@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+Example Homie Controller
+
+This script demonstrates how to use the Controller class to:
+- Auto-discover Homie devices on an MQTT broker
+- Monitor device state changes
+- Read device descriptions and properties
+- Send commands to settable properties
+
+Usage:
+    python3 example-controller.py --config broker-cfg.json
+    EBUS_BROKER_CFG=broker-cfg.json python3 example-controller.py
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from pprint import pprint
+
+from ebus_sdk import Controller, DiscoveredDevice
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def on_device_discovered(device: DiscoveredDevice):
+    """Called when a new device is discovered"""
+    logger.info(f"✓ Discovered device: {device.device_id} (state: {device.state})")
+
+
+def on_device_state_changed(device: DiscoveredDevice, old_state: str, new_state: str):
+    """Called when a device state changes"""
+    logger.info(f"↻ Device {device.device_id}: {old_state} → {new_state}")
+
+
+def on_device_removed(device: DiscoveredDevice):
+    """Called when a device is removed"""
+    logger.warning(f"✗ Device removed: {device.device_id}")
+
+
+def on_description_received(device: DiscoveredDevice):
+    """Called when a device description is received"""
+    logger.info(f"📋 Description received for {device.device_id}")
+    if device.description:
+        print(f'\nDevice: {device.description.get("name", device.device_id)}')
+        print(f'  Type: {device.description.get("type", "unknown")}')
+        if "nodes" in device.description:
+            nodes = device.description["nodes"]
+            print(f"  Nodes: {len(nodes)}")
+            for node_id, node_data in nodes.items():
+                node_name = node_data.get("name", node_id)
+                properties = node_data.get("properties", {})
+                print(f"    - {node_name} ({node_id}): {len(properties)} properties")
+                for prop_id, prop_data in properties.items():
+                    prop_name = prop_data.get("name", prop_id)
+                    prop_datatype = prop_data.get("datatype", "unknown")
+                    settable = prop_data.get("settable", False)
+                    settable_str = " [settable]" if settable else ""
+                    print(
+                        f"      • {prop_name} ({prop_id}): {prop_datatype}{settable_str}"
+                    )
+
+
+def on_property_changed(
+    device_id: str, node_id: str, property_id: str, new_value: str, old_value: str
+):
+    """Called when a property value changes"""
+    if old_value is None:
+        logger.info(f"📊 {device_id}/{node_id}/{property_id} = {new_value}")
+    else:
+        logger.info(
+            f"📊 {device_id}/{node_id}/{property_id}: {old_value} → {new_value}"
+        )
+
+
+def load_broker_config(config_file: str):
+    """Load MQTT broker configuration from JSON file"""
+    try:
+        with open(config_file, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {config_file}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing config file: {e}")
+        return None
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="Homie Controller - auto-discover and monitor Homie devices"
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        help="Path to broker config JSON file (or set EBUS_BROKER_CFG env var)",
+    )
+    args = parser.parse_args()
+
+    # Determine config file: command line takes precedence over env var
+    config_file = args.config or os.environ.get("EBUS_BROKER_CFG")
+    if not config_file:
+        print("Error: No broker config file specified.")
+        print(
+            "Provide config via --config option or EBUS_BROKER_CFG environment variable."
+        )
+        print()
+        print("Example config file format:")
+        print("  {")
+        print('    "host": "mqtt.example.com",')
+        print('    "port": 1883,')
+        print(
+            '    "authentication": {"type": "USER_PASS", "username": "user", "password": "pass"}'
+        )
+        print("  }")
+        sys.exit(1)
+
+    # Load MQTT broker configuration
+    mqtt_cfg = load_broker_config(config_file)
+    if mqtt_cfg is None:
+        sys.exit(1)
+
+    print("=" * 60)
+    print("Homie Controller Example")
+    print("=" * 60)
+    print()
+
+    print(f'Connecting to MQTT broker: {mqtt_cfg.get("host")}:{mqtt_cfg.get("port")}')
+    print()
+
+    # Create controller
+    controller = Controller(mqtt_cfg=mqtt_cfg)
+
+    # Register callbacks
+    controller.set_on_device_discovered_callback(on_device_discovered)
+    controller.set_on_device_state_changed_callback(on_device_state_changed)
+    controller.set_on_device_removed_callback(on_device_removed)
+    controller.set_on_description_received_callback(on_description_received)
+    controller.set_on_property_changed_callback(on_property_changed)
+
+    # Start discovery
+    print("Starting auto-discovery...")
+    print("Press Ctrl+C to exit")
+    print()
+    controller.start_discovery()
+
+    try:
+        # Keep running and display summary every 30 seconds
+        while True:
+            time.sleep(30)
+
+            devices = controller.get_all_devices()
+            print()
+            print("-" * 60)
+            print(f"Summary: {len(devices)} device(s) discovered")
+            print("-" * 60)
+
+            for device_id, device in devices.items():
+                print(f"\n{device_id}:")
+                print(f"  State: {device.state}")
+                print(
+                    f"  Last seen: {time.time() - device.last_seen:.1f}s ago"
+                    if device.last_seen
+                    else "  Last seen: never"
+                )
+
+                if device.description:
+                    print(f'  Name: {device.description.get("name", "N/A")}')
+                    print(f'  Nodes: {len(device.description.get("nodes", []))}')
+
+                # Show current property values
+                if device.properties:
+                    print(f"  Properties:")
+                    for node_id, props in device.properties.items():
+                        for prop_id, value in props.items():
+                            target = device.get_property_target(node_id, prop_id)
+                            target_str = f" (target: {target})" if target else ""
+                            print(f"    {node_id}/{prop_id} = {value}{target_str}")
+
+            print()
+
+    except KeyboardInterrupt:
+        print()
+        print("Shutting down...")
+        controller.stop()
+        print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()

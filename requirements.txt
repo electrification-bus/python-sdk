@@ -1,0 +1,8 @@
+# Python SDK for Homie MQTT Convention (eBus)
+# Required dependencies
+
+# MQTT client library
+paho-mqtt>=1.6.1
+
+# mDNS/Zeroconf service discovery for SPAN Panel broker discovery
+zeroconf>=0.131.0

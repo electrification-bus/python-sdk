@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+Targeted Homie Controller Example with mDNS Discovery
+
+This controller demonstrates how to:
+- Discover SPAN Panel MQTTS broker via mDNS
+- Connect securely to MQTTS broker with authentication
+- Monitor a specific device by device ID
+- Subscribe to a specific property
+- React when that property changes
+
+Usage:
+    python3 example-controller-targeted.py <serial-number> <password> <device-id>
+
+Example:
+    python3 example-controller-targeted.py ABC123XYZ mypassword nt-2026-c192x
+
+The controller will:
+1. Discover SPAN Panel broker via mDNS (span-{serial-number}.local)
+2. Connect to MQTTS broker on port 8883
+3. Wait for the specified device to be discovered
+4. Monitor the core/dominant-power-source property
+5. Print updates when the value changes
+"""
+
+import argparse
+import json
+import logging
+import os
+import time
+from typing import Optional
+
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+
+from ebus_sdk import Controller, DiscoveredDevice
+
+# Optional SPAN auth utilities - enables automatic credential and CA cert management
+try:
+    from span_auth_utils import get_panel_credentials, ensure_ca_cert
+
+    SPAN_AUTH_AVAILABLE = True
+except ImportError:
+    SPAN_AUTH_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+class MdnsDiscovery(ServiceListener):
+    """
+    mDNS service discovery for SPAN Panel MQTT broker
+    """
+
+    def __init__(self, serial_number: str):
+        self.serial_number = serial_number
+        self.hostname = f"span-{serial_number}.local"
+        self.broker_host = None
+        self.broker_port = 8883  # Default MQTTS port
+        self.discovered = False
+
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when service information is updated"""
+        pass
+
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when service is removed"""
+        pass
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when service is discovered"""
+        info = zc.get_service_info(type_, name)
+        if info:
+            logger.debug(f"Found service: {name}")
+            logger.debug(f"  Server: {info.server}")
+            logger.debug(f"  Type: {type_}")
+
+            # Check if this is our target SPAN Panel
+            server = info.server.lower()
+            if self.hostname in server:
+                # Extract host and port
+                if info.addresses:
+                    import socket
+
+                    self.broker_host = socket.inet_ntoa(info.addresses[0])
+                    self.broker_port = info.port if info.port else 8883
+                    self.discovered = True
+                    logger.info(f"✓ Discovered SPAN Panel: {self.hostname}")
+                    logger.info(f"  Host: {self.broker_host}")
+                    logger.info(f"  Port: {self.broker_port}")
+            else:
+                logger.debug(f"  Not our target (looking for {self.hostname})")
+
+    def discover(self, timeout: float = 5.0) -> bool:
+        """
+        Attempt to discover the SPAN Panel via mDNS
+        Returns True if discovered, False otherwise
+        """
+        logger.info(f"Starting mDNS discovery for: {self.hostname}")
+
+        zeroconf = Zeroconf()
+        # Look for MQTT services - SPAN Panel uses _secure-mqtt._tcp
+        service_types = ["_secure-mqtt._tcp.local.", "_mqtt._tcp.local."]
+
+        browsers = []
+        for service_type in service_types:
+            logger.debug(f"Browsing for service type: {service_type}")
+            browser = ServiceBrowser(zeroconf, service_type, self)
+            browsers.append(browser)
+
+        # Wait for discovery
+        start_time = time.time()
+        while not self.discovered and (time.time() - start_time) < timeout:
+            time.sleep(0.1)
+
+        zeroconf.close()
+
+        if self.discovered:
+            logger.info(f"✓ mDNS discovery successful")
+            return True
+        else:
+            # Fallback: Use hostname directly and let DNS resolver handle it
+            logger.warning(
+                f"⚠️  mDNS discovery timed out, using hostname directly: {self.hostname}"
+            )
+            self.broker_host = self.hostname
+            return True  # Still return True to attempt connection
+
+
+class TargetedController:
+    """
+    A controller that monitors a specific device and property
+    """
+
+    def __init__(
+        self,
+        target_device_id: str,
+        serial_number: str,
+        password: str,
+        broker_host: Optional[str] = None,
+        broker_port: int = 8883,
+        tls_ca_cert: Optional[str] = None,
+        tls_insecure: bool = True,
+    ):
+        self.target_device_id = target_device_id
+        self.target_found = False
+        self.serial_number = serial_number
+        self.password = password
+
+        # If broker host not provided, try to discover via mDNS
+        if broker_host is None:
+            logger.info("No broker host specified, attempting mDNS discovery...")
+            discovery = MdnsDiscovery(serial_number)
+            discovery.discover(timeout=5.0)
+            broker_host = discovery.broker_host
+            broker_port = discovery.broker_port
+
+            if broker_host is None:
+                raise RuntimeError(
+                    f"Failed to discover SPAN Panel broker. "
+                    f"Please specify broker host with --broker-host option"
+                )
+        else:
+            logger.info(f"Using specified broker host: {broker_host}:{broker_port}")
+
+        # Build MQTT configuration for MQTTS with authentication
+        mqtt_cfg = {
+            "host": broker_host,
+            "port": broker_port,
+            "authentication": {
+                "type": "USER_PASS",
+                "username": serial_number,
+                "password": password,
+            },
+            "use_tls": True,
+            "tls_insecure": tls_insecure,
+        }
+        if tls_ca_cert:
+            mqtt_cfg["tls_ca_cert"] = tls_ca_cert
+
+        logger.info(
+            f'Connecting to MQTTS broker at {mqtt_cfg["host"]}:{mqtt_cfg["port"]}'
+        )
+        logger.info(f"Username: {serial_number}")
+
+        self.controller = Controller(mqtt_cfg=mqtt_cfg)
+
+        # Register callbacks
+        self.controller.set_on_device_discovered_callback(self.on_device_discovered)
+        self.controller.set_on_device_state_changed_callback(
+            self.on_device_state_changed
+        )
+        self.controller.set_on_property_changed_callback(self.on_property_changed)
+        self.controller.set_on_description_received_callback(
+            self.on_description_received
+        )
+
+    def on_device_discovered(self, device: DiscoveredDevice):
+        """Called when any device is discovered"""
+        if device.device_id == self.target_device_id:
+            logger.info(
+                f"🎯 Target device found: {device.device_id} (state: {device.state})"
+            )
+            self.target_found = True
+        else:
+            logger.debug(f"Discovered device: {device.device_id} (not our target)")
+
+    def on_device_state_changed(
+        self, device: DiscoveredDevice, old_state: str, new_state: str
+    ):
+        """Called when device state changes"""
+        if device.device_id == self.target_device_id:
+            logger.info(f"🔄 Target device state: {old_state} → {new_state}")
+
+    def on_description_received(self, device: DiscoveredDevice):
+        """Called when device description is received"""
+        if device.device_id != self.target_device_id:
+            return
+
+        logger.info(f"📋 Description received for target device: {device.device_id}")
+
+        # Check if the target nodes and properties exist
+        if device.description and "nodes" in device.description:
+            nodes = device.description["nodes"]
+
+            # Check core/dominant-power-source
+            if "core" in nodes:
+                core_node = nodes["core"]
+                properties = core_node.get("properties", {})
+
+                if "dominant-power-source" in properties:
+                    prop = properties["dominant-power-source"]
+                    logger.info(f"✓ Target property found: core/dominant-power-source")
+                    logger.info(f'  Name: {prop.get("name", "N/A")}')
+                    logger.info(f'  Datatype: {prop.get("datatype", "N/A")}')
+                    if "format" in prop:
+                        logger.info(f'  Format: {prop.get("format")}')
+
+                    # Get current value if available
+                    current_value = device.get_property("core", "dominant-power-source")
+                    if current_value:
+                        logger.info(f"  Current value: {current_value}")
+                else:
+                    logger.warning(
+                        '⚠️  Property "dominant-power-source" not found in core node'
+                    )
+                    logger.info(f"  Available properties: {list(properties.keys())}")
+            else:
+                logger.warning('⚠️  Node "core" not found in device')
+
+            # Check power-flows node and all its properties
+            if "power-flows" in nodes:
+                power_flows_node = nodes["power-flows"]
+                properties = power_flows_node.get("properties", {})
+
+                logger.info(
+                    f"✓ Found power-flows node with {len(properties)} properties:"
+                )
+                for prop_id, prop_info in properties.items():
+                    prop_name = prop_info.get("name", prop_id)
+                    prop_datatype = prop_info.get("datatype", "N/A")
+                    prop_unit = prop_info.get("unit", "")
+
+                    # Get current value if available
+                    current_value = device.get_property("power-flows", prop_id)
+                    value_str = (
+                        f" = {current_value}{prop_unit}" if current_value else ""
+                    )
+
+                    logger.info(
+                        f"  • {prop_id} ({prop_name}, {prop_datatype}){value_str}"
+                    )
+            else:
+                logger.warning('⚠️  Node "power-flows" not found in device')
+
+            if "core" not in nodes and "power-flows" not in nodes:
+                logger.info(f"  Available nodes: {list(nodes.keys())}")
+
+    def on_property_changed(
+        self,
+        device_id: str,
+        node_id: str,
+        property_id: str,
+        new_value: str,
+        old_value: Optional[str],
+    ):
+        """Called when any property changes"""
+        # Only process our target device
+        if device_id != self.target_device_id:
+            return
+
+        # Handle core/dominant-power-source
+        if node_id == "core" and property_id == "dominant-power-source":
+            if old_value is None:
+                # Initial value received
+                logger.info(
+                    f"📌 Initial value: core/dominant-power-source = {new_value}"
+                )
+            else:
+                # Value changed - only log if actually different
+                if old_value != new_value:
+                    logger.info(
+                        f"⚡ core/dominant-power-source changed: {old_value} → {new_value}"
+                    )
+
+        # Handle all power-flows properties
+        elif node_id == "power-flows":
+            if old_value is None:
+                # Initial value received
+                logger.info(
+                    f"📌 Initial value: power-flows/{property_id} = {new_value}"
+                )
+            else:
+                # Value changed - only log if actually different
+                if old_value != new_value:
+                    logger.info(
+                        f"⚡ power-flows/{property_id} changed: {old_value} → {new_value}"
+                    )
+
+    def start(self):
+        """Start the controller"""
+        logger.info(f"Starting controller, looking for device: {self.target_device_id}")
+        logger.info(f"Monitoring properties:")
+        logger.info(f"  • core/dominant-power-source")
+        logger.info(f"  • power-flows/* (all properties)")
+        logger.info("Press Ctrl+C to exit")
+        print()
+
+        self.controller.start_discovery()
+
+        try:
+            while True:
+                time.sleep(60)
+
+                # Periodic status update - only if device not found yet
+                if not self.target_found:
+                    logger.info(
+                        f"⏳ Still waiting for target device: {self.target_device_id}"
+                    )
+                # Once found, stay silent and only log when property value changes
+
+        except KeyboardInterrupt:
+            print()
+            logger.info("Shutting down...")
+            self.controller.stop()
+            logger.info("Goodbye!")
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="Monitor SPAN Panel Homie device properties via MQTTS with mDNS discovery",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Monitor SPAN Panel device (device_id = serial_number):
+  %(prog)s nt-2204-c1c46 mypassword
+
+  # Monitor a different device on the SPAN Panel broker:
+  %(prog)s nt-2204-c1c46 mypassword --device-id nt-2026-c192x
+
+  # With explicit broker host (IP address):
+  %(prog)s nt-2204-c1c46 mypassword --broker-host 192.168.1.100
+
+  # With debug logging:
+  %(prog)s nt-2204-c1c46 mypassword --debug
+
+The controller will:
+1. Discover the SPAN Panel broker via mDNS (span-{serial-number}.local), or use --broker-host
+2. Connect securely via MQTTS on port 8883
+3. Monitor core/dominant-power-source and all power-flows/* properties
+4. Print initial values and log updates when property values change
+        """,
+    )
+
+    parser.add_argument(
+        "serial_number", help="SPAN Panel serial number (e.g., nt-2204-c1c46)"
+    )
+
+    parser.add_argument(
+        "password",
+        nargs="?",
+        default=None,
+        help="MQTT broker password (optional if span_auth_utils available)",
+    )
+
+    parser.add_argument(
+        "--device-id", help="Device ID to monitor (default: same as serial_number)"
+    )
+
+    parser.add_argument(
+        "--broker-host", help="MQTT broker hostname or IP (skips mDNS discovery)"
+    )
+
+    parser.add_argument(
+        "--broker-port", type=int, default=8883, help="MQTT broker port (default: 8883)"
+    )
+
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification (default if no CA cert available)",
+    )
+
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
+    args = parser.parse_args()
+
+    # Default device_id to serial_number if not provided
+    device_id = args.device_id if args.device_id else args.serial_number
+
+    # Configure logging level
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+
+    # Get password - from CLI arg or from span_auth_utils if available
+    password = args.password
+    if password is None:
+        if SPAN_AUTH_AVAILABLE:
+            try:
+                creds = get_panel_credentials(args.serial_number)
+                if creds:
+                    password = creds.get("ebus_broker_password")
+                if password:
+                    logger.info(f"Using password from ~/.span-auth.json")
+                else:
+                    logger.error(
+                        f"No password found in ~/.span-auth.json for {args.serial_number}"
+                    )
+                    print(
+                        f"Error: No password provided and none found in ~/.span-auth.json"
+                    )
+                    print(
+                        f"Provide password as argument or run: span-api auth {args.serial_number}"
+                    )
+                    return
+            except Exception as e:
+                logger.error(f"Failed to get credentials: {e}")
+                print(
+                    f"Error: No password provided and failed to get from ~/.span-auth.json: {e}"
+                )
+                return
+        else:
+            print("Error: Password is required when span_auth_utils is not available")
+            print("Usage: simple-span-controller <serial-number> <password>")
+            print("")
+            print(
+                "To enable automatic credential management, add SPAN-API-Client-Docs lib to PYTHONPATH:"
+            )
+            print("  export PYTHONPATH=$PYTHONPATH:/path/to/SPAN-API-Client-Docs/lib")
+            return
+
+    # Get CA cert if available and not insecure mode
+    tls_ca_cert = None
+    tls_insecure = args.insecure
+    if SPAN_AUTH_AVAILABLE and not args.insecure:
+        try:
+            # Determine hostname for CA cert
+            hostname = (
+                args.broker_host
+                if args.broker_host
+                else f"span-{args.serial_number}.local"
+            )
+            tls_ca_cert = ensure_ca_cert(args.serial_number, hostname)
+            if tls_ca_cert:
+                logger.info(f"Using CA cert: {tls_ca_cert}")
+                tls_insecure = False
+            else:
+                logger.warning("No CA cert available, using insecure mode")
+                tls_insecure = True
+        except Exception as e:
+            logger.warning(f"Failed to get CA cert, using insecure mode: {e}")
+            tls_insecure = True
+    else:
+        tls_insecure = True
+
+    print("=" * 70)
+    print("Targeted Homie Controller with mDNS Discovery and MQTTS")
+    print("=" * 70)
+    print(f"SPAN Panel Serial: {args.serial_number}")
+    print(f"Target Device: {device_id}")
+    if device_id == args.serial_number:
+        print("  (monitoring SPAN Panel itself)")
+    print(f"Monitoring Properties:")
+    print(f"  • core/dominant-power-source")
+    print(f"  • power-flows/* (all properties)")
+    if args.broker_host:
+        print(f"Broker: {args.broker_host}:{args.broker_port}")
+    else:
+        print(f"Broker: Auto-discover via mDNS")
+    if tls_ca_cert:
+        print(f"TLS: Secure (CA cert verification)")
+    else:
+        print(f"TLS: Insecure (no certificate verification)")
+    print("=" * 70)
+    print()
+
+    # Create and start controller
+    controller = TargetedController(
+        device_id,
+        args.serial_number,
+        password,
+        broker_host=args.broker_host,
+        broker_port=args.broker_port,
+        tls_ca_cert=tls_ca_cert,
+        tls_insecure=tls_insecure,
+    )
+    controller.start()
+
+
+if __name__ == "__main__":
+    main()

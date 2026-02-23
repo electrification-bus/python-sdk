@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local config files (contain secrets)
+broker-cfg*.json
+
+# Personal LLM config (symlinked to ../cfg/python-sdk/)
+CLAUDE.md
+.beads
+.claude
+AGENTS.md

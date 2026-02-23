@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ebus-sdk"
+version = "0.1.2"
+description = "Python SDK for Homie MQTT Convention (eBus)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "eBus Contributors"}
+]
+keywords = ["mqtt", "homie", "iot", "ebus"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "paho-mqtt>=2.0.0",
+]
+
+[project.optional-dependencies]
+mdns = ["zeroconf>=0.131.0"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://ebus.energy"
+Repository = "https://github.com/electrification-bus/python-sdk"
+
+[tool.setuptools.packages.find]
+where = ["src"]
