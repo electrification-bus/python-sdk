@@ -28,9 +28,3 @@ htmlcov/
 
 # Local config files (contain secrets)
 broker-cfg*.json
-
-# Personal LLM config (symlinked to ../cfg/python-sdk/)
-CLAUDE.md
-.beads
-.claude
-AGENTS.md
