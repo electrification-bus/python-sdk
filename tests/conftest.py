@@ -8,7 +8,7 @@ import pytest
 @pytest.fixture
 def mock_paho():
     """Mock paho.mqtt.client to prevent real MQTT connections."""
-    with patch("ebus_sdk.mqtt.mqtt.Client") as mock_client_cls:
+    with patch("ebus_mqtt_client.client.mqtt.Client") as mock_client_cls:
         mock_instance = MagicMock()
         mock_instance.is_connected.return_value = True
         mock_instance.subscribe.return_value = (0, 1)  # MQTT_ERR_SUCCESS, msg_id
