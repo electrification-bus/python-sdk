@@ -1,5 +1,8 @@
 # ebus-sdk
 
+[![PyPI](https://img.shields.io/pypi/v/ebus-sdk)](https://pypi.org/project/ebus-sdk/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 Python SDK for the [Electrification Bus (eBus)](https://ebus.energy) integration framework, which adopts and supports the [Homie Convention](https://homieiot.github.io).
 
 ## Installation

@@ -1,9 +1,7 @@
 """Tests for ebus_sdk.mqtt.MqttClient."""
 
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
-import paho.mqtt.matcher as matcher
-import pytest
 
 from ebus_sdk.mqtt import MqttClient, AUTH_TYPE_USER_PASS
 
@@ -40,9 +38,7 @@ class TestMqttClientInit:
             port=1883,
             lwt=lwt,
         )
-        mock_paho.will_set.assert_called_once_with(
-            topic="device/$state", payload="lost", retain=True, qos=1
-        )
+        mock_paho.will_set.assert_called_once_with(topic="device/$state", payload="lost", retain=True, qos=1)
 
     def test_on_connect_callback_stored(self, mock_paho):
         cb = MagicMock()
@@ -89,17 +85,13 @@ class TestMqttClientOperations:
     """Test start, stop, publish, subscribe."""
 
     def test_start_non_blocking(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         client.start(blocking=False)
         assert client.is_running is True
         mock_paho.loop_start.assert_called_once()
 
     def test_stop_cleans_up(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         cb = MagicMock()
         client.on_connect_callback = cb
         client.start()
@@ -114,9 +106,7 @@ class TestMqttClientOperations:
         assert client.on_connect_callback is None
 
     def test_subscribe_registers_callback(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         cb = MagicMock()
         client.subscribe("ebus/5/+/$state", param=cb, qos=2)
 
@@ -125,18 +115,12 @@ class TestMqttClientOperations:
         mock_paho.subscribe.assert_called_with("ebus/5/+/$state", 2)
 
     def test_publish(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         client.publish("ebus/5/dev1/$state", "ready", qos=2, retain=True)
-        mock_paho.publish.assert_called_once_with(
-            "ebus/5/dev1/$state", "ready", 2, True
-        )
+        mock_paho.publish.assert_called_once_with("ebus/5/dev1/$state", "ready", 2, True)
 
     def test_on_connect_resubscribes(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         cb = MagicMock()
         client.sub_callbacks["ebus/5/+/$state"] = (cb, 2)
 
@@ -158,9 +142,7 @@ class TestMqttClientOperations:
         on_connect.assert_called_once()
 
     def test_on_message_dispatches_to_subscriber(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         cb = MagicMock()
         client.subscribe("ebus/5/+/$state", param=cb, qos=2)
 
@@ -173,9 +155,7 @@ class TestMqttClientOperations:
         cb.assert_called_once_with("ebus/5/my-device/$state", b"ready")
 
     def test_on_message_no_matching_sub(self, mock_paho):
-        client = MqttClient(
-            client_id="test", endpoint="localhost", port=1883
-        )
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         msg = MagicMock()
         msg.topic = "unmatched/topic"
         msg.payload = b"data"

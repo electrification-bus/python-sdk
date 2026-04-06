@@ -40,3 +40,17 @@ Issues = "https://github.com/electrification-bus/python-sdk/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E402: module-level imports not at top — triggered by __future__ + docstring pattern
+# E721: type comparison with == — intentional in datatype_from_type()
+ignore = ["E402", "E721"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

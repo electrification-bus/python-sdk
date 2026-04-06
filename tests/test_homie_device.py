@@ -2,8 +2,7 @@
 
 import json
 from enum import Enum
-from functools import partial
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -13,7 +12,6 @@ from ebus_sdk.homie import (
     Node,
     Device,
     DeviceState,
-    StateTransitionContext,
     Unit,
     datatype_from_type,
     ebus_cfg_add_auth,
@@ -114,8 +112,7 @@ class TestUnit:
 
 class TestHomieProperty:
     def test_basic_init(self):
-        p = Property(id="temp", value=72.5, name="Temperature",
-                     datatype=PropertyDatatype.FLOAT, unit="°C")
+        p = Property(id="temp", value=72.5, name="Temperature", datatype=PropertyDatatype.FLOAT, unit="°C")
         assert p.id() == "temp"
         assert p.name() == "Temperature"
         assert p.value() == 72.5
@@ -201,8 +198,7 @@ class TestHomieProperty:
 
 class TestHomiePropertyDescription:
     def test_basic_description(self):
-        p = Property(id="temp", name="Temperature",
-                     datatype=PropertyDatatype.FLOAT, unit="°C")
+        p = Property(id="temp", name="Temperature", datatype=PropertyDatatype.FLOAT, unit="°C")
         desc = p.description()
         assert desc["name"] == "Temperature"
         assert desc["datatype"] == PropertyDatatype.FLOAT
@@ -211,8 +207,7 @@ class TestHomiePropertyDescription:
         assert "retained" not in desc  # only included if False
 
     def test_description_includes_settable(self):
-        p = Property(id="mode", settable=True, datatype=PropertyDatatype.ENUM,
-                     format="auto,manual")
+        p = Property(id="mode", settable=True, datatype=PropertyDatatype.ENUM, format="auto,manual")
         desc = p.description()
         assert desc["settable"] is True
         assert desc["format"] == "auto,manual"
@@ -223,8 +218,7 @@ class TestHomiePropertyDescription:
         assert desc["retained"] is False
 
     def test_as_dict(self):
-        p = Property(id="temp", name="Temperature", value=72.5,
-                     datatype=PropertyDatatype.FLOAT, settable=False)
+        p = Property(id="temp", name="Temperature", value=72.5, datatype=PropertyDatatype.FLOAT, settable=False)
         d = p.as_dict()
         assert d["id"] == "temp"
         assert d["value"] == 72.5
@@ -263,6 +257,7 @@ class TestHomiePropertyCoercion:
     def test_coerced_value_enum(self):
         class Color(Enum):
             RED = "red"
+
         p = Property(id="color", value=Color.RED, datatype=PropertyDatatype.ENUM)
         assert p.coerced_value() == "red"
 
@@ -328,8 +323,7 @@ class TestHomiePropertyPublish:
 
     def test_publish_boolean_coerced(self):
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, value=True,
-                                     datatype=PropertyDatatype.BOOLEAN, id="active")
+        prop = _make_wired_property(mock_client, value=True, datatype=PropertyDatatype.BOOLEAN, id="active")
 
         prop.publish_value()
         call_args = mock_client.publish.call_args
@@ -390,8 +384,9 @@ class TestHomiePropertySettableCallback:
     def test_settable_callback_invokes_set_callback(self):
         cb = MagicMock()
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, id="mode", settable=True,
-                                     set_callback=cb, datatype=PropertyDatatype.STRING)
+        prop = _make_wired_property(
+            mock_client, id="mode", settable=True, set_callback=cb, datatype=PropertyDatatype.STRING
+        )
 
         topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev1/node1/mode/set"
         prop._settable_callback(topic, b"manual")
@@ -400,8 +395,9 @@ class TestHomiePropertySettableCallback:
     def test_settable_callback_json_datatype(self):
         cb = MagicMock()
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, id="config", settable=True,
-                                     set_callback=cb, datatype=PropertyDatatype.JSON)
+        prop = _make_wired_property(
+            mock_client, id="config", settable=True, set_callback=cb, datatype=PropertyDatatype.JSON
+        )
 
         topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev1/node1/config/set"
         payload = json.dumps({"key": "value"}).encode()
@@ -411,8 +407,9 @@ class TestHomiePropertySettableCallback:
     def test_settable_callback_not_settable_noop(self):
         cb = MagicMock()
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, id="temp", settable=False,
-                                     set_callback=cb, datatype=PropertyDatatype.FLOAT)
+        prop = _make_wired_property(
+            mock_client, id="temp", settable=False, set_callback=cb, datatype=PropertyDatatype.FLOAT
+        )
 
         topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev1/node1/temp/set"
         prop._settable_callback(topic, b"99")
@@ -421,8 +418,9 @@ class TestHomiePropertySettableCallback:
     def test_settable_callback_invalid_topic_noop(self):
         cb = MagicMock()
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, id="mode", settable=True,
-                                     set_callback=cb, datatype=PropertyDatatype.STRING)
+        prop = _make_wired_property(
+            mock_client, id="mode", settable=True, set_callback=cb, datatype=PropertyDatatype.STRING
+        )
 
         # Wrong domain
         topic = "wrong/5/dev1/node1/mode/set"
@@ -433,8 +431,7 @@ class TestHomiePropertySettableCallback:
 class TestHomiePropertySetSubscribe:
     def test_set_subscribe_settable(self):
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, id="mode", settable=True,
-                                     datatype=PropertyDatatype.STRING)
+        prop = _make_wired_property(mock_client, id="mode", settable=True, datatype=PropertyDatatype.STRING)
 
         prop.set_subscribe()
         mock_client.subscribe.assert_called_once()
@@ -530,11 +527,13 @@ class TestNodeAddProperty:
         node = device.new_node("core")
         device.add_node(node)
 
-        prop = node.add_property_from_dict({
-            "id": "humidity",
-            "value": 50.0,
-            "datatype": PropertyDatatype.FLOAT,
-        })
+        prop = node.add_property_from_dict(
+            {
+                "id": "humidity",
+                "value": 50.0,
+                "datatype": PropertyDatatype.FLOAT,
+            }
+        )
         assert prop.id() == "humidity"
         assert "humidity" in node.properties()
 
@@ -584,8 +583,7 @@ class TestNodeDescription:
 
     def test_as_dict(self):
         n = Node(id="core", name="Core", type="sensor")
-        p = Property(id="temp", name="Temperature", value=72,
-                     datatype=PropertyDatatype.FLOAT)
+        p = Property(id="temp", name="Temperature", value=72, datatype=PropertyDatatype.FLOAT)
         n._properties["temp"] = p
 
         d = n.as_dict()
@@ -829,8 +827,7 @@ class TestDeviceParent:
 
 class TestDeviceDescription:
     def test_description_structure(self, mock_paho):
-        device, _ = _make_device(mock_paho, device_id="panel-1",
-                                  name="Panel", type="electrical-panel")
+        device, _ = _make_device(mock_paho, device_id="panel-1", name="Panel", type="electrical-panel")
         desc = device.description()
         assert desc["name"] == "Panel"
         assert desc["type"] == "electrical-panel"
@@ -985,9 +982,7 @@ class TestDeviceClearRetainedTopic:
 
         result = device.clear_retained_topic("ebus/5/panel-1/core/temp")
         assert result is True
-        mock_client.publish.assert_called_once_with(
-            "ebus/5/panel-1/core/temp", "", retain=True, qos=device.qos
-        )
+        mock_client.publish.assert_called_once_with("ebus/5/panel-1/core/temp", "", retain=True, qos=device.qos)
 
     def test_clear_retained_no_mqtt(self, mock_paho):
         device, _ = _make_device(mock_paho)

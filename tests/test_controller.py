@@ -1,10 +1,8 @@
 """Tests for ebus_sdk.homie.Controller and DiscoveredDevice."""
 
 import json
-from functools import partial
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from ebus_sdk.homie import (
     Controller,
@@ -165,9 +163,7 @@ class TestControllerDiscoveryWildcard:
     def test_state_change_fires_callback(self, mock_paho):
         ctrl, _ = _make_controller(mock_paho)
         changes = []
-        ctrl.set_on_device_state_changed_callback(
-            lambda dev, old, new: changes.append((old, new))
-        )
+        ctrl.set_on_device_state_changed_callback(lambda dev, old, new: changes.append((old, new)))
         ctrl.start_discovery()
 
         # First message — discovery
@@ -187,9 +183,7 @@ class TestControllerDiscoveryWildcard:
     def test_same_state_does_not_fire_callback(self, mock_paho):
         ctrl, _ = _make_controller(mock_paho)
         changes = []
-        ctrl.set_on_device_state_changed_callback(
-            lambda dev, old, new: changes.append((old, new))
-        )
+        ctrl.set_on_device_state_changed_callback(lambda dev, old, new: changes.append((old, new)))
         ctrl.start_discovery()
 
         ctrl._on_state_message(
@@ -270,9 +264,7 @@ class TestControllerDiscoverySingleDevice:
             topic = c[0][0]
             parts = topic.split("/")
             # parts[2] is the device-id position
-            assert (
-                parts[2] == "panel-1"
-            ), f"Wildcard found in device-id position: {topic}"
+            assert parts[2] == "panel-1", f"Wildcard found in device-id position: {topic}"
 
 
 class TestControllerPropertyMessages:
@@ -304,9 +296,7 @@ class TestControllerPropertyMessages:
         ctrl, _ = _make_controller(mock_paho)
         changes = []
         ctrl.set_on_property_changed_callback(
-            lambda dev_id, node, prop, val, old: changes.append(
-                (dev_id, node, prop, val, old)
-            )
+            lambda dev_id, node, prop, val, old: changes.append((dev_id, node, prop, val, old))
         )
         ctrl.start_discovery()
 
@@ -371,12 +361,8 @@ class TestControllerSetProperty:
         result = ctrl.set_property("panel-1", "breaker", "state", "CLOSED")
 
         assert result is True
-        expected_topic = (
-            f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/panel-1/breaker/state/set"
-        )
-        mock_client.publish.assert_called_once_with(
-            expected_topic, "CLOSED", qos=EBUS_HOMIE_MQTT_QOS, retain=False
-        )
+        expected_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/panel-1/breaker/state/set"
+        mock_client.publish.assert_called_once_with(expected_topic, "CLOSED", qos=EBUS_HOMIE_MQTT_QOS, retain=False)
 
     def test_set_property_no_connection(self, mock_paho):
         ctrl, _ = _make_controller(mock_paho)
@@ -393,9 +379,7 @@ class TestControllerBroadcast:
         result = ctrl.broadcast("alert", "test-message")
 
         assert result is True
-        expected_topic = (
-            f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/$broadcast/alert"
-        )
+        expected_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/$broadcast/alert"
         mock_client.publish.assert_called_once_with(
             expected_topic, "test-message", qos=EBUS_HOMIE_MQTT_QOS, retain=False
         )
@@ -508,9 +492,7 @@ class TestControllerQoS:
         assert kwargs["qos"] == 0
 
     def test_single_device_subscribe_uses_custom_qos(self, mock_paho):
-        ctrl, mock_client = _make_controller_with_qos(
-            mock_paho, qos=1, device_id="panel-1"
-        )
+        ctrl, mock_client = _make_controller_with_qos(mock_paho, qos=1, device_id="panel-1")
         ctrl.start_discovery()
 
         assert mock_client.subscribe.call_count == 4

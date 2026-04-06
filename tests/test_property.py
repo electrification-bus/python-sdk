@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from ebus_sdk.property import (
     Property,
@@ -122,7 +121,7 @@ class TestPropertyDict:
 
     def test_add_property_from_dict(self):
         pd = PropertyDict()
-        p = pd.add_property_from_dict({"id": "temp", "value": 72, "type": float})
+        pd.add_property_from_dict({"id": "temp", "value": 72, "type": float})
         assert pd.value("temp") == 72
 
     def test_delete_property(self):
