@@ -55,7 +55,24 @@ Constructing a `Device` never blocks or fails just because the broker is momenta
 
 #### Transport-free construction
 
-A `Device` tree can also be built with no transport at all: pass `mqtt_cfg=None` (the default) and the tree composes `$description`, resolves ids and topics, and holds property values without opening a socket: useful for tests, for deriving the wire schema, and for a host that publishes through its own MQTT client. `mqtt_cfg={}` still connects on the transport's defaults; only `None` skips the connection. Children attach to a transport-free root exactly as they do to a connected one.
+A `Device` tree can also be built with no transport at all: pass `mqtt_cfg=None` (the default) and the tree composes `$description`, resolves ids and topics, and holds property values without opening a socket: useful for tests and for deriving the wire schema offline. (A host that wants to *publish* an eBus tree through its own connected client uses bring-your-own-transport, below, not this.) `mqtt_cfg={}` still connects on the transport's defaults; only `None` skips the connection. Children attach to a transport-free root exactly as they do to a connected one.
+
+#### Bring-your-own-transport
+
+A host that already owns its MQTT connection can publish an eBus device tree through it instead of letting the SDK open its own: pass a pre-built client as `Device(..., mqttc=client)` (root-only, mutually exclusive with `mqtt_cfg=`). The SDK uses the client as-is and never `start()`s or `stop()`s it: the caller owns its lifecycle and event loop. This is the producer-side mirror of `Controller(mqttc=...)`, and the case it exists for is a host like Home Assistant, whose MQTT integration is `single_config_entry` (a second SDK-owned connection is not an option) and forbids background threads.
+
+Inject the client before it connects, then wire the two Homie-correctness pieces the SDK can only set through its own connect path: the Last Will, and the whole-tree republish on (re)connect.
+
+```python
+client = my_host_mqtt_client()                 # created, not yet connected
+device = Device('panel-1', type='...', mqttc=client)
+
+client.set_will(**device.will())               # LWT ($state=lost); must precede connect
+client.on_connect(device.refresh_tree)         # re-announce the retained tree on every (re)connect
+client.connect()                               # host connects on its own loop
+```
+
+`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` through the client and returns immediately, without flushing or closing it. `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
 
 #### Clearing a value vs. an empty-string value
 

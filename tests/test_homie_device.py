@@ -387,10 +387,22 @@ class TestHomiePropertyPublish:
     def test_publish_value_mqtt_not_running(self):
         mock_client = _mock_mqtt_client()
         mock_client.is_running = False
+        mock_client.is_connected.return_value = False  # fully down: not started and not connected
         prop = _make_wired_property(mock_client)
 
         result = prop.publish_value()
         assert result is False
+
+    def test_publish_value_publishes_when_connected_but_not_running(self):
+        """Bring-your-own-transport: a caller-driven client is connected but never gets
+        the SDK's is_running set (the caller owns the loop). Values must still publish (#14)."""
+        mock_client = _mock_mqtt_client()
+        mock_client.is_running = False
+        mock_client.is_connected.return_value = True
+        prop = _make_wired_property(mock_client)
+
+        assert prop.publish_value() is True
+        mock_client.publish.assert_called_once()
 
     def test_publish_skips_none_value_never_published(self):
         mock_client = _mock_mqtt_client()
@@ -1863,6 +1875,101 @@ class TestDeviceStop:
         device.mqttc = None
         device.stop()  # must not raise
         mock_client.stop.assert_not_called()
+
+
+class TestDeviceBYOTransport:
+    """Bring-your-own-transport: inject a client into a root Device (#14).
+
+    The SDK uses an injected client as-is and never starts or stops it; its
+    lifecycle stays the caller's (e.g. a Home Assistant host on its own loop).
+    """
+
+    def test_injected_client_used_without_from_config(self, mock_paho):
+        client = _mock_mqtt_client()
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            device = Device(id="panel-1", mqttc=client)
+            mock_from_config.assert_not_called()  # the SDK does not build a client
+        assert device.mqttc is client
+        assert device.get_mqtt_client() is client
+        assert device._owns_client is False
+
+    def test_sdk_never_starts_an_injected_client(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_running = False  # even if not running, the SDK must not start it
+        device = Device(id="panel-1", mqttc=client)
+        device.start_mqtt_client()
+        client.start.assert_not_called()
+
+    def test_stop_injected_publishes_disconnected_without_flush_or_close(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_connected.return_value = True
+        device = Device(id="panel-1", mqttc=client)
+
+        client.reset_mock()  # ignore construction-time publishes
+        device.stop()
+
+        client.publish.assert_called_once()
+        topic, payload = client.publish.call_args.args
+        assert topic == f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/panel-1/$state"
+        assert payload == DeviceState.DISCONNECTED.value
+        assert client.publish.call_args.kwargs["retain"] is True
+        client.publish_and_flush.assert_not_called()  # owned-only, off the injected surface
+        client.stop.assert_not_called()  # the caller closes its own client
+        assert device.mqttc is None
+
+    def test_stop_injected_broker_down_is_silent(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_connected.return_value = False
+        device = Device(id="panel-1", mqttc=client)
+
+        client.reset_mock()
+        device.stop()
+
+        client.publish.assert_not_called()
+        client.publish_and_flush.assert_not_called()
+        client.stop.assert_not_called()
+        assert device.mqttc is None
+
+    def test_mqttc_and_mqtt_cfg_are_mutually_exclusive(self, mock_paho):
+        with pytest.raises(ValueError, match="mqtt_cfg= and mqttc="):
+            Device(id="panel-1", mqtt_cfg={"host": "x"}, mqttc=_mock_mqtt_client())
+
+    def test_mqttc_and_parent_are_mutually_exclusive(self, mock_paho):
+        root = Device(id="panel-1", mqttc=_mock_mqtt_client())
+        with pytest.raises(ValueError, match="parent= and mqttc="):
+            Device(id="circuit-1", parent=root, mqttc=_mock_mqtt_client())
+
+    def test_injected_root_takes_children_sharing_the_client(self, mock_paho):
+        client = _mock_mqtt_client()
+        root = Device(id="panel-1", mqttc=client)
+        child = Device(id="circuit-1", parent=root)
+        assert child.get_mqtt_client() is client  # child borrows the root's injected client
+        assert root._owns_client is False
+
+    def test_property_start_never_starts_an_injected_client(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_running = False
+        node = Node(id="core", name="Core", type="sensor")
+        Device(id="panel-1", mqttc=client, nodes=[node])  # wires node -> device (root, not owned)
+        prop = Property(id="power", value=1.0, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)
+
+        client.reset_mock()
+        prop.start_mqtt_client()  # the other start site besides Device.start_mqtt_client
+        client.start.assert_not_called()
+
+    def test_on_disconnect_is_accepted_but_inert_for_an_injected_client(self, mock_paho):
+        client = _mock_mqtt_client()
+        cb = MagicMock()
+        with patch("ebus_sdk.homie.logger") as mock_logger:
+            device = Device(id="panel-1", mqttc=client, on_disconnect=cb)
+        assert device._on_disconnect is cb  # accepted (mirrors Controller), not rejected
+        assert any("OnDisconnectInert" in str(c) for c in mock_logger.warning.call_args_list)
+
+    def test_parent_and_empty_mqtt_cfg_are_mutually_exclusive(self, mock_paho):
+        root = Device(id="panel-1")  # transport-free root
+        with pytest.raises(ValueError, match="parent= and mqtt_cfg="):
+            Device(id="circuit-1", parent=root, mqtt_cfg={})
 
 
 class TestDeviceWithoutTransport:
