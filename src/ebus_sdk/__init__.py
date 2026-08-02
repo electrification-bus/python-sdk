@@ -79,7 +79,7 @@ from .topology import (
 from ebus_mqtt_client import MqttClient
 
 # Structural types for a caller-supplied MQTT client
-from ebus_sdk.transport import MqttControllerTransport, MqttTransport
+from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport, MqttTransport
 
 __version__ = "0.15.0"
 
@@ -135,4 +135,5 @@ __all__ = [
     "MqttClient",
     "MqttTransport",
     "MqttControllerTransport",
+    "MqttDeviceTransport",
 ]

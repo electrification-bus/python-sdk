@@ -62,7 +62,7 @@ from functools import partial
 from typing import Any, Callable, List, Optional, Type, Union
 from ebus_mqtt_client import MqttClient
 
-from ebus_sdk.transport import MqttControllerTransport
+from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport
 
 # Optional: JSONSchema validation of a `json` property's `$format`. Kept optional
 # (see `ebus-sdk[validation]`) so a constrained build can omit it; absent it,
@@ -667,7 +667,7 @@ class Property:
         logger.debug(f"reason=getDatatype,datatype={datatype}")
         return datatype
 
-    def get_mqtt_client(self) -> MqttClient:
+    def get_mqtt_client(self) -> Optional[MqttDeviceTransport]:
         """
         Who calls this function, and why?
         """
@@ -689,16 +689,17 @@ class Property:
             logger.warning(f"reason=propertyStartMqttClientNoMqttClient,propertyID={self._id}")
             return
         # Never start a caller-owned client (bring-your-own-transport): mirror the
-        # ownership guard on Device.start_mqtt_client(). Resolve the root via
-        # node -> device -> root; an incomplete chain falls through as owned.
+        # ownership guard on Device.start_mqtt_client(), and start via the concrete
+        # owned handle (start() is owned-only, off the MqttDeviceTransport surface).
+        # Resolve the root via node -> device -> root; an incomplete chain is a no-op.
         node = self.node()
         device = node.device() if node else None
         root = device.root() if device else None
-        if root is not None and not root._owns_client:
+        if root is None or not root._owns_client or root._owned_client is None:
             return
         try:
-            if not mqttc.is_running:
-                mqttc.start()
+            if not root._owned_client.is_running:
+                root._owned_client.start()
         except Exception as e:
             logger.warning(f"reason=propertyStartMqttClientException,e={e}")
 
@@ -1056,7 +1057,7 @@ class Node:
     def set_device(self, device: Device) -> None:
         self._device = device
 
-    def get_mqtt_client(self) -> MqttClient:
+    def get_mqtt_client(self) -> Optional[MqttDeviceTransport]:
         device = self.device()
         if not device:
             logger.warning(f"reason=nodeGetMqttClientNoDevice,nodeID={self._id}")
@@ -1289,7 +1290,7 @@ class Device:
         extensions: Optional[List] = None,
         description_extras: Optional[dict] = None,
         mqtt_cfg: Optional[dict] = None,
-        mqttc: Optional[MqttClient] = None,
+        mqttc: Optional[MqttDeviceTransport] = None,
         qos: int = EBUS_HOMIE_MQTT_QOS,
         on_disconnect: Optional[Callable[[bool], None]] = None,
     ):
@@ -1324,8 +1325,13 @@ class Device:
         # Controller's bring-your-own-transport seam). mqttc=None is the owned path
         # (the SDK builds the client from mqtt_cfg) or transport-free (mqtt_cfg=None,
         # no socket). Only the root holds a client; children read root._owns_client.
-        self.mqttc = mqttc
+        self.mqttc: Optional[MqttDeviceTransport] = mqttc
         self._owns_client = mqttc is None
+        # The SDK-constructed client, kept as its concrete type so start() / stop() /
+        # publish_and_flush() -- which exist only on a client we own -- stay callable.
+        # Stays None for an injected client, which makes "never started, never stopped"
+        # a property of the types rather than a promise in a comment (mirrors Controller).
+        self._owned_client: Optional[MqttClient] = None
         self._state = None
         self._qos = qos
         # Optional consumer hook: called on the ROOT's MQTT (dis)connect. Only a
@@ -1487,7 +1493,7 @@ class Device:
         """
         return self._nodes
 
-    def get_mqtt_client(self) -> MqttClient:
+    def get_mqtt_client(self) -> Optional[MqttDeviceTransport]:
         """
         Return the MQTT client for this device's tree.
         For root devices, returns self.mqttc. For children, ascends to root.
@@ -1510,8 +1516,10 @@ class Device:
             # Bring-your-own-transport: the caller owns the client's lifecycle, so
             # the SDK never starts it (it is expected to be connected already).
             return
-        if not root.mqttc.is_running:
-            root.mqttc.start()
+        # Owned path: start via the concrete handle (start() is owned-only, off the
+        # MqttDeviceTransport surface). _owned_client is set whenever _owns_client is True.
+        if root._owned_client is not None and not root._owned_client.is_running:
+            root._owned_client.start()
 
     def is_connected(self) -> bool:
         """
@@ -1566,8 +1574,8 @@ class Device:
         if mqttc.is_connected():
             root._state = DeviceState.DISCONNECTED
             state_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
-            if root._owns_client:
-                flushed = mqttc.publish_and_flush(
+            if root._owns_client and root._owned_client is not None:
+                flushed = root._owned_client.publish_and_flush(
                     state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
                 )
                 logger.info(f"reason=deviceStopDisconnectedPublished,id={root._id},flushed={flushed}")
@@ -1581,9 +1589,10 @@ class Device:
                 logger.info(f"reason=deviceStopDisconnectedPublishedInjected,id={root._id}")
         else:
             logger.info(f"reason=deviceStopBrokerUnreachable,id={root._id}")
-        if root._owns_client:
-            mqttc.stop(timeout=stop_timeout)
+        if root._owns_client and root._owned_client is not None:
+            root._owned_client.stop(timeout=stop_timeout)
         root.mqttc = None
+        root._owned_client = None
 
     def description(self) -> dict:
         """
@@ -2111,13 +2120,18 @@ class Device:
             # If we already have a mqtt client, don't reconnect...
             return
         try:
-            self.mqttc = MqttClient.from_config(
+            # Bind to a local of the concrete type so start() / stop() resolve later:
+            # self.mqttc is MqttDeviceTransport, which deliberately has neither. Both
+            # references are set before any start(), so behavior is unchanged.
+            client = MqttClient.from_config(
                 mqtt_cfg=self._mqtt_cfg,
                 client_id=self._id,
                 lwt=self.will(),
                 on_connect_callback=partial(self.on_connect),
                 on_disconnect_callback=self._handle_disconnect,
             )
+            self._owned_client = client
+            self.mqttc = client
         except Exception:
             logger.exception(f"reason=deviceConnectBrokerFailed,id={self._id}")
             raise

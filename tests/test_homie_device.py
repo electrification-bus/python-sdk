@@ -1972,6 +1972,62 @@ class TestDeviceBYOTransport:
             Device(id="circuit-1", parent=root, mqtt_cfg={})
 
 
+class TestMqttDeviceTransportProtocol:
+    """The Device injection point is typed by what the SDK calls on an injected client (#14).
+
+    MqttDeviceTransport = MqttTransport (publish/subscribe) + is_connected() + is_running.
+    It has a data member (is_running), so use isinstance, not issubclass.
+    """
+
+    def test_protocol_is_exported_from_the_package_root(self):
+        import ebus_sdk
+
+        assert "MqttDeviceTransport" in ebus_sdk.__all__
+        assert ebus_sdk.MqttDeviceTransport is not None
+
+    def test_a_minimal_client_is_a_valid_device_transport(self):
+        """publish / subscribe / is_connected / is_running is the whole injected-Device
+        contract. Deliberately no start / stop / publish_and_flush: the SDK never calls
+        those on an injected client, so a minimal client that lacks them still works."""
+        from ebus_sdk import MqttDeviceTransport
+
+        class Minimal:
+            is_running = True
+
+            def publish(self, topic, data, qos=1, retain=False):
+                return None
+
+            def subscribe(self, sub, param, qos=1):
+                return None
+
+            def is_connected(self):
+                return True
+
+        client = Minimal()
+        assert isinstance(client, MqttDeviceTransport)
+
+        device = Device(id="panel-1", type="dev.test", mqttc=client)
+        device.stop()  # must not reach start()/stop() on a client that has neither
+
+    def test_owned_client_handle_is_none_when_injected(self):
+        client = _mock_mqtt_client()
+        device = Device(id="panel-1", mqttc=client)
+        assert device._owned_client is None
+        device.start_mqtt_client()  # no-op for an injected client
+        client.start.assert_not_called()
+
+    def test_owned_client_handle_is_set_and_cleared_for_an_sdk_built_client(self):
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            client = _mock_mqtt_client()
+            client.is_connected.return_value = True
+            mock_from_config.return_value = client
+            device = Device(id="panel-1", mqtt_cfg={"host": "x"})
+            assert device._owned_client is client
+            device.stop()
+            client.stop.assert_called_once()  # stops via the owned handle
+            assert device._owned_client is None
+
+
 class TestDeviceWithoutTransport:
     """`mqtt_cfg=None` — the declared default — builds a device tree with no transport."""
 

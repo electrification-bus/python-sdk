@@ -51,7 +51,27 @@ class MqttControllerTransport(MqttTransport, Protocol):
 
     ``is_connected``, ``is_running`` and ``publish_and_flush`` are absent because nothing on
     the ``Controller`` path calls them — they belong to the ``Device`` / ``Property`` path,
-    which has no injection point today.
+    which types its own injection point with ``MqttDeviceTransport`` below.
     """
 
     def unsubscribe(self, sub: str) -> object: ...
+
+
+@runtime_checkable
+class MqttDeviceTransport(MqttTransport, Protocol):
+    """What the SDK calls on a client injected into a root ``Device``.
+
+    ``MqttTransport`` plus ``is_connected()`` and the ``is_running`` attribute, which the
+    device publish path reads to gate publishing on connectivity. Like
+    ``MqttControllerTransport`` it omits ``start`` / ``stop`` (and ``publish_and_flush``):
+    those are owned-only and resolve on the concrete client the SDK builds
+    (``Device._owned_client``), never on an injected one, so the no-start/no-stop guarantee
+    is a property of the types rather than a promise in a comment.
+
+    This protocol has a data member (``is_running``), so use ``isinstance`` for runtime
+    checks; ``issubclass`` is unsupported for protocols with non-method members.
+    """
+
+    def is_connected(self) -> bool: ...
+
+    is_running: bool
