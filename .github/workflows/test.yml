@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Run every version even if one fails, so a single-version break is
+      # visible as exactly that rather than masking the rest.
+      fail-fast: false
+      matrix:
+        # Mirror pyproject's requires-python (>=3.10) and the classifiers.
+        # CI previously ran only 3.12, so 3.10/3.11/3.13 were unverified
+        # despite being declared supported (the StrEnum polyfill in homie.py
+        # exists precisely for <3.11).
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: python -m pytest -q
