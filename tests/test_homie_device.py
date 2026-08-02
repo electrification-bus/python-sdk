@@ -856,6 +856,28 @@ class TestDeviceInit:
             assert lwt["payload"] == DeviceState.LOST.value
             assert "$state" in lwt["topic"]
 
+    def test_will_exposes_lost_descriptor(self, mock_paho):
+        """will() exposes the root's $state=lost LWT for a bring-your-own-transport caller (#13)."""
+        device, _ = _make_device(mock_paho, device_id="panel-1")
+        will = device.will()
+        assert will["payload"] == DeviceState.LOST.value
+        assert will["topic"].endswith("/panel-1/$state")
+
+    def test_will_matches_the_owned_client_lwt(self, mock_paho):
+        """The LWT the SDK installs on a client it builds is exactly will(), so the two cannot drift (#13)."""
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            mock_from_config.return_value = _mock_mqtt_client()
+            device = Device(id="panel-1", mqtt_cfg={"host": "localhost", "port": 1883})
+            assert mock_from_config.call_args[1]["lwt"] == device.will()
+
+    def test_will_describes_root_from_a_child(self, mock_paho):
+        """Children share the root's connection; will() names the root's $state from any handle (#13)."""
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            mock_from_config.return_value = _mock_mqtt_client()
+            root = Device(id="panel-1", mqtt_cfg={"host": "localhost", "port": 1883})
+            child = Device(id="bess-1", parent=root)
+            assert child.will()["topic"].endswith("/panel-1/$state")
+
     def test_on_connect_callback_set(self, mock_paho):
         with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
             mock_client = _mock_mqtt_client()

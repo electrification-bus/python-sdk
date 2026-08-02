@@ -1266,6 +1266,43 @@ class TestTreeRootedReconnect:
         assert set(ctrl.devices.keys()) == {"panel-1", "bess-1"}
 
 
+class TestControllerResync:
+    """resync() is the public reconnect hook a bring-your-own-transport caller wires (#13).
+
+    An injected client bypasses MqttClient.from_config, so the SDK's on_connect
+    (which resets tree-rooted bookkeeping) is never registered on it. resync()
+    exposes that reset so a BYO tree-rooted caller can drive the re-walk itself.
+    """
+
+    def test_resync_resets_tree_rooted_registry(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        _push_state(ctrl, "bess-1", "ready")
+        assert "bess-1" in ctrl.devices
+
+        ctrl.resync()
+
+        assert set(ctrl.devices.keys()) == {"panel-1"}
+        assert ctrl.devices["panel-1"].state is None
+
+    def test_resync_is_noop_when_not_tree_rooted(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho)  # wildcard mode
+        ctrl.devices["some-dev"] = DiscoveredDevice("some-dev")
+        ctrl.resync()
+        assert "some-dev" in ctrl.devices
+
+    def test_on_connect_delegates_to_resync(self, mock_paho):
+        """The owned-client path resets via resync(), so the refactor preserved behavior (#13)."""
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        called = []
+        ctrl.resync = lambda: called.append(True)
+        ctrl._on_connect()
+        assert called == [True]
+
+
 class TestControllerBYOTransport:
     """Bring-your-own-transport: inject an MQTT client instead of constructing one (SDK-61t.6)."""
 

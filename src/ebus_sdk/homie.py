@@ -1819,6 +1819,11 @@ class Device:
         Republish this device and every descendant (description, nodes,
         property values, state). Used on broker reconnect (S6) so the entire
         tree's retained-state is re-established under the root's connection.
+
+        For a client the SDK owns, ``on_connect`` calls this automatically on
+        every (re)connect. A bring-your-own-transport caller must call it from
+        their own on-connect handler, so the retained tree re-announces after a
+        broker reconnect the SDK's ``on_connect`` never sees.
         """
         logger.info(
             f"reason=deviceRefreshTree,deviceId={self._id},"
@@ -1986,6 +1991,23 @@ class Device:
         logger.info(f"reason=deviceDisconnect,rootId={self._id},transportRc={rc}")
         _dispatch_disconnect(self._on_disconnect, rc, f"device:{self._id}")
 
+    def will(self) -> dict:
+        """The Last Will and Testament for this device tree: the root's ``$state=lost``.
+
+        The SDK installs this on any client it constructs (see ``connect_broker``).
+        It is exposed because a bring-your-own-transport caller (a root ``Device``
+        handed a live client) must set the will on that client BEFORE connecting:
+        the will rides the MQTT CONNECT packet, so the SDK cannot add it to a
+        client it is merely given after that client has connected. Children share
+        the root's connection, so this always describes the root regardless of
+        which device in the tree it is called on.
+        """
+        root = self.root()
+        return {
+            "topic": f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state",
+            "payload": DeviceState.LOST.value,
+        }
+
     def connect_broker(self) -> None:
         """
         Connect to MQTT broker using configuration from mqtt_cfg.
@@ -2013,15 +2035,11 @@ class Device:
         if self.mqttc:
             # If we already have a mqtt client, don't reconnect...
             return
-        lwt = {
-            "topic": f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/$state",
-            "payload": DeviceState.LOST.value,
-        }
         try:
             self.mqttc = MqttClient.from_config(
                 mqtt_cfg=self._mqtt_cfg,
                 client_id=self._id,
-                lwt=lwt,
+                lwt=self.will(),
                 on_connect_callback=partial(self.on_connect),
                 on_disconnect_callback=self._handle_disconnect,
             )
@@ -2329,16 +2347,33 @@ class Controller:
         return self._qos
 
     def _on_connect(self) -> None:
-        """Called when controller connects to MQTT broker.
+        """Called when the controller's owned MQTT client (re-)connects.
 
         MqttClient re-subscribes its own sub_callbacks dict on reconnect, so
-        topic-level recovery is already handled. In tree-rooted mode, the
-        controller's own bookkeeping (devices dict, current children) is reset
-        here so the retained $state/$description that paho delivers on the
-        fresh subscriptions drives a clean re-walk of the tree from the root,
-        identical to first-connect.
+        topic-level recovery is already handled; the discovery-state reset for
+        tree-rooted mode lives in the public ``resync()``, which a
+        bring-your-own-transport caller wires onto its own client.
         """
         logger.info("reason=controllerOnConnect")
+        self.resync()
+
+    def resync(self) -> None:
+        """Reset discovery bookkeeping so retained state re-walks the tree from scratch.
+
+        In tree-rooted mode this wipes the in-memory device registry and the
+        subscribed-children map and re-seeds the root, so the retained
+        ``$state``/``$description`` the broker replays after a (re)connect
+        drives a clean re-walk from the root (the state edge that gates
+        descendant discovery is seen rather than short-circuited by stale
+        state). A no-op in wildcard and single-device modes, where MqttClient's
+        own sub_callbacks recovery is sufficient.
+
+        The SDK calls this on every (re)connect for a client it owns. A
+        bring-your-own-transport caller (``Controller(mqttc=...)``) in
+        tree-rooted mode must call it from their own on-connect handler, since
+        the SDK's ``on_connect`` is registered only on a client it constructs
+        (via ``MqttClient.from_config``), which an injected client bypasses.
+        """
         if self.is_tree_rooted:
             # Cold restart of tree-rooted bookkeeping. paho-mqtt's MqttClient
             # has already re-subscribed our root's four filters; retained
