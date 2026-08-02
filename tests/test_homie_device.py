@@ -1,6 +1,7 @@
 """Tests for ebus_sdk.homie device-role classes: Property, Node, Device, and helpers."""
 
 import json
+import logging
 from enum import Enum
 from unittest.mock import MagicMock, patch
 
@@ -2050,3 +2051,96 @@ class TestDeviceWithoutTransport:
 
         with pytest.raises(RuntimeError, match="has no MQTT client"):
             Device(id="child", type="dev.child", parent=root)
+
+
+class TestTransportFreeLogSeverity:
+    """A tree built without transport reports "no client" at DEBUG, not WARNING (#11).
+
+    The message is right either way; only the cause differs. Transport-free means the caller
+    asked for no client, so every traversal announcing one is noise — a 31-device tree emitted
+    1,593 WARNING lines saying only that it got what it requested. A root that was given a
+    config, or handed a client, is the case where a missing client is a real fault, and that
+    one stays exactly as loud as it was.
+    """
+
+    @staticmethod
+    def _tree(**root_kwargs):
+        root = Device(id="root", name="Root", type="dev.root", **root_kwargs)
+        node = root.add_node_from_dict({"id": "meter", "name": "meter", "type": "cap.meter"})
+        prop = node.add_property_from_dict({"id": "power", "name": "power", "datatype": "float", "settable": True})
+        return root, node, prop
+
+    @staticmethod
+    def _no_client_records(caplog, level):
+        return [r for r in caplog.records if r.levelno == level and "NoMqttClient" in r.getMessage()]
+
+    def test_transport_free_tree_reports_missing_client_at_debug(self, caplog):
+        """The whole point: no WARNING anywhere in a tree that asked for no transport."""
+        root, _node, prop = self._tree()
+
+        with caplog.at_level(logging.DEBUG, logger="homie"):
+            prop.get_mqtt_client()  # property -> node -> device, three sites in one call
+            prop.publish_value()
+            prop.set_subscribe()
+            prop.start_mqtt_client()
+            root.start_mqtt_client()
+            root.stop()
+
+        assert self._no_client_records(caplog, logging.WARNING) == []
+        assert self._no_client_records(caplog, logging.DEBUG)
+
+    def test_a_root_given_a_config_still_warns(self, caplog):
+        """The "you forgot to start the root" case, which the issue is careful to preserve.
+
+        `_mqtt_cfg` is what separates it: a root that was told how to build a client and has
+        none is broken, where a root told nothing is simply passive.
+        """
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            mock_from_config.return_value = _mock_mqtt_client()
+            root, _node, prop = self._tree(mqtt_cfg={"host": "broker.invalid"})
+        root.mqttc = None  # client expected, absent — the genuine fault
+
+        with caplog.at_level(logging.DEBUG, logger="homie"):
+            prop.get_mqtt_client()
+
+        assert root._transport_free() is False
+        assert self._no_client_records(caplog, logging.WARNING)
+
+    def test_an_injected_client_is_not_transport_free(self):
+        """Bring-your-own-transport is the opposite of transport-free, even though both
+        leave `_mqtt_cfg` unset — the client is present, so its absence would be an anomaly."""
+        root = Device(id="root", type="dev.root", mqttc=_mock_mqtt_client())
+
+        assert root._transport_free() is False
+
+    def test_the_predicate_resolves_from_every_level(self):
+        """Property and Node answer for their tree, not for themselves."""
+        root, node, prop = self._tree()
+        child = Device(id="child", type="dev.child", parent=root)
+
+        assert root._transport_free() is True
+        assert child._transport_free() is True
+        assert node._transport_free() is True
+        assert prop._transport_free() is True
+
+    def test_a_detached_entity_stays_loud(self, caplog):
+        """An incomplete chain cannot prove the tree is transport-free, so it does not go
+        quiet: a property with no node is a bug, and silencing it would hide one."""
+        orphan = Property(id="power", name="power", datatype=PropertyDatatype.FLOAT)
+
+        assert orphan._transport_free() is False
+
+    def test_device_publish_keeps_its_own_severity_when_a_client_was_expected(self, caplog):
+        """`devicePublishNoMqttClient` was already INFO on main. Transport-free drops it to
+        DEBUG; the expected-a-client case keeps INFO rather than being escalated."""
+        with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
+            mock_from_config.return_value = _mock_mqtt_client()
+            root, _node, _prop = self._tree(mqtt_cfg={"host": "broker.invalid"})
+        root.mqttc = None
+
+        with caplog.at_level(logging.DEBUG, logger="homie"):
+            root.publish(attribute="$state", value="ready")
+
+        assert [
+            r for r in caplog.records if r.levelno == logging.INFO and "devicePublishNoMqttClient" in r.getMessage()
+        ]

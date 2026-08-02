@@ -74,6 +74,21 @@ except ImportError:  # pragma: no cover - exercised via the graceful-skip path
 
 logger = logging.getLogger("homie")
 
+
+def _log_missing_client(message: str, *, by_design: bool, level: int = logging.WARNING) -> None:
+    """Log a missing MQTT client at the severity its cause deserves.
+
+    A tree built without transport has no client because that is what was asked for, so
+    every entity in it reports one on each traversal — thousands of lines saying only that
+    the caller got what they requested. That case is DEBUG.
+
+    Everywhere else a client was expected: the root was given a config, or handed one, and
+    its absence means something went wrong. That case keeps the severity it had, so the
+    "you forgot to start the root" warning stays as loud as it was.
+    """
+    logger.log(logging.DEBUG if by_design else level, message)
+
+
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
 _jsonschema_warned = False
 
@@ -532,6 +547,14 @@ class Property:
         """
         return self._node
 
+    def _transport_free(self) -> bool:
+        """See ``Device._transport_free``. Resolved node -> device, mirroring the walk in
+        ``start_mqtt_client``; an incomplete chain falls through as *not* transport-free so
+        a half-built tree stays loud rather than going quiet."""
+        node = self.node()
+        device = node.device() if node is not None else None
+        return device._transport_free() if device is not None else False
+
     def get_node_id(self) -> str:
         """
         Why is this needed?
@@ -677,7 +700,9 @@ class Property:
             return None
         mqttc = node.get_mqtt_client()
         if not mqttc:
-            logger.warning(f"reason=propertyGetMqttClientNoMqttClient,propertyID={self._id}")
+            _log_missing_client(
+                f"reason=propertyGetMqttClientNoMqttClient,propertyID={self._id}", by_design=self._transport_free()
+            )
         return mqttc
 
     def start_mqtt_client(self) -> None:
@@ -686,7 +711,9 @@ class Property:
         """
         mqttc = self.get_mqtt_client()
         if not mqttc:
-            logger.warning(f"reason=propertyStartMqttClientNoMqttClient,propertyID={self._id}")
+            _log_missing_client(
+                f"reason=propertyStartMqttClientNoMqttClient,propertyID={self._id}", by_design=self._transport_free()
+            )
             return
         # Never start a caller-owned client (bring-your-own-transport): mirror the
         # ownership guard on Device.start_mqtt_client(). Resolve the root via
@@ -757,7 +784,9 @@ class Property:
         # is_running covers the owned path (True after start()); for an owned client
         # connected implies running, so this does not change owned behavior.
         if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
-            logger.warning(f"reason=propertyPublishValueNoMqttClient,id={self._id}")
+            _log_missing_client(
+                f"reason=propertyPublishValueNoMqttClient,id={self._id}", by_design=self._transport_free()
+            )
             return False
         node_id = self.get_node_id()
         device_id = self.get_device_id()
@@ -836,7 +865,9 @@ class Property:
         # See publish_value: gate on connectivity so an injected (caller-driven)
         # client can retract a retained value even without the SDK's is_running.
         if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
-            logger.warning(f"reason=propertyClearValueNoMqttClient,propertyID={self._id}")
+            _log_missing_client(
+                f"reason=propertyClearValueNoMqttClient,propertyID={self._id}", by_design=self._transport_free()
+            )
             return False
         node_id = self.get_node_id()
         device_id = self.get_device_id()
@@ -956,7 +987,7 @@ class Property:
         logger.debug(f"reason=propertySetSubscribe,id={self._id}")
         mqttc = self.get_mqtt_client()
         if not mqttc:
-            logger.warning("reason=propertySetSubscribeNoMqttClient")
+            _log_missing_client("reason=propertySetSubscribeNoMqttClient", by_design=self._transport_free())
             return
         if not self.settable():
             logger.debug(f"reason=propertySetSubscribePropertyNotSettable,id={self._id}")
@@ -1053,6 +1084,12 @@ class Node:
     def device(self) -> Device:
         return self._device
 
+    def _transport_free(self) -> bool:
+        """See ``Device._transport_free``. An incomplete chain falls through as *not*
+        transport-free so a half-built tree stays loud rather than going quiet."""
+        device = self.device()
+        return device._transport_free() if device is not None else False
+
     def set_device(self, device: Device) -> None:
         self._device = device
 
@@ -1063,7 +1100,9 @@ class Node:
             return None
         mqttc = device.get_mqtt_client()
         if not mqttc:
-            logger.warning(f"reason=nodeGetMqttClientNoMqttClient,nodeID={self._id}")
+            _log_missing_client(
+                f"reason=nodeGetMqttClientNoMqttClient,nodeID={self._id}", by_design=self._transport_free()
+            )
         return mqttc
 
     def add_property(self, property: Property) -> Property:
@@ -1409,6 +1448,18 @@ class Device:
         """
         return self if self._parent is None else self._parent.root()
 
+    def _transport_free(self) -> bool:
+        """True when this tree was deliberately built without transport.
+
+        The root holds no client and was given no config to build one from, so "no client"
+        is the requested state rather than a fault: the tree is serving as a naming and
+        structure model for topic derivation, ``$description``, or tests. A root that was
+        handed a client or given a config is the opposite case — there a missing client is
+        an anomaly and stays a warning.
+        """
+        root = self.root()
+        return root.mqttc is None and root._mqtt_cfg is None
+
     @staticmethod
     def now_ems() -> int:
         """
@@ -1494,7 +1545,9 @@ class Device:
         """
         mqttc = self.root().mqttc
         if not mqttc:
-            logger.warning(f"reason=deviceGetMqttClientNoMqttClient,id={self._id}")
+            _log_missing_client(
+                f"reason=deviceGetMqttClientNoMqttClient,id={self._id}", by_design=self._transport_free()
+            )
         return mqttc
 
     def start_mqtt_client(self) -> None:
@@ -1504,7 +1557,9 @@ class Device:
         """
         root = self.root()
         if root.mqttc is None:
-            logger.warning(f"reason=deviceStartMqttClientNoMqttClient,id={self._id}")
+            _log_missing_client(
+                f"reason=deviceStartMqttClientNoMqttClient,id={self._id}", by_design=self._transport_free()
+            )
             return
         if not root._owns_client:
             # Bring-your-own-transport: the caller owns the client's lifecycle, so
@@ -1558,7 +1613,7 @@ class Device:
         root = self.root()
         mqttc = root.mqttc
         if mqttc is None:
-            logger.warning(f"reason=deviceStopNoMqttClient,id={self._id}")
+            _log_missing_client(f"reason=deviceStopNoMqttClient,id={self._id}", by_design=self._transport_free())
             return
         # Best-effort graceful $state=disconnected. publish_and_flush is bounded
         # and returns False (never blocks/raises) when the broker is unreachable,
@@ -1709,7 +1764,9 @@ class Device:
 
         mqttc = self.get_mqtt_client()
         if not mqttc:
-            logger.warning(f"reason=deviceDeleteAllFromMqttNoMqttClient,deviceId={self._id}")
+            _log_missing_client(
+                f"reason=deviceDeleteAllFromMqttNoMqttClient,deviceId={self._id}", by_design=self._transport_free()
+            )
             return
 
         base_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
@@ -1799,7 +1856,9 @@ class Device:
         """
         mqttc = self.get_mqtt_client()
         if not mqttc:
-            logger.warning(f"reason=deviceClearTopicNoMqttClient,topic={topic_path}")
+            _log_missing_client(
+                f"reason=deviceClearTopicNoMqttClient,topic={topic_path}", by_design=self._transport_free()
+            )
             return False
         try:
             mqttc.publish(topic_path, "", retain=True, qos=self._qos)
@@ -1921,7 +1980,11 @@ class Device:
         """
         mqttc = self.get_mqtt_client()
         if not mqttc:
-            logger.info(f"reason=devicePublishNoMqttClient,attribute={attribute}")
+            _log_missing_client(
+                f"reason=devicePublishNoMqttClient,attribute={attribute}",
+                by_design=self._transport_free(),
+                level=logging.INFO,
+            )
             return
         if not self._id:
             logger.info("reason=devicePublishNoDeviceID")
