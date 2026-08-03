@@ -40,3 +40,29 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           print-hash: true
+
+  # After a successful PyPI publish, mirror the release to GitHub Releases,
+  # using the tag's CHANGELOG section as the notes. Idempotent (create or edit).
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Create GitHub Release from the CHANGELOG section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" > notes.md <<'PY'
+          import re, sys, pathlib
+          v = re.escape(sys.argv[1])
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          m = re.search(rf"^## \[{v}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.S | re.M)
+          body = (m.group(1).strip() if m else "") or "See CHANGELOG.md."
+          sys.stdout.write(body + "\n")
+          PY
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md --verify-tag \
+            || gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md

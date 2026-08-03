@@ -39,12 +39,12 @@ Pull requests are welcome.
 - **Lint before sending.** The repo enforces [ruff](https://github.com/astral-sh/ruff) via the [`lint`](.github/workflows/lint.yml) workflow — run `ruff check` and `ruff format` locally before pushing. CI will catch what you miss, but green-first is friendlier.
 - **Tests are required.** New behavior needs a test (`pytest tests/`); new bug fixes need a regression test. Match the existing pattern (mocked paho via `ebus-mqtt-client`'s test scaffolding) unless the change genuinely requires a real broker — in which case open a Discussion first.
 - **Keep comments to a minimum.** The project style is to write self-explanatory code and reserve comments for non-obvious *why* (a spec quirk, a Homie nuance, a workaround for a specific paho behavior). Don't add comments that just restate the code.
-- **Version bumps touch two files.** When a release-worthy change lands, bump `version` in both `pyproject.toml` and `setup.py` (the `setup.py` shim exists so legacy `setuptools<61` — pinned in Yocto kirkstone — can build a wheel with correct metadata; the docstring at the top of `setup.py` explains this).
+- **The version lives in one place.** When a release-worthy change lands, bump `__version__` in `src/ebus_sdk/__init__.py`; that is the single source of truth. `pyproject.toml` reads it dynamically (`dynamic = ["version"]` plus `[tool.setuptools.dynamic]`) and the `setup.py` shim reads the same literal by regex, so neither file carries a `version` value to edit (the shim exists so legacy `setuptools<61`, pinned in Yocto kirkstone, can build a wheel with correct metadata; the docstring at the top of `setup.py` explains this).
 - One commit per logical change is fine; we don't require squash or any particular branch naming.
 
 ## Releases
 
-Releases to PyPI are automated via the [`Publish to PyPI`](.github/workflows/publish.yml) GitHub Actions workflow, which runs on `v*` git tags using PyPI [trusted publishing](https://docs.pypi.org/trusted-publishers/). Contributors don't need to do anything special — once a maintainer tags `vX.Y.Z`, the workflow tests and publishes.
+Releases to PyPI are automated via the [`Publish to PyPI`](.github/workflows/publish.yml) GitHub Actions workflow, which runs on `v*` git tags using PyPI [trusted publishing](https://docs.pypi.org/trusted-publishers/). Contributors don't need to do anything special: once a maintainer tags `vX.Y.Z`, the workflow tests, publishes to PyPI, and creates a GitHub Release using that version's `CHANGELOG.md` section as the notes.
 
 ## Code of conduct
 
