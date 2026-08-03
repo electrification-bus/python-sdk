@@ -4,6 +4,14 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `Device(async_loop=...)`: set the consumer's asyncio event loop once on the root instead of on every settable `Property`. It propagates to every property in the tree via `add_node()` / `Node.add_property()` (like QoS) and is inherited by child devices, so inbound `/set` callbacks for a tree with N settable properties no longer configure the loop N times. The per-`Property` `async_loop` argument still works and is preserved when no device-level loop is set. ([#15](https://github.com/electrification-bus/python-sdk/issues/15))
+
+### Fixed
+
+- Inbound `/set` on a settable property with an async (coroutine) callback is now dispatched to the consumer's event loop with `asyncio.run_coroutine_threadsafe` instead of `asyncio.ensure_future`. `/set` arrives on the transport's network-loop thread, and `ensure_future` is not safe to call from a thread other than the loop's own, so the previous path could misbehave on a real async host. The dispatch now branches on whether the callback returns a coroutine (not merely on a loop being configured), so a synchronous callback keeps running inline even when a tree-wide loop is set, and an exception raised inside an async callback is logged rather than silently swallowed by the discarded scheduling future. The `async_loop` default is corrected from `False` to `None` (a bool against the event-loop annotation, which `py.typed` surfaces), and `Node`'s mutable default `properties={}` is replaced with `None` (a shared-dict footgun the new propagation reads and writes through). ([#15](https://github.com/electrification-bus/python-sdk/issues/15))
+
 ## [0.16.0] — 2026-08-02
 
 ### Added

@@ -2029,6 +2029,105 @@ class TestMqttDeviceTransportProtocol:
             assert device._owned_client is None
 
 
+class TestInboundAsyncLoop:
+    """Inbound /set async dispatch: async_loop promoted to the root, thread-safe (#15)."""
+
+    def test_async_loop_default_is_none(self):
+        # Was `Optional[...] = False` (a bool against the loop annotation); now None.
+        assert Property(id="mode").async_loop is None
+
+    def test_device_async_loop_propagates_via_add_node(self):
+        loop = MagicMock()
+        prop = Property(id="setpoint", datatype=PropertyDatatype.FLOAT)
+        node = Node(id="core", name="Core", type="sensor", properties={"setpoint": prop})
+        Device(id="dev", async_loop=loop, nodes=[node])  # add_node propagates to the node's props
+        assert prop.async_loop is loop
+
+    def test_device_async_loop_propagates_via_node_add_property(self):
+        loop = MagicMock()
+        device = Device(id="dev", async_loop=loop)  # transport-free root
+        node = Node(id="core", name="Core", type="sensor")
+        device.add_node(node)
+        prop = Property(id="setpoint", value=1.0, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)  # node is attached -> propagates the device's loop
+        assert prop.async_loop is loop
+
+    def test_child_device_inherits_root_async_loop(self):
+        loop = MagicMock()
+        root = Device(id="root", async_loop=loop)  # transport-free root
+        child = Device(id="child", parent=root)
+        assert child._async_loop is loop  # one loop per tree, inherited by children
+        node = Node(id="core", name="Core", type="sensor")
+        child.add_node(node)
+        prop = Property(id="setpoint", value=1.0, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)
+        assert prop.async_loop is loop
+
+    def test_async_dispatch_uses_run_coroutine_threadsafe(self):
+        """An async /set callback is scheduled onto the consumer's loop thread-safely;
+        /set arrives on the transport's network thread, so ensure_future is unsafe."""
+
+        async def cb(payload):
+            return None
+
+        loop = MagicMock()
+        prop = Property(id="mode", settable=True, set_callback=cb)
+        prop.async_loop = loop
+        with patch("asyncio.run_coroutine_threadsafe") as rct, patch("asyncio.ensure_future") as ef:
+            prop._settable_callback("ebus/5/dev/node/mode/set", b"LOAD_UP")
+        rct.assert_called_once()
+        assert rct.call_args.args[1] is loop  # scheduled onto the given loop
+        ef.assert_not_called()  # never the thread-unsafe ensure_future path
+        rct.call_args.args[0].close()  # close the un-awaited coroutine (rct is mocked)
+
+    def test_sync_dispatch_when_no_loop(self):
+        seen = []
+        prop = Property(id="mode", settable=True, set_callback=lambda v: seen.append(v))
+        assert prop.async_loop is None
+        with patch("asyncio.run_coroutine_threadsafe") as rct:
+            prop._settable_callback("ebus/5/dev/node/mode/set", b"LOAD_UP")
+        assert seen == ["LOAD_UP"]  # invoked synchronously
+        rct.assert_not_called()
+
+    def test_sync_callback_stays_inline_under_device_loop(self):
+        """A device-level loop must not force a sync callback onto the async path: the
+        dispatch branches on the callback's return, not on the loop's presence (#15)."""
+        loop = MagicMock()
+        seen = []
+        prop = Property(id="mode", settable=True, set_callback=lambda v: seen.append(v))
+        prop.async_loop = loop  # a device-level loop is propagated to every property
+        with patch("asyncio.run_coroutine_threadsafe") as rct:
+            prop._settable_callback("ebus/5/dev/node/mode/set", b"ON")
+        assert seen == ["ON"]  # ran inline, once
+        rct.assert_not_called()  # not scheduled: a sync callback returns no coroutine
+
+    def test_per_property_loop_survives_when_device_has_no_loop(self):
+        """Backward compat: a per-Property async_loop is kept when the device sets none."""
+        loop_a = MagicMock()
+        prop = Property(id="setpoint", datatype=PropertyDatatype.FLOAT, async_loop=loop_a)
+        node = Node(id="core", name="Core", type="sensor", properties={"setpoint": prop})
+        Device(id="dev", nodes=[node])  # no async_loop -> propagation is skipped
+        assert prop.async_loop is loop_a
+
+    def test_device_loop_overrides_per_property_loop(self):
+        """One loop per tree: a device-level loop wins over a pre-set per-Property loop."""
+        loop_a, loop_b = MagicMock(), MagicMock()
+        prop = Property(id="setpoint", datatype=PropertyDatatype.FLOAT, async_loop=loop_a)
+        node = Node(id="core", name="Core", type="sensor", properties={"setpoint": prop})
+        Device(id="dev", async_loop=loop_b, nodes=[node])
+        assert prop.async_loop is loop_b
+
+    def test_async_set_callback_exception_is_surfaced(self):
+        """A raising async /set handler is logged, not swallowed by the discarded Future."""
+        prop = Property(id="mode")
+        future = MagicMock()
+        future.cancelled.return_value = False
+        future.exception.return_value = ValueError("bad setpoint")
+        with patch("ebus_sdk.homie.logger") as mock_logger:
+            prop._log_async_set_result(future, "mode")
+        assert any("propertySetAsyncCallbackException" in str(c) for c in mock_logger.error.call_args_list)
+
+
 class TestDeviceWithoutTransport:
     """`mqtt_cfg=None` — the declared default — builds a device tree with no transport."""
 

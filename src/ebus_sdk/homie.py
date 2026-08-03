@@ -478,7 +478,7 @@ class Property:
         supports_target: Optional[bool] = False,
         node: Optional[Node] = None,
         device: Optional[Device] = None,
-        async_loop: Optional[asyncio.SelectorEventLoop] = False,
+        async_loop: Optional[asyncio.AbstractEventLoop] = None,
         from_dict: Optional[dict] = None,
     ):
         if from_dict:
@@ -973,12 +973,34 @@ class Property:
                 # Property supports_target, publish that!
                 self.publish_target_value(payload)
             # Call the property's set_callback function
-            if self.async_loop:
-                asyncio.ensure_future(set_callback(payload), loop=self.async_loop)
-            else:
-                set_callback(payload)
+            # Run the callback: a sync callback runs inline here (on the transport's
+            # network thread, as before); an async (coroutine) callback is scheduled onto
+            # the consumer's event loop thread-safely via run_coroutine_threadsafe
+            # (ensure_future is NOT safe to call from a thread other than the loop's own).
+            # Decide on the callback's actual return, not just async_loop's presence, so a
+            # sync callback stays inline even when a device-level loop is set for the tree.
+            result = set_callback(payload)
+            if self.async_loop is not None and asyncio.iscoroutine(result):
+                future = asyncio.run_coroutine_threadsafe(result, self.async_loop)
+                # The Future is otherwise discarded, so an exception raised inside the
+                # coroutine would vanish silently (the inline path is caught below by the
+                # surrounding try/except). Surface it, matching the sync path's logging.
+                future.add_done_callback(partial(self._log_async_set_result, property_id=property_id))
         except Exception as e:
             logger.exception(f"reason=propertySetCallbackException,e={e}")
+
+    def _log_async_set_result(self, future, property_id) -> None:
+        """Done-callback for an async /set handler scheduled via run_coroutine_threadsafe.
+
+        The scheduling Future is otherwise discarded, and a discarded concurrent.futures
+        Future swallows a stored exception silently (unlike an asyncio.Task). Surface it,
+        matching the synchronous path's ``propertySetCallbackException`` logging.
+        """
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is not None:
+            logger.error(f"reason=propertySetAsyncCallbackException,propertyID={property_id},exc={exc!r}")
 
     def set_subscribe(self) -> None:
         """
@@ -1022,7 +1044,7 @@ class Node:
         id: Optional[str] = None,
         name: Optional[str] = None,
         type: Optional[str] = None,
-        properties: dict = {},
+        properties: Optional[dict] = None,
         device: Optional[Device] = None,
         # mqttc: Optiona[MqttClient] = None, # DCJ pretty sure we can remove this
         from_dict: Optional[dict] = None,
@@ -1047,7 +1069,7 @@ class Node:
             else:
                 self._name = id
             self._type = type
-            self._properties = properties
+            self._properties = properties if properties is not None else {}
             self._device = device
 
     def as_dict(self) -> dict:
@@ -1112,9 +1134,11 @@ class Node:
         """
         if not property.node():
             property.set_node(self)
-        # Propagate QoS from device if available
+        # Propagate QoS (and the async /set dispatch loop, if set) from the device.
         if self._device and hasattr(self._device, "_qos"):
             property._qos = self._device._qos
+        if self._device and getattr(self._device, "_async_loop", None) is not None:
+            property.async_loop = self._device._async_loop
         # Note set_subscribe() checks if property is settable...
         property.set_subscribe()
         # Add property to dictionary BEFORE publishing description
@@ -1331,6 +1355,7 @@ class Device:
         mqtt_cfg: Optional[dict] = None,
         mqttc: Optional[MqttDeviceTransport] = None,
         qos: int = EBUS_HOMIE_MQTT_QOS,
+        async_loop: Optional[asyncio.AbstractEventLoop] = None,
         on_disconnect: Optional[Callable[[bool], None]] = None,
     ):
         # Root vs. child invariants — mutually exclusive. Test presence by identity
@@ -1373,6 +1398,14 @@ class Device:
         self._owned_client: Optional[MqttClient] = None
         self._state = None
         self._qos = qos
+        # The consumer's asyncio event loop for dispatching inbound /set callbacks on
+        # settable properties. Set once per tree on the root and propagated to every
+        # property via add_node() / Node.add_property() (like _qos), rather than
+        # per-property. Children inherit the root's loop unless given their own. None
+        # means /set callbacks run synchronously on the transport's network thread.
+        self._async_loop = (
+            async_loop if async_loop is not None else (parent._async_loop if parent is not None else None)
+        )
         # Optional consumer hook: called on the ROOT's MQTT (dis)connect. Only a
         # root owns a client (children share it), so it fires on the root only.
         # Contract is transport-neutral: on_disconnect(clean: bool), never a paho
@@ -1702,9 +1735,12 @@ class Device:
         """
         if not node.device():
             node.set_device(self)
-        # Propagate device QoS to all properties in this node
+        # Propagate device QoS (and the async /set dispatch loop, if set) to every
+        # property in this node.
         for prop in node.properties().values():
             prop._qos = self._qos
+            if self._async_loop is not None:
+                prop.async_loop = self._async_loop
         node_id = node.id()
         self._nodes.update({node_id: node})
         node.publish()
