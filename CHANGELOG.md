@@ -4,9 +4,15 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-08-02
+
 ### Added
 
 - `Device(async_loop=...)`: set the consumer's asyncio event loop once on the root instead of on every settable `Property`. It propagates to every property in the tree via `add_node()` / `Node.add_property()` (like QoS) and is inherited by child devices, so inbound `/set` callbacks for a tree with N settable properties no longer configure the loop N times. The per-`Property` `async_loop` argument still works and is preserved when no device-level loop is set. ([#15](https://github.com/electrification-bus/python-sdk/issues/15))
+
+### Changed
+
+- Dependency floor: `ebus-mqtt-client>=0.3.0` (was `>=0.2.0`). 0.3.0 ships the PEP 561 `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class instead of `Any`, completing the transport `Protocol` typing (`MqttTransport` / `MqttControllerTransport` / `MqttDeviceTransport`) added in 0.16.0. The bump requires the typed transport rather than any new runtime API: 0.3.0 adds nothing the SDK's runtime needs beyond 0.2.0, and the test suite passes unchanged against it.
 
 ### Fixed
 

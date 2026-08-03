@@ -279,7 +279,7 @@ See [`examples/README.md`](examples/README.md) for example scripts demonstrating
 ## Requirements
 
 - Python 3.10+
-- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.2.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; it also carries, since 0.1.8, the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
+- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.3.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.3.0 ships the `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class rather than `Any`; 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; and, since 0.1.8, it carries the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
 
 Optional extras:
 

@@ -30,13 +30,15 @@ classifiers = [
 dependencies = [
     # MQTT transport lives in ebus-mqtt-client, which pins paho-mqtt; the SDK
     # does not import paho directly, so paho is a transitive dependency (not
-    # declared here). Floor 0.2.0: the SDK adopts the client's
-    # on_disconnect_callback for push disconnect notification (SDK-al5), added in
-    # 0.2.0. It also relies (since 0.1.8) on the client's connect_async
-    # construction for resilient-connect completeness (full tree republish on the
-    # first connect, construction-decoupled from broker availability); older
-    # clients raised ConnectionRefusedError on a down broker.
-    "ebus-mqtt-client>=0.2.0",
+    # declared here). Floor 0.3.0: it ships the PEP 561 py.typed marker, so a
+    # downstream type checker resolves the re-exported MqttClient to the concrete
+    # class instead of Any, completing the transport Protocol typing (MqttTransport
+    # / MqttControllerTransport / MqttDeviceTransport) the SDK added in 0.16.0.
+    # Earlier floors, still relied on: 0.2.0 added the on_disconnect_callback the
+    # disconnect hook adopts (SDK-al5); 0.1.8 added the connect_async construction
+    # the resilient-connect behavior relies on (older clients raised
+    # ConnectionRefusedError on a down broker).
+    "ebus-mqtt-client>=0.3.0",
 ]
 
 [project.optional-dependencies]
