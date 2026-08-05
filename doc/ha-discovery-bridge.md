@@ -102,7 +102,7 @@ HaDiscoveryBridge(
 
 ## The eBus-aware customizer
 
-`ebus_default_override` is a ready-made hook that recognizes the eBus capability vocabulary (`energy.ebus.capability.<capability>` node types plus known property ids) and emits better metadata than unit inference alone: `meter/imported-energy` -> energy + total_increasing, `battery/soc` -> battery (resolving the ambiguous percent), `info/*` -> the `diagnostic` entity category. It only ADDS or SHARPENS; it never suppresses, so it is safe as a blanket `default_override`. Generic Homie devices that do not use the eBus vocabulary fall through to plain inference unchanged.
+`ebus_default_override` is a ready-made hook that recognizes the eBus capability vocabulary (`energy.ebus.capability.<capability>` node types plus known property ids) and emits better metadata than unit inference alone: `meter/imported-energy` -> energy + total_increasing, `soc/soc` -> battery (resolving the ambiguous percent), `soc/soe` -> energy_storage + measurement (a reservoir level, not an accumulating register), `info/*` -> the `diagnostic` entity category. It only ADDS or SHARPENS; it never suppresses, so it is safe as a blanket `default_override`. Generic Homie devices that do not use the eBus vocabulary fall through to plain inference unchanged.
 
 ## Replacing an existing integration: preserving entity_id and history
 

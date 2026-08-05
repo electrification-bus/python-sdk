@@ -28,29 +28,51 @@ from .emit import PropertyContext
 # value; other keys (`entity_category` / `icon`) land in the component config
 # overlay. A capability's "*" entry applies to every property on that capability.
 _CAPABILITY_META = {
+    # energy.ebus.capability.meter
     "meter": {
         "imported-energy": {"device_class": "energy", "state_class": "total_increasing"},
         "exported-energy": {"device_class": "energy", "state_class": "total_increasing"},
-        "imported-active-energy": {"device_class": "energy", "state_class": "total_increasing"},
-        "exported-active-energy": {"device_class": "energy", "state_class": "total_increasing"},
+        # Reactive/apparent energy registers are cumulative like the active ones,
+        # but HA has no energy device_class for varh/VAh (see `emit._UNIT_SEMANTICS`),
+        # so they carry the state_class alone: without it HA keeps no long-term
+        # statistics for them. A state_class without a device_class is legal.
+        "imported-reactive-energy": {"state_class": "total_increasing"},
+        "exported-reactive-energy": {"state_class": "total_increasing"},
+        "apparent-energy-imported": {"state_class": "total_increasing"},
+        "apparent-energy-exported": {"state_class": "total_increasing"},
         "active-power": {"device_class": "power", "state_class": "measurement"},
         "reactive-power": {"device_class": "reactive_power", "state_class": "measurement"},
         "apparent-power": {"device_class": "apparent_power", "state_class": "measurement"},
         "voltage": {"device_class": "voltage", "state_class": "measurement"},
         "current": {"device_class": "current", "state_class": "measurement"},
         "frequency": {"device_class": "frequency", "state_class": "measurement"},
+        # Power factor is unitless, so inference has nothing to go on. The table has
+        # no pattern support, so the per-phase forms are spelled out.
         "power-factor": {"device_class": "power_factor", "state_class": "measurement"},
+        "power-factor-a": {"device_class": "power_factor", "state_class": "measurement"},
+        "power-factor-b": {"device_class": "power_factor", "state_class": "measurement"},
+        "power-factor-c": {"device_class": "power_factor", "state_class": "measurement"},
     },
-    "battery": {
+    # energy.ebus.capability.soc. There is no `battery` capability: state of charge
+    # lives here, for any reservoir (a BESS pack, a water heater's tank).
+    "soc": {
         # A bare percent is ambiguous to inference; here it is unmistakably SoC.
         "soc": {"device_class": "battery", "state_class": "measurement"},
-        "state-of-charge": {"device_class": "battery", "state_class": "measurement"},
-        "power": {"device_class": "power", "state_class": "measurement"},
-        "temperature": {"device_class": "temperature", "state_class": "measurement"},
+        # Reservoir LEVELS, not accumulating registers. Inference sees Wh/kWh and
+        # says energy + total_increasing, under which HA reads every discharge as a
+        # meter reset and back-fills the drop as freshly consumed energy. HA's
+        # `energy_storage` is the level counterpart: same units, measurement only.
+        "soe": {"device_class": "energy_storage", "state_class": "measurement"},
+        "total-energy-storage": {"device_class": "energy_storage", "state_class": "measurement"},
+        "loadup-headroom": {"device_class": "energy_storage", "state_class": "measurement"},
     },
+    # energy.ebus.capability.info
     "info": {
         # Identity/firmware fields are diagnostics, not primary state.
         "*": {"entity_category": "diagnostic"},
+        # A nameplate rating is a constant, not an accumulating register: same
+        # correction as the `soc` energy levels above.
+        "nameplate-capacity": {"device_class": "energy_storage", "state_class": "measurement"},
     },
 }
 

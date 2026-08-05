@@ -4,8 +4,8 @@
 End-to-end demonstration and self-check for `ebus_sdk.ha.HaDiscoveryBridge`,
 against a REAL broker but WITHOUT needing a running Home Assistant. It:
 
-  1. publishes a synthetic eBus device (a meter + battery + a settable control)
-     onto the broker (device role),
+  1. publishes a synthetic eBus device (a meter + a state-of-charge node + a
+     settable control) onto the broker (device role),
   2. runs a Controller + HaDiscoveryBridge that discovers it and emits Home
      Assistant discovery (controller role),
   3. subscribes an INDEPENDENT MQTT client to `homeassistant/device/+/config`
@@ -51,19 +51,20 @@ DEVICE_ID = "ha-bridge-demo"
 DEVICE_NAME = "HA Bridge Demo Panel"
 DEVICE_TYPE = "energy.ebus.device.demo"
 
-# The synthetic device's declarative shape: a meter node, a battery node, and a
-# settable control. build_from_declarations turns these into Homie nodes +
-# properties (node types become energy.ebus.capability.<capability>).
+# The synthetic device's declarative shape: a meter node, a state-of-charge node,
+# and a settable control. build_from_declarations turns these into Homie nodes +
+# properties (node types become energy.ebus.capability.<capability>), so the group
+# names here must be real eBus capabilities for the customizer to recognize them.
 SPECS = [
     PropertySpec("meter", "imported-energy", PropertyDatatype.FLOAT, Unit.WATT_HOUR),
     PropertySpec("meter", "active-power", PropertyDatatype.FLOAT, Unit.WATT),
-    PropertySpec("battery", "soc", PropertyDatatype.FLOAT, Unit.PERCENT),
+    PropertySpec("soc", "soc", PropertyDatatype.FLOAT, Unit.PERCENT),
     PropertySpec("control", "enabled", PropertyDatatype.BOOLEAN, settable=True),
 ]
 VALUES = {
     ("meter", "imported-energy"): 12345.6,
     ("meter", "active-power"): 800.0,
-    ("battery", "soc"): 55.0,
+    ("soc", "soc"): 55.0,
     ("control", "enabled"): False,
 }
 
@@ -85,7 +86,7 @@ def publish_synthetic_device(mqtt_cfg):
     device.start_mqtt_client()
     model = GroupedPropertyDict()
     build_from_declarations(device, model, SPECS, values=VALUES)
-    print(f"Published synthetic device '{DEVICE_ID}' ({len(SPECS)} properties across meter/battery/control)")
+    print(f"Published synthetic device '{DEVICE_ID}' ({len(SPECS)} properties across meter/soc/control)")
     return device
 
 
@@ -125,8 +126,8 @@ def verify(config):
         cmps.get("meter_imported-energy", {}).get("state_class") == "total_increasing",
     )
     check(
-        "battery/soc -> battery device_class (resolves ambiguous %)",
-        cmps.get("battery_soc", {}).get("device_class") == "battery",
+        "soc/soc -> battery device_class (resolves ambiguous %)",
+        cmps.get("soc_soc", {}).get("device_class") == "battery",
     )
     check(
         "settable control/enabled -> switch with a command_topic",

@@ -33,14 +33,34 @@ def test_meter_active_power():
     assert comp.state_class == "measurement"
 
 
-def test_battery_soc_resolves_ambiguous_percent():
+def test_soc_capability_resolves_ambiguous_percent():
     # A bare percent is ambiguous to inference (device_class None); the eBus
-    # customizer recognizes battery/soc and nails device_class=battery.
-    inferred = homie_property_to_component("dev1", "battery", "soc", {"datatype": "float", "unit": "%"})
+    # customizer recognizes the soc capability and nails device_class=battery.
+    # The node id is deliberately NOT "soc": _capability_of falls back to the node
+    # id, so a same-named node would pass even with $type resolution broken. (GH #27)
+    inferred = homie_property_to_component("dev1", "bess", "soc", {"datatype": "float", "unit": "%"})
     assert inferred.device_class is None
 
-    comp = _component("battery", "soc", {"datatype": "float", "unit": "%"}, node_type="energy.ebus.capability.battery")
+    comp = _component("bess", "soc", {"datatype": "float", "unit": "%"}, node_type="energy.ebus.capability.soc")
     assert comp.device_class == "battery"
+    assert comp.state_class == "measurement"
+
+
+def test_soc_energy_properties_are_levels_not_registers():
+    # soe / total-energy-storage / loadup-headroom are reservoir levels: they FALL
+    # on discharge. Inference sees kWh and would say energy + total_increasing,
+    # under which HA reads each drop as a meter reset. (GH #27)
+    for prop_id in ("soe", "total-energy-storage", "loadup-headroom"):
+        comp = _component("bess", prop_id, {"datatype": "float", "unit": "kWh"}, node_type="energy.ebus.capability.soc")
+        assert comp.device_class == "energy_storage", prop_id
+        assert comp.state_class == "measurement", prop_id
+
+
+def test_no_battery_capability():
+    # There is no energy.ebus.capability.battery in the specification; `battery` is
+    # a DEVICE type there, and a property of power-flows. Guard the invented key
+    # from coming back. (GH #27)
+    assert "battery" not in customize._CAPABILITY_META
 
 
 def test_info_fields_are_diagnostic():
@@ -78,15 +98,15 @@ def test_usable_as_default_override_over_whole_device():
                     "active-power": {"datatype": "float", "unit": "W"},
                 },
             },
-            "battery": {
-                "type": "energy.ebus.capability.battery",
+            "bess": {
+                "type": "energy.ebus.capability.soc",
                 "properties": {"soc": {"datatype": "float", "unit": "%"}},
             },
         },
     }
     device = homie_description_to_ha(description, "panel-1", override=ebus_default_override)
     assert device.components["meter_imported-energy"].state_class == "total_increasing"
-    assert device.components["battery_soc"].device_class == "battery"
+    assert device.components["bess_soc"].device_class == "battery"
 
 
 # --- typed-field routing (SDK-anu) ------------------------------------------
