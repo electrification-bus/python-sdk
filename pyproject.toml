@@ -30,15 +30,19 @@ classifiers = [
 dependencies = [
     # MQTT transport lives in ebus-mqtt-client, which pins paho-mqtt; the SDK
     # does not import paho directly, so paho is a transitive dependency (not
-    # declared here). Floor 0.3.0: it ships the PEP 561 py.typed marker, so a
-    # downstream type checker resolves the re-exported MqttClient to the concrete
-    # class instead of Any, completing the transport Protocol typing (MqttTransport
-    # / MqttControllerTransport / MqttDeviceTransport) the SDK added in 0.16.0.
-    # Earlier floors, still relied on: 0.2.0 added the on_disconnect_callback the
-    # disconnect hook adopts (SDK-al5); 0.1.8 added the connect_async construction
-    # the resilient-connect behavior relies on (older clients raised
-    # ConnectionRefusedError on a down broker).
-    "ebus-mqtt-client>=0.3.0",
+    # declared here). Floor 0.4.0: it adds the loop-native AsyncioMqttDriver
+    # (MqttClient.asyncio_driver()), which the bring-your-own-transport section of
+    # the README now documents as the answer for a host that forbids paho's
+    # background thread; the SDK does not import it, but a consumer following that
+    # guidance needs it present. Earlier floors, still relied on: 0.3.0 ships the
+    # PEP 561 py.typed marker, so a downstream type checker resolves the
+    # re-exported MqttClient to the concrete class instead of Any, completing the
+    # transport Protocol typing (MqttTransport / MqttControllerTransport /
+    # MqttDeviceTransport) the SDK added in 0.16.0; 0.2.0 added the
+    # on_disconnect_callback the disconnect hook adopts (SDK-al5); 0.1.8 added the
+    # connect_async construction the resilient-connect behavior relies on (older
+    # clients raised ConnectionRefusedError on a down broker).
+    "ebus-mqtt-client>=0.4.0",
 ]
 
 [project.optional-dependencies]
