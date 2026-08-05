@@ -76,6 +76,19 @@ client.connect()                               # host connects on its own loop
 
 For the inbound direction, if the tree has settable properties whose callbacks are async coroutines, pass `Device(async_loop=<your event loop>)`: inbound `/set` arrives on the transport's network thread, and this schedules the callback onto your loop (set once for the whole tree, not per property). A synchronous callback runs inline and needs no loop.
 
+**Running the transport on your own event loop.** Injecting a client answers *which* connection to publish through, but paho's network loop still has to be pumped somewhere, and by default that is a background thread. For a host that forbids one, `ebus-mqtt-client` 0.4.0 provides a loop-native alternative: `MqttClient.asyncio_driver(loop=None)` returns a driver that pumps the network loop on your asyncio loop (paho socket hooks plus a periodic `loop_misc`) rather than paho's thread, so all MQTT I/O runs on the host's loop. Use it instead of `start()`, not alongside it: the two are mutually exclusive per client.
+
+```python
+client = MqttClient.from_config(mqtt_cfg)
+driver = client.asyncio_driver()               # call from within a running loop, or pass loop=
+await driver.start()                           # connects and pumps on your loop
+device = Device('panel-1', type='...', mqttc=client)
+...
+await driver.stop()
+```
+
+The driver module loads lazily and imports only the standard library plus paho, so a thread-mode consumer (or a constrained build such as a Yocto image) never loads it.
+
 **A producer should own its MQTT connection.** The example above owns a *dedicated* client and connects it itself, so the SDK's Last Will (`$state=lost` on an ungraceful death) works normally: prefer this for any producer whose liveness matters. A *shared* connection owned by a host (Home Assistant is the archetype: one connection, up before your code loads, its single will already spent on the host's own) **cannot carry an eBus will**, because MQTT allows one will per connection. A producer publishing through such a connection therefore never signals ungraceful death: a crash leaves a stale retained `$state=ready`, and consumers render a dead device as alive. Reconnect is still handled (wire `refresh_tree()` to the host's reconnect callback and gate on `is_connected()`), but permanent death is not, and there is no portable substitute (a host that owns the connection also will not forward the MQTT 5 publish properties that would let `$state` expire). So do not publish a liveness-bearing device through a connection you do not own: if a host environment forbids a dedicated connection, run the producer as a **separate adapter** with its own connection rather than borrowing the host's. (The injected-client seam is still the right tool for the *consumer* role, `Controller(mqttc=...)`, which has no `$state` and no will to lose, and for tests.)
 
 #### Clearing a value vs. an empty-string value
