@@ -1,7 +1,7 @@
 {
   "$schema": "https://ebus.energy/schemas/ebus-spec.json",
   "spec_repo": "https://github.com/electrification-bus/specification",
-  "synced_commit": "6e582c994fff4c77853a79d8bab26ef9924e22c7",
+  "synced_commit": "922b9f89d13653327d1c08b79e3081706a9c0a1d",
   "synced_date": "2026-08-05",
   "role": "library",
   "framework": "0.7",
@@ -35,7 +35,7 @@
       "power-quality": "0.1"
     },
     "devices": { "utility-meter": "0.6" },
-    "registries": { "capability-types": "0.19", "device-types": "0.4" }
+    "registries": { "capability-types": "0.19", "device-types": "0.5" }
   },
   "notes": "role=library: the SDK provides the framework mechanisms (supports). Excluded framework features: broker-hosting (broker's concern, not the SDK) and rest-configuration (not implemented). mdns-discovery is provided via the optional `mdns` extra and the examples. The implements map covers the examples/utility-meter reference publisher plus the capability vocabulary the SDK itself encodes. grid/status/demand/power-quality were previously defined inline in the utility-meter data model and covered implicitly by pinning it; utility-meter 0.6 split them out into standalone catalogs, so they are now pinned directly. soc is pinned because the ebus_sdk.ha customizer maps its properties to Home Assistant metadata and examples/ha-discovery-bridge publishes a soc node; it is a capability the SDK has first-class knowledge of rather than merely transports. If the simulators migrate out of examples/ into their own repo(s), each would carry its own application lockfile and this implements map would reduce to the SDK proper."
 }
