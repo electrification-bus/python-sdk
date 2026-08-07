@@ -772,6 +772,50 @@ class TestNodeDeleteProperty:
         n = Node(id="core")
         assert n.delete_property("missing") is False
 
+    def test_delete_property_republishes_description(self, mock_paho):
+        """The mirror of add_property() must also re-announce the property set.
+
+        Without the republish the broker keeps a device in `ready` whose
+        $description still names a property that no longer exists, with nothing
+        to correct it later.
+        """
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        with device.state_transition():
+            node = device.add_node_from_dict({"id": "core", "type": "sensor"})
+            node.add_property_from_dict({"id": "temp", "datatype": PropertyDatatype.FLOAT})
+            node.add_property_from_dict({"id": "humidity", "datatype": PropertyDatatype.FLOAT})
+        mock_client.publish.reset_mock()
+
+        assert node.delete_property("temp") is True
+
+        descriptions = [c[0][1] for c in mock_client.publish.call_args_list if c[0][0].endswith("/dev-1/$description")]
+        assert descriptions, f"delete_property published no $description: {mock_client.publish.call_args_list}"
+        published = json.loads(descriptions[-1])
+        props = published["nodes"]["core"]["properties"]
+        assert "temp" not in props, f"deleted property still in published $description: {props}"
+        assert "humidity" in props, f"surviving property missing from $description: {props}"
+
+    def test_delete_property_batches_inside_state_transition(self, mock_paho):
+        """N deletions in one transition collapse to one $description publish.
+
+        Same guarantee add_node/add_property already give, so the two halves of
+        the API stay symmetric under batching.
+        """
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        with device.state_transition():
+            node = device.add_node_from_dict({"id": "core", "type": "sensor"})
+            for pid in ("a", "b", "c"):
+                node.add_property_from_dict({"id": pid, "datatype": PropertyDatatype.FLOAT})
+        mock_client.publish.reset_mock()
+
+        with device.state_transition():
+            for pid in ("a", "b", "c"):
+                node.delete_property(pid)
+
+        descriptions = [c for c in mock_client.publish.call_args_list if c[0][0].endswith("/dev-1/$description")]
+        assert len(descriptions) == 1, f"expected 1 consolidated $description, got {len(descriptions)}"
+        assert json.loads(descriptions[0][0][1])["nodes"]["core"]["properties"] == {}
+
 
 class TestNodeDescription:
     def test_description(self):

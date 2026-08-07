@@ -1172,8 +1172,17 @@ class Node:
 
     def delete_property(self, property_id: str) -> bool:
         """
-        Remove property and clear its MQTT topic
-        Returns True if removed, False if not found
+        Remove property, clear its MQTT topic, and republish $description.
+
+        The mirror of add_property(): both mutate the node's property set, so
+        both must re-announce it. Without the republish the broker kept a device
+        in `ready` whose $description still named a property that no longer
+        existed, and nothing ever corrected it.
+
+        Batching several deletions inside `device.state_transition()` collapses
+        the republishes to one, exactly as it does for additions.
+
+        Returns True if removed, False if not found.
         """
         if property_id not in self._properties:
             logger.warning(f"reason=nodeDeletePropertyNotFound,nodeId={self._id},propertyId={property_id}")
@@ -1181,6 +1190,11 @@ class Node:
         property = self._properties[property_id]
         property.clear_value()
         del self._properties[property_id]
+        # Delete from the dict BEFORE republishing, so the new $description
+        # reflects the removal (add_property() has the same ordering rule).
+        device = self.device()
+        if device:
+            device.publish_description()
         logger.info(f"reason=nodeDeletedProperty,nodeId={self._id},propertyId={property_id}")
         return True
 

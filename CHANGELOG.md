@@ -8,6 +8,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 - Tooling: the ruff lint selection is now declared explicitly (`select = ["E4", "E7", "E9", "F"]`) rather than inherited from ruff's defaults, and CI moves from ruff 0.15.21 to 0.16.1. Ruff 0.16 widened its default selection (UP, LOG, BLE, I, RUF and more) and began formatting Python code blocks embedded in Markdown, so an unchanged codebase reported 0 or 381 violations depending only on which ruff you happened to run, and four docs files showed phantom format diffs locally that CI never saw. Pinning the set decouples "what this project lints for" from "what version of ruff is installed"; `extend-exclude = ["*.md"]` keeps prose out of both check and format. Verified clean on both 0.16.1 and 0.15.21, with no source changes. Widening the rule set (the 381) is now a deliberate act rather than an upgrade side-effect. ([#39](https://github.com/electrification-bus/python-sdk/issues/39))
 
+### Fixed
+
+- `Node.delete_property()` now republishes `$description`, as its mirror `Node.add_property()` always has. Deleting a property cleared the retained value topic but left the device in `ready` with a `$description` that still named the property, and nothing corrected it afterwards, so the broker held a self-contradicting device indefinitely. The two halves of the same API disagreed about whether mutating a node's property set is a structural change; it is. Deletions batch inside `device.state_transition()` exactly as additions do, so N deletions still collapse to one `$description` publish. ([#35](https://github.com/electrification-bus/python-sdk/issues/35))
+
 ## [0.18.1] — 2026-08-07
 
 ### Added
