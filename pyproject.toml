@@ -74,8 +74,19 @@ ebus_sdk = ["py.typed"]
 
 [tool.ruff]
 line-length = 120
+# Ruff 0.16 formats Python code blocks embedded in Markdown. This repo's docs are
+# prose that happens to contain illustrative snippets, not a formatting target, so
+# keep them out of both check and format.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
+# Declared explicitly rather than inherited: ruff's default selection changed in
+# 0.16 (it began enforcing UP, LOG, BLE, I, RUF and more), which turned an
+# unchanged codebase into 381 violations depending only on which ruff you ran.
+# Pinning the set here decouples "what this project lints for" from "what version
+# of ruff you happen to have". Widening it is a deliberate act, not an upgrade
+# side-effect.
+select = ["E4", "E7", "E9", "F"]
 # E402: module-level imports not at top — triggered by __future__ + docstring pattern
 # E721: type comparison with == — intentional in datatype_from_type()
 ignore = ["E402", "E721"]

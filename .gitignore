@@ -28,3 +28,6 @@ htmlcov/
 
 # Local config files (contain secrets)
 broker-cfg*.json
+
+# macOS
+.DS_Store
