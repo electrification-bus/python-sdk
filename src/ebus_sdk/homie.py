@@ -2553,6 +2553,10 @@ class Controller:
         self._on_device_removed = None
         self._on_property_changed = None
         self._on_description_received = None
+        self._on_tree_ready = None
+        # Per-root last-known result of is_tree_complete(), so on_tree_ready can
+        # be edge-triggered AND re-arm when a tree grows a new child.
+        self._tree_complete: dict = {}
         # Consumer disconnect hook (SDK-al5), set via set_on_disconnect_callback.
         # Only effective when the controller OWNS its client (constructed from
         # mqtt_cfg); a bring-your-own-client caller registers disconnect handling
@@ -2912,6 +2916,11 @@ class Controller:
             except Exception:
                 logger.exception(f"reason=onDeviceRemovedCallbackException,deviceID={device_id}")
 
+        # Dropping a descendant shrinks the declared tree, which can complete a
+        # root that was waiting on the device just removed.
+        self._tree_complete.pop(device_id, None)
+        self._reevaluate_tree_completeness()
+
     def _on_description_message(self, device_id: str, topic: str, payload: bytes) -> None:
         """Handle device $description messages"""
         if device_id not in self.devices:
@@ -2935,6 +2944,12 @@ class Controller:
         # in the design-intended order (description-then-state) too.
         if self.is_tree_rooted and device.state == DeviceState.READY.value:
             self._reconcile_descendants(device_id)
+
+        # A description is the only thing that can complete a tree (it is what
+        # "described" means) and also the only thing that can un-complete one
+        # (by declaring a new child). Re-evaluate after reconcile, so any child
+        # this description just introduced is already registered.
+        self._reevaluate_tree_completeness()
 
     def _on_property_message(self, device_id: str, topic: str, payload: bytes) -> None:
         """
@@ -3173,6 +3188,78 @@ class Controller:
                 queue.append(child.device_id)
         return out
 
+    def is_tree_complete(self, root_id: str) -> bool:
+        """
+        True when every device transitively declared under ``root_id`` has
+        published its own ``$description``.
+
+        This is a RECONCILING PREDICATE, not a barrier. It reads current state
+        and is safe to call at any time, as often as you like; it will flip back
+        to False when a device declares a new child, because a Homie tree can
+        grow at any moment (children are commissioned out of band). Consumers
+        that need a "the tree I can see is coherent" gate should evaluate this on
+        every update, not await it once. See doc/consuming-a-homie-tree.md.
+
+        Specifically NOT the same as ``root $state == ready``. That is a
+        per-device signal meaning "my own $description is current"; it never
+        promised anything about descendants and cannot be made to. This walks
+        the declared tree and checks.
+
+        A device counts as described once its ``$description`` has been parsed,
+        regardless of its ``$state``: a declared child that is `lost` has still
+        told you what it is. Use ``get_effective_state()`` for liveness.
+
+        Returns False when ``root_id`` is unknown or has published no
+        ``$description`` of its own (nothing has declared a tree yet).
+        """
+        root = self.devices.get(root_id)
+        if root is None or root.description is None:
+            return False
+
+        # Breadth-first over DECLARED children, with a visited set: a malformed
+        # or mid-reconfiguration tree can name a cycle, and this must terminate
+        # rather than trusting the wire.
+        seen = {root_id}
+        queue = list(root.children_ids)
+        while queue:
+            child_id = queue.pop(0)
+            if child_id in seen:
+                continue
+            seen.add(child_id)
+            child = self.devices.get(child_id)
+            if child is None or child.description is None:
+                return False
+            queue.extend(child.children_ids)
+        return True
+
+    def _reevaluate_tree_completeness(self) -> None:
+        """Fire on_tree_ready for any root that just became complete.
+
+        Edge-triggered on the incomplete -> complete transition, and re-arming:
+        a root that grows a new child goes back to incomplete and will fire
+        again once that child describes itself. That re-arming is the point.
+        A one-shot barrier is the exact consumer bug this API exists to prevent,
+        so this must not be one either.
+
+        Called after every $description update and after a descendant is
+        dropped, which are the only things that can change the predicate.
+        """
+        if not self._on_tree_ready:
+            return
+        for root in self.get_root_devices():
+            root_id = root.device_id
+            now_complete = self.is_tree_complete(root_id)
+            was_complete = self._tree_complete.get(root_id, False)
+            self._tree_complete[root_id] = now_complete
+            if now_complete and not was_complete:
+                logger.info(
+                    f"reason=treeComplete,rootID={root_id},deviceCount={len(self.get_descendants(root_id)) + 1}"
+                )
+                try:
+                    self._on_tree_ready(root)
+                except Exception:
+                    logger.exception(f"reason=onTreeReadyCallbackException,rootID={root_id}")
+
     def get_effective_state(self, device_id: str) -> Optional[str]:
         """
         Return the device's effective state per the Homie 5 spec (SDK-zt2).
@@ -3218,12 +3305,14 @@ class Controller:
         # Release DiscoveredDevice objects and their property dicts
         self.devices.clear()
         self._subscribed_children.clear()
+        self._tree_complete.clear()
         # Clear callback references to break reference cycles
         self._on_device_discovered = None
         self._on_device_state_changed = None
         self._on_device_removed = None
         self._on_property_changed = None
         self._on_description_received = None
+        self._on_tree_ready = None
 
     # Callback setters
     def set_on_device_discovered_callback(self, callback: Callable[[DiscoveredDevice], None]) -> None:
@@ -3241,6 +3330,21 @@ class Controller:
     def set_on_property_changed_callback(self, callback: Callable[[str, str, str, str, Optional[str]], None]) -> None:
         """Set callback for property changes (device_id, node_id, property_id, new_value, old_value)"""
         self._on_property_changed = callback
+
+    def set_on_tree_ready_callback(self, callback: Callable[[DiscoveredDevice], None]) -> None:
+        """Fire when a root's declared tree becomes fully described.
+
+        Called with the ROOT DiscoveredDevice on the incomplete -> complete
+        edge of ``is_tree_complete(root_id)``. It RE-ARMS: a root that grows a
+        new child goes back to incomplete and fires again once that child
+        describes itself, so a tree commissioned in stages produces one call per
+        settled shape rather than one call ever.
+
+        That re-arming is deliberate. Treating the first call as a barrier and
+        unsubscribing afterwards reintroduces the bug this exists to avoid: a
+        device commissioned later is simply missed. Handle every call.
+        """
+        self._on_tree_ready = callback
 
     def set_on_description_received_callback(self, callback: Callable[[DiscoveredDevice], None]) -> None:
         """Set callback for when a device description is received"""

@@ -1426,3 +1426,118 @@ class TestMqttTransportProtocols:
             ctrl.stop()
             client.stop.assert_called_once()
             assert ctrl._owned_client is None
+
+
+class TestTreeCompleteAffordance:
+    """gh-37: a reconciling 'the declared tree is fully described' predicate.
+
+    The point is that this is NOT a barrier. A Homie tree can grow at any
+    moment, so the predicate must be re-evaluable and the callback must re-arm.
+    """
+
+    def test_incomplete_while_a_declared_child_has_not_described_itself(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+
+        # The root says ready and names a child that has published nothing.
+        # This is exactly the state that misleads a consumer gating on $state.
+        assert ctrl.get_effective_state("panel-1") == "ready"
+        assert ctrl.is_tree_complete("panel-1") is False
+
+    def test_complete_once_every_declared_descendant_is_described(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(
+            ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1", "children": ["mid-1"]}
+        )
+        _push_state(ctrl, "bess-1", "ready")
+        assert ctrl.is_tree_complete("panel-1") is False, "grandchild not described yet"
+
+        _push_description(ctrl, "mid-1", {"homie": "5.0", "root": "panel-1", "parent": "bess-1"})
+        assert ctrl.is_tree_complete("panel-1") is True
+
+    def test_a_described_but_lost_child_still_counts_as_described(self, mock_paho):
+        """Completeness is about description, not liveness. get_effective_state is for liveness."""
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        _push_state(ctrl, "bess-1", "lost")
+
+        assert ctrl.is_tree_complete("panel-1") is True
+        assert ctrl.get_effective_state("bess-1") == "lost"
+
+    def test_unknown_or_undescribed_root_is_not_complete(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        assert ctrl.is_tree_complete("never-seen") is False
+        _push_state(ctrl, "panel-1", "ready")
+        assert ctrl.is_tree_complete("panel-1") is False, "state without a description declares no tree"
+
+    def test_a_declared_cycle_terminates(self, mock_paho):
+        """A malformed tree must not hang the predicate."""
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(
+            ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1", "children": ["panel-1"]}
+        )
+
+        assert ctrl.is_tree_complete("panel-1") is True
+
+    def test_on_tree_ready_fires_once_on_the_completing_edge(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        fired = []
+        ctrl.set_on_tree_ready_callback(lambda root: fired.append(root.device_id))
+        ctrl.start_discovery()
+
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        assert fired == [], "fired before the declared child described itself"
+
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        assert fired == ["panel-1"]
+
+        # Edge-triggered: a redundant republish of the same shape must not refire.
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        assert fired == ["panel-1"]
+
+    def test_on_tree_ready_rearms_when_the_tree_grows(self, mock_paho):
+        """The whole point: a device commissioned later must not be missed.
+
+        A one-shot barrier is the consumer bug this API exists to prevent, so
+        the callback itself must not behave like one.
+        """
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        fired = []
+        ctrl.set_on_tree_ready_callback(lambda root: fired.append(root.device_id))
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        assert fired == ["panel-1"]
+
+        # Commission a second child well after the tree first settled.
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1", "evse-1"]})
+        assert ctrl.is_tree_complete("panel-1") is False, "newly declared child un-completes the tree"
+        assert fired == ["panel-1"], "must not refire while incomplete"
+
+        _push_description(ctrl, "evse-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+        assert ctrl.is_tree_complete("panel-1") is True
+        assert fired == ["panel-1", "panel-1"], "must fire again for the new settled shape"
+
+    def test_on_tree_ready_survives_a_raising_callback(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        ctrl.set_on_tree_ready_callback(MagicMock(side_effect=RuntimeError("consumer blew up")))
+        ctrl.start_discovery()
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["bess-1"]})
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(ctrl, "bess-1", {"homie": "5.0", "root": "panel-1", "parent": "panel-1"})
+
+        assert ctrl.is_tree_complete("panel-1") is True

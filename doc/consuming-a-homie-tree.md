@@ -95,7 +95,27 @@ The property that makes this correct is that it is **idempotent and order-indepe
 
 The SDK's `Controller` implements the above in tree-rooted mode. `_reconcile_descendants` fires on each `init` to `ready` edge and diffs the announced `children` against what is subscribed: added children get full topic subscriptions (their own retained state and description then cascade through the same handler, surfacing grandchildren), removed children are unsubscribed and dropped recursively. It also reconciles on a `$description` update for a device already in `ready`. That is why a `Controller`-based consumer was never exposed to the ordering defect fixed in 0.18.1: it uses `ready` as a trigger to subscribe, not as a barrier to read.
 
-**Known gap:** there is no public "the declared tree is fully described" affordance. `Controller` reconciles correctly but does not expose a tree-complete signal, so a consumer that genuinely needs one (a topology snapshot, a one-shot export) currently has to build it. If that is you, build it as a reconciling predicate evaluated on every update, not as a barrier awaited once.
+## When you genuinely need "the whole tree"
+
+Some consumers really do need to know that the declared tree is fully described: a topology snapshot, a one-shot export, a test harness. Two affordances exist for that, and both are built as reconciling predicates rather than barriers:
+
+```python
+if controller.is_tree_complete("panel-1"):
+    ...   # every device transitively declared under panel-1 has described itself
+
+controller.set_on_tree_ready_callback(lambda root: snapshot(root.device_id))
+```
+
+`is_tree_complete(root_id)` walks the declared tree and returns whether every device named transitively under it has published its own `$description`. It is safe to call at any time, as often as you like, and it will **flip back to False** when a device declares a new child. That is not a defect; it is the open child set showing through.
+
+`set_on_tree_ready_callback()` fires on the incomplete-to-complete edge and **re-arms**: a root that grows a new child fires again once that child describes itself. A tree commissioned in stages produces one call per settled shape rather than one call ever.
+
+Read that re-arming as a warning. If you take the first call as a barrier and stop listening, you have rebuilt the one-shot barrier from failure mode 1 out of the very API meant to prevent it. Handle every call.
+
+Two things `is_tree_complete()` deliberately does not mean:
+
+- **Not liveness.** A device counts as described once its `$description` has been parsed, whatever its `$state`. A declared child that is `lost` has still told you what it is. Use `get_effective_state()` for liveness.
+- **Not permanence.** It is true of the tree you can see right now. It says nothing about the tree a second from now.
 
 ## Checklist
 
@@ -106,3 +126,4 @@ The SDK's `Controller` implements the above in tree-rooted mode. `_reconcile_des
 - [ ] Nothing in the consumer awaits message B because message A arrived.
 - [ ] A declared child that never appears is handled by timeout, not by hanging.
 - [ ] Effective state is read via `get_effective_state()` rather than a device's own `$state`.
+- [ ] If a tree-complete gate is needed, it uses `is_tree_complete()` / `on_tree_ready` and handles every call rather than only the first.
