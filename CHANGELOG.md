@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-08-07
+
 ### Added
 
 - [`doc/consuming-a-homie-tree.md`](doc/consuming-a-homie-tree.md): the controller/subscriber-side guide, and the counterpart to [`doc/building-a-proxy.md`](doc/building-a-proxy.md). It states the asymmetry the convention relies on and that this repo had never written down: a producer SHOULD minimize `$state` and `$description` transitions (quality-of-implementation, best-effort), while a consumer MUST react to every one of them, unconditionally (correctness). Covers what `$state=ready` does and does not promise (it means "my own `$description` is current", never "my children are present", and no producer can make the latter true since children are commissioned out of band), and the three ways consumers get this wrong: the one-shot barrier that stops reconciling after startup, awaiting a `$description` that the content-hash suppression never sends, and inferring publish order across retained messages. Linked from the README.
@@ -274,7 +276,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.1
 [0.18.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.0
 [0.17.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.17.0
 [0.16.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.16.0
