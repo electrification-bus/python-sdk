@@ -1781,8 +1781,19 @@ class Device:
 
     def remove_node(self, node_id: str) -> bool:
         """
-        Removes node with node_id from nodes, if it exists
-        Returns True if removed, else False
+        Removes node with node_id from nodes and republishes $description.
+
+        This drops the node from the SCHEMA ONLY. Its properties' retained value
+        topics are left on the broker, so a subscriber that already holds them
+        keeps seeing values for a node the description no longer names, and a
+        wildcard subscriber still receives them on connect. Use this when the
+        topics are wanted (a node being re-parented, or a cleanup the caller is
+        doing itself); use ``delete_node()`` to also clear them.
+
+        Batch several removals inside ``device.state_transition()`` to collapse
+        the republishes into one.
+
+        Returns True if removed, else False.
         """
         if node_id in self._nodes:
             self._nodes.pop(node_id, None)
@@ -1793,8 +1804,20 @@ class Device:
 
     def delete_node(self, node_id: str) -> bool:
         """
-        Remove node from device, clear all node topics, and update description
-        Returns True if removed, False if not found
+        Remove node from device, clear all its retained property topics, and
+        republish $description.
+
+        The broker-cleaning counterpart to ``remove_node()``, which drops the
+        node from the schema but leaves its retained values behind. This is
+        almost always the one you want: without it the removed node's values sit
+        on the broker indefinitely with nothing left to describe them. Only
+        properties that were actually published are cleared, so no phantom
+        empty-retained topics are created.
+
+        Batch several deletions inside ``device.state_transition()`` to collapse
+        the republishes into one.
+
+        Returns True if removed, False if not found.
         """
         if node_id not in self._nodes:
             logger.warning(f"reason=deviceDeleteNodeNotFound,deviceId={self._id},nodeId={node_id}")
