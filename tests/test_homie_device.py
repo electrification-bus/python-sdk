@@ -1843,6 +1843,47 @@ class TestDeviceRefreshTree:
         assert bess_state and mid_state
         assert min(bess_state) > max(mid_state), f"intermediate device announced $state before its child: {topics}"
 
+    def test_refresh_tree_continues_past_a_raising_child(self, mock_paho):
+        """A sick device must not keep its siblings or ancestors off the broker.
+
+        Reconnect is precisely when a partial refresh beats an aborted one, so
+        the cascade is best-effort: the failure is logged and the walk goes on.
+        """
+        root, mock_client = _make_device(mock_paho, device_id="panel-1")
+        Device(id="circuit-a", parent=root)
+        bad = Device(id="circuit-bad", parent=root)
+        Device(id="circuit-z", parent=root)
+        bad.refresh_tree = MagicMock(side_effect=RuntimeError("transport exploded"))
+        mock_client.publish.reset_mock()
+
+        root.refresh_tree()
+
+        topics = [c[0][0] for c in mock_client.publish.call_args_list]
+        bad.refresh_tree.assert_called_once()
+        # The sibling ordered after the failure still republished...
+        assert any(t.endswith("/circuit-z/$state") for t in topics), f"sibling after the failure was skipped: {topics}"
+        # ...and the parent still announced itself, which is what a controller
+        # gates on. Aborting here would have taken the whole tree offline.
+        assert any(t.endswith("/panel-1/$state") for t in topics), f"ancestor never announced: {topics}"
+
+    def test_node_publish_continues_past_a_raising_property(self, mock_paho):
+        """Property.publish_value() reaches the client unwrapped; contain it there."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        with device.state_transition():
+            node = device.add_node_from_dict({"id": "core", "type": "sensor"})
+            bad = node.add_property_from_dict({"id": "bad", "datatype": PropertyDatatype.FLOAT})
+            good = node.add_property_from_dict({"id": "good", "datatype": PropertyDatatype.FLOAT})
+        good.set_value(1.0)
+        bad.publish_value = MagicMock(side_effect=RuntimeError("transport exploded"))
+        mock_client.publish.reset_mock()
+
+        device.refresh_tree()
+
+        topics = [c[0][0] for c in mock_client.publish.call_args_list]
+        bad.publish_value.assert_called_once()
+        assert any(t.endswith("/core/good") for t in topics), f"sibling property was skipped: {topics}"
+        assert any(t.endswith("/dev-1/$state") for t in topics), f"device never announced: {topics}"
+
     def test_on_connect_reconnect_cascades(self, mock_paho):
         """On reconnect, root.on_connect() walks the whole tree."""
         root, mock_client = _make_device(mock_paho, device_id="panel-1")

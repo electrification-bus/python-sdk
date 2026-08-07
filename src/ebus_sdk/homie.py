@@ -1246,7 +1246,15 @@ class Node:
         # Use list() to create a shallow copy, preventing crash if dict changes during iteration
         for property_id, property in list(self._properties.items()):
             logger.debug(f"reason=nodePublishProperty,nodeId={node_id},propertyId={property_id}")
-            property.publish_value()
+            # Best-effort per property. Property.publish_value() reaches the MQTT
+            # client directly and does not wrap it, so an injected transport that
+            # raises on one property would otherwise abort this node's remaining
+            # properties, its device's $state, and (via refresh_tree) the entire
+            # rest of the tree's reconnect. See Device.refresh_tree().
+            try:
+                property.publish_value()
+            except Exception as e:
+                logger.exception(f"reason=nodePublishPropertyFailed,nodeId={node_id},propertyId={property_id},e={e}")
 
 
 class StateTransitionContext:
@@ -2007,6 +2015,13 @@ class Device:
         every (re)connect. A bring-your-own-transport caller must call it from
         their own on-connect handler, so the retained tree re-announces after a
         broker reconnect the SDK's ``on_connect`` never sees.
+
+        BEST-EFFORT: a descendant whose republish raises is logged and skipped,
+        and the cascade continues. Reconnect is exactly when one sick device
+        must not be able to keep its siblings and every ancestor off the broker,
+        so a partial refresh beats an aborted one. The exception is not
+        re-raised; callers wanting to detect it should watch for
+        ``reason=deviceRefreshTreeChildFailed`` in the log.
         """
         logger.info(
             f"reason=deviceRefreshTree,deviceId={self._id},"
@@ -2028,7 +2043,16 @@ class Device:
         # Snapshot — main thread may construct child devices (which append
         # to self._children) while this runs on the MQTT loop thread.
         for child in list(self._children):
-            child.refresh_tree()
+            # Best-effort per child: Device.publish() swallows its own
+            # exceptions, but Node.publish() and Property.publish_value() do
+            # not, so an injected transport that raises would otherwise abort
+            # the whole cascade from wherever it failed. That would take out
+            # every later sibling AND this device's own state publish below,
+            # turning one sick device into a tree-wide reconnect failure.
+            try:
+                child.refresh_tree()
+            except Exception as e:
+                logger.exception(f"reason=deviceRefreshTreeChildFailed,deviceId={self._id},childId={child._id},e={e}")
         self.publish_state()
 
     def publish(self, attribute: str = "", value: Optional[Any] = None) -> None:
