@@ -158,6 +158,8 @@ model.set_value('meter', 'active-power', 1850.0)
 
 **If you are building a proxy, read [`doc/building-a-proxy.md`](doc/building-a-proxy.md) first.** It is the comprehensive guide: declarative property definitions, the bridge-root plus proxied-children topology, dynamic device shapes, settable/bidirectional properties, and the anti-pattern to avoid (driving `homie.Device` directly from your data path). `examples/utility-meter` is the fullest worked example.
 
+**If you are writing a controller or any subscriber, read [`doc/consuming-a-homie-tree.md`](doc/consuming-a-homie-tree.md) first.** It states the producer/consumer asymmetry the convention relies on (a producer SHOULD minimize `$state` and `$description` transitions; a consumer MUST react to every one of them unconditionally), what `$state = ready` does and does not promise, and the three ways consumers get this wrong. If you are about to gate on a root's `$state`, that document is the one you need.
+
 **Home Assistant interop** is covered by two `ebus_sdk.ha` guides: [`doc/ha-mqtt-discovery.md`](doc/ha-mqtt-discovery.md) parses HA MQTT discovery INTO eBus, and [`doc/ha-discovery-bridge.md`](doc/ha-discovery-bridge.md) emits eBus OUT to HA via `HaDiscoveryBridge` (per-device mapping, an eBus-aware customizer, and HA <-> eBus loop-avoidance guards). `examples/ha-discovery-bridge` is a live-broker, no-HASS-needed demo.
 
 ### Controller Role
