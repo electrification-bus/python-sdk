@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-08-07
+
 ### Added
 
 - `Controller.is_tree_complete(root_id)` and `Controller.set_on_tree_ready_callback()`: a first-class answer to "has the declared tree fully described itself?". `$state=ready` is a per-device signal meaning "my own `$description` is current" and never promised anything about descendants, so a consumer needing a whole-tree gate previously had to hand-roll one, and hand-rolling it is how you end up with a one-shot barrier that stops reconciling and silently misses a device commissioned later. Both are built as reconciling predicates instead: `is_tree_complete()` walks the declared tree on demand and flips back to False when a device declares a new child, and the callback is edge-triggered but **re-arms**, firing again for each settled shape. Completeness is about description, not liveness: a declared child that is `lost` has still told you what it is, so use `get_effective_state()` for liveness. A declared cycle terminates rather than hanging. ([#37](https://github.com/electrification-bus/python-sdk/issues/37))
@@ -292,7 +294,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.19.0
 [0.18.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.1
 [0.18.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.0
 [0.17.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.17.0
