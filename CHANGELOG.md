@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Documentation
+
+- README, bring-your-own-transport: a transport must preserve publish order, and why. `MqttDeviceTransport` says nothing about ordering because the two transports shipped with the SDK cannot violate it (paho's thread and `asyncio_driver` each pump one client), but a transport written against the protocol directly can, and one that starts a task per `publish()` hands ordering to the scheduler. The SDK maintains ordering on a producer's behalf — a device's `$description` precedes the `$state=ready` that vouches for it, and `refresh_tree()` publishes a device's `$state` after the children it announces, which is what 0.18.1 fixed — so a transport can silently drop a guarantee the SDK spends effort meeting. Consumers must still never depend on publish order (`doc/consuming-a-homie-tree.md` says so at length, since order does not survive retention), which is exactly why that document cannot warn a transport author: it addresses the other party. Also notes the teardown consequence: a `publish()` that enqueues is legitimate (every return is typed `object` because the SDK discards it), but `Device.stop()` publishes the final `$state` without flushing, so a queueing transport needs a drain point before the client closes. Raised by [@cayossarian](https://github.com/cayossarian) from building a natively-async transport, where the hazard is real rather than theoretical. ([#46](https://github.com/electrification-bus/python-sdk/issues/46))
+
 ## [0.19.0] — 2026-08-07
 
 ### Added
