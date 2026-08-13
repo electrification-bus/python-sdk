@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-08-12
+
 ### Added
 
 - `Device.declare_lost()`: a way to announce deliberate death. `Device` modeled three teardowns and implemented one, so a producer that knew it was failing (a fatal error handler, a supervisor about to kill it, hardware that has gone away, a simulator acting the part) could only announce `disconnected`, which is a lie, or reach around the SDK to the concrete client; `DeviceState.LOST` was published nowhere in `homie.py` except inside the `will()` descriptor, and the will fires only on an *unclean* disconnect, which the clean disconnect `stop()` performs deliberately suppresses. It is TREE-level like `will()` and `stop()`, publishing the ROOT's `$state` (per the Homie 5 effective-state rule that covers every descendant in one publish) and emitting exactly the topic and payload `will()` describes, so the declared and will-driven paths cannot drift; to mark a single device lost, `set_state(DeviceState.LOST)` on that device remains the right call, and `declare_lost()` would blank the whole tree's liveness. The state move and the publish happen together, and the move is unconditional, because publishing a state the `Device` does not hold is exactly how a later `refresh_tree()` silently republishes `ready` over it. It returns whether `$state` actually moved, reusing `set_state`'s True-changed/False-already-there convention: on an injected transport that distinguishes "queued, now drain" from "already lost, nothing to wait for", and it is deliberately not a delivery signal, which it could not honestly be there. Owned clients flush; injected clients queue on the caller's loop, since `publish_and_flush` is owned-only and off the `MqttDeviceTransport` surface. Reported by [@cayossarian](https://github.com/cayossarian), whose async-transport drain sequence shaped the contract, and adopted by `ebus-panel-sim` in place of the reach-around that produced four separate downstream bugs. ([#46](https://github.com/electrification-bus/python-sdk/issues/46))
@@ -312,7 +314,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.0
 [0.19.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.19.0
 [0.18.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.1
 [0.18.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.0
