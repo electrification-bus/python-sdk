@@ -72,7 +72,7 @@ client.on_connect(device.refresh_tree)         # re-announce the retained tree o
 client.connect()                               # host connects on its own loop
 ```
 
-`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` through the client and returns immediately, without flushing or closing it. `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
+`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` through the client and returns immediately, without flushing or closing it; `device.stop(announce=False)` publishes nothing and leaves the retained `$state` as it stands, for a caller that published its own final state first (see `declare_lost()` below). `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
 
 For the inbound direction, if the tree has settable properties whose callbacks are async coroutines, pass `Device(async_loop=<your event loop>)`: inbound `/set` arrives on the transport's network thread, and this schedules the callback onto your loop (set once for the whole tree, not per property). A synchronous callback runs inline and needs no loop.
 
@@ -95,9 +95,32 @@ That matters because ordering is a guarantee the SDK maintains on your behalf. A
 
 So if your transport hands work onward rather than publishing inline (an `MqttDeviceTransport` over a natively-async client, say, where `publish()` enqueues and returns), **drain a single queue in order** rather than dispatching each publish independently. The failure is invisible in testing: it holds by luck under a fast broker and breaks under a slow first publish.
 
-`publish()` returning without having reached the wire is otherwise entirely legitimate: the protocol types every return as `object` precisely because the SDK discards them. It does mean teardown needs a drain point of your own, because `Device.stop()` publishes the final `$state` and returns without flushing. Close the queue before closing the client, or that last message is lost behind it.
+`publish()` returning without having reached the wire is otherwise entirely legitimate: the protocol types every return as `object` precisely because the SDK discards them. It does mean teardown needs a drain point of your own, because `Device.stop()` publishes the final `$state` and returns without flushing. Close the queue before closing the client, or that last message is lost behind it. The same obligation applies to `declare_lost()`, which queues the `lost` and returns; its `True` return means "queued, now drain", `False` means "already lost, nothing to wait for".
 
 **A producer should own its MQTT connection.** The example above owns a *dedicated* client and connects it itself, so the SDK's Last Will (`$state=lost` on an ungraceful death) works normally: prefer this for any producer whose liveness matters. A *shared* connection owned by a host (Home Assistant is the archetype: one connection, up before your code loads, its single will already spent on the host's own) **cannot carry an eBus will**, because MQTT allows one will per connection. A producer publishing through such a connection therefore never signals ungraceful death: a crash leaves a stale retained `$state=ready`, and consumers render a dead device as alive. Reconnect is still handled (wire `refresh_tree()` to the host's reconnect callback and gate on `is_connected()`), but permanent death is not, and there is no portable substitute (a host that owns the connection also will not forward the MQTT 5 publish properties that would let `$state` expire). So do not publish a liveness-bearing device through a connection you do not own: if a host environment forbids a dedicated connection, run the producer as a **separate adapter** with its own connection rather than borrowing the host's. (The injected-client seam is still the right tool for the *consumer* role, `Controller(mqttc=...)`, which has no `$state` and no will to lose, and for tests.)
+
+#### Announcing death: the three teardowns
+
+A device has three ways to stop, and they mean different things to a consumer rendering `$state` into availability:
+
+| Teardown | `$state` left retained | How |
+| --- | --- | --- |
+| Graceful shutdown | `disconnected` | `device.stop()` |
+| Ungraceful death (crash, power loss) | `lost` | the Last Will, which fires only on an *unclean* disconnect |
+| Deliberate death | `lost` | `device.declare_lost()` |
+
+The third is for a producer that knows it is failing: a fatal error handler, a supervisor about to kill it, hardware that has gone away, or a simulator acting the part. `disconnected` would tell consumers the shutdown was orderly and expected, which is a lie.
+
+```python
+device.declare_lost()          # root's $state=lost, published and (owned path) flushed
+device.stop(announce=False)    # tear down without overwriting it with `disconnected`
+```
+
+`declare_lost()` is **tree-level**, like `will()` and `stop()`: it publishes the *root's* `$state`, which per the Homie 5 effective-state rule makes every descendant lost too, and it publishes exactly the topic and payload `will()` describes so the two paths cannot drift. To mark one device lost (a proxy whose single upstream vanished), use `set_state(DeviceState.LOST)` on that device instead.
+
+It moves the state and publishes it together, and the move is unconditional: publishing a state the `Device` does not hold is how a later `refresh_tree()` silently republishes `ready` over it. It returns whether `$state` actually moved, the same convention as `set_state`: on an injected transport, a `True` from a connected tree is your cue to drain, and `False` means the root was already lost. It is not a delivery signal and cannot be one there. Publishing is skipped entirely when the broker is unreachable (the state still moves, and the next connect republishes it), so `True` does not by itself prove anything was queued. It does not stop the client.
+
+`stop(announce=False)` unpaired leaves whatever was published last, typically a stale `ready`, and nothing will correct it: the clean disconnect `stop()` performs suppresses the LWT. Neither call substitutes for the will, because a crashed process calls nothing.
 
 #### Clearing a value vs. an empty-string value
 
@@ -147,7 +170,7 @@ Device(id='mid-1', type='...metering', parent=bess)
 panel.children()[0].delete()
 ```
 
-Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies — controllers compute effective state per the Homie 5 precedence table (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
+Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies, and `root.declare_lost()` publishes the same thing deliberately when the publisher knows it is dying — controllers compute effective state per the Homie 5 precedence table (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
 
 `$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content (ignoring its `version` timestamp) is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)).
 
@@ -256,7 +279,7 @@ MQTT transport lives in the separate [`ebus-mqtt-client`](https://github.com/ele
 
 Core Homie convention implementation:
 
-- **Device** - Represents a Homie device; pass `parent=` to build a child in a tree, or `on_disconnect=` for a push disconnect hook (`clean: bool`)
+- **Device** - Represents a Homie device; pass `parent=` to build a child in a tree, or `on_disconnect=` for a push disconnect hook (`clean: bool`); `declare_lost()` announces deliberate death and `stop(announce=False)` tears down without announcing
 - **Node** - Groups related properties within a device
 - **Property** - Individual data points (sensors, controls)
 - **Controller** - Discovers and monitors Homie devices on a broker; navigates trees and computes effective state; `set_on_disconnect_callback` for push disconnect notification

@@ -117,7 +117,7 @@ Read that re-arming as a warning. If you take the first call as a barrier and st
 
 Two things `is_tree_complete()` deliberately does not mean:
 
-- **Not liveness.** A device counts as described once its `$description` has been parsed, whatever its `$state`. A declared child that is `lost` has still told you what it is. Use `get_effective_state()` for liveness.
+- **Not liveness.** A device counts as described once its `$description` has been parsed, whatever its `$state`. A declared child that is `lost` has still told you what it is. Use `get_effective_state()` for liveness. Note `lost` is not always a crash: a producer that knows it is dying can publish it deliberately (`Device.declare_lost()`), so you may see it arrive from a publisher that is otherwise healthy and still connected. Your obligation is unchanged, which is the point: react to the state you are told, never to how you imagine it was produced.
 - **Not permanence.** It is true of the tree you can see right now. It says nothing about the tree a second from now.
 
 ## Checklist

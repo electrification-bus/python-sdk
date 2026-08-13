@@ -2312,6 +2312,153 @@ class TestDeviceStop:
         device.stop()  # must not raise
         mock_client.stop.assert_not_called()
 
+    def test_announce_false_publishes_nothing_and_still_closes_the_owned_client(self, mock_paho):
+        device, mock_client = _make_device(mock_paho, device_id="dev-silent")
+        mock_client.is_connected.return_value = True
+        mock_client.publish.reset_mock()
+
+        device.stop(announce=False)
+
+        mock_client.publish_and_flush.assert_not_called()
+        mock_client.publish.assert_not_called()
+        # Teardown itself is unchanged: still bounded, still clean.
+        mock_client.stop.assert_called_once()
+        assert device.mqttc is None
+
+    def test_announce_false_leaves_a_declared_lost_state_intact(self, mock_paho):
+        """The pairing #46 exists for: declare death, then tear down without lying about it."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-dying")
+        mock_client.is_connected.return_value = True
+        device.declare_lost()
+        mock_client.publish.reset_mock()
+        mock_client.publish_and_flush.reset_mock()
+
+        device.stop(announce=False)
+
+        assert device._state == DeviceState.LOST
+        assert DeviceState.DISCONNECTED.value not in _state_payloads_for(mock_client, "dev-dying")
+        for call in mock_client.publish_and_flush.call_args_list:
+            assert call.args[1] != DeviceState.DISCONNECTED.value
+
+
+class TestDeviceDeclareLost:
+    """Device.declare_lost(): announce deliberate death, tree-level (#46).
+
+    The third teardown. stop() announces `disconnected` and the will announces
+    `lost` only on an unclean disconnect, so a producer that knows it is dying
+    previously had to lie or reach around the SDK.
+    """
+
+    def test_publishes_lost_retained_and_flushes_on_the_owned_path(self, mock_paho):
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+
+        assert device.declare_lost() is True
+
+        mock_client.publish_and_flush.assert_called_once()
+        args, kwargs = mock_client.publish_and_flush.call_args
+        assert args[0] == f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev-1/$state"
+        assert args[1] == DeviceState.LOST.value == "lost"
+        # A plain str, not the StrEnum member: on Python < 3.11 (CI runs 3.10)
+        # str(DeviceState.LOST) is "DeviceState.LOST", so a transport that stringifies
+        # its payload would put that on the wire. `==` alone cannot see the difference.
+        assert type(args[1]) is str
+        assert kwargs["retain"] is True
+        assert kwargs["timeout"] == 1.0
+        assert device._state == DeviceState.LOST
+
+    def test_payload_and_topic_match_the_will(self, mock_paho):
+        """Anti-drift: the declared path and the LWT path must say the identical thing."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+
+        device.declare_lost()
+
+        topic, payload = mock_client.publish_and_flush.call_args.args[:2]
+        assert (topic, payload) == (device.will()["topic"], device.will()["payload"])
+
+    def test_returns_true_once_then_false_when_already_lost(self, mock_paho):
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+
+        assert device.declare_lost() is True  # queued, now drain
+        assert device.declare_lost() is False  # already lost, nothing to wait for
+
+    def test_moves_state_so_a_later_refresh_republishes_lost(self, mock_paho):
+        """#46's downstream bug 4: publishing a state the Device does not hold lets
+        the next refresh_tree() silently republish `ready` over it."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+        device.declare_lost()
+        mock_client.publish.reset_mock()
+
+        device.refresh_tree()
+
+        assert _state_payloads_for(mock_client, "dev-1") == [DeviceState.LOST.value]
+
+    def test_from_a_child_declares_the_root(self, mock_paho):
+        """Tree-level, like will() and stop(): a lost root makes every descendant lost."""
+        root, mock_client = _make_device(mock_paho, device_id="panel-1")
+        child = Device(id="circuit-a", parent=root)
+        mock_client.is_connected.return_value = True
+        mock_client.publish_and_flush.reset_mock()
+
+        assert child.declare_lost() is True
+
+        assert mock_client.publish_and_flush.call_args.args[0].endswith("/panel-1/$state")
+        assert root._state == DeviceState.LOST
+
+    def test_moves_state_even_when_the_broker_is_unreachable(self, mock_paho):
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = False
+
+        assert device.declare_lost() is True
+
+        mock_client.publish_and_flush.assert_not_called()
+        # The state still moved, so the next connect republishes it.
+        assert device._state == DeviceState.LOST
+
+    def test_no_mqtt_client_still_moves_state(self, mock_paho):
+        device, _ = _make_device(mock_paho, device_id="dev-1")
+        device.mqttc = None  # e.g. after stop()
+
+        assert device.declare_lost() is True  # must not raise
+        assert device._state == DeviceState.LOST
+
+    def test_warns_inside_an_open_state_transition(self, mock_paho, caplog):
+        """_end_state_transition() publishes READY on exit, landing on top of this."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+
+        with caplog.at_level(logging.WARNING, logger="homie"), device.state_transition():
+            device.declare_lost()
+
+        assert any("DeclareLostInsideStateTransition" in r.message for r in caplog.records)
+
+    def test_warns_when_the_roots_transition_is_open_not_the_callers(self, mock_paho, caplog):
+        """The guard reads the ROOT's depth, not the caller's, because it is the root's
+        transition exit that publishes READY over the just-declared `lost`. A bridge
+        dying while it builds a child inside `with root.state_transition():` is exactly
+        that case, and _transition_depth is strictly per-device."""
+        root, mock_client = _make_device(mock_paho, device_id="panel-1")
+        mock_client.is_connected.return_value = True
+        child = Device(id="circuit-a", parent=root)
+
+        with caplog.at_level(logging.WARNING, logger="homie"), root.state_transition():
+            assert child._transition_depth == 0  # only the ROOT's transition is open
+            child.declare_lost()
+
+        assert any("DeclareLostInsideStateTransition" in r.message for r in caplog.records)
+
+    def test_does_not_stop_the_client(self, mock_paho):
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        mock_client.is_connected.return_value = True
+
+        device.declare_lost()
+
+        mock_client.stop.assert_not_called()
+        assert device.mqttc is not None
+
 
 class TestDeviceBYOTransport:
     """Bring-your-own-transport: inject a client into a root Device (#14).
@@ -2360,6 +2507,39 @@ class TestDeviceBYOTransport:
 
         client.reset_mock()
         device.stop()
+
+        client.publish.assert_not_called()
+        client.publish_and_flush.assert_not_called()
+        client.stop.assert_not_called()
+        assert device.mqttc is None
+
+    def test_declare_lost_injected_publishes_without_flush_or_close(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_connected.return_value = True
+        device = Device(id="panel-1", mqttc=client)
+
+        client.reset_mock()  # ignore construction-time publishes
+        assert device.declare_lost() is True
+
+        client.publish.assert_called_once()
+        topic, payload = client.publish.call_args.args
+        assert topic == f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/panel-1/$state"
+        assert payload == DeviceState.LOST.value
+        assert type(payload) is str  # not the StrEnum member; see TestDeviceDeclareLost
+        assert client.publish.call_args.kwargs["retain"] is True
+        # Ownership decides, not isinstance: an injected client can itself be a real
+        # MqttClient, so neither owned-only method may be reached (#46, bugs 2 and 3).
+        client.publish_and_flush.assert_not_called()
+        client.stop.assert_not_called()
+        assert device.mqttc is client  # declare_lost() does not tear down
+
+    def test_stop_announce_false_injected_publishes_nothing_and_closes_nothing(self, mock_paho):
+        client = _mock_mqtt_client()
+        client.is_connected.return_value = True
+        device = Device(id="panel-1", mqttc=client)
+
+        client.reset_mock()
+        device.stop(announce=False)
 
         client.publish.assert_not_called()
         client.publish_and_flush.assert_not_called()
@@ -2444,6 +2624,43 @@ class TestMqttDeviceTransportProtocol:
 
         device = Device(id="panel-1", type="dev.test", mqttc=client)
         device.stop()  # must not reach start()/stop() on a client that has neither
+
+    def test_declare_lost_and_silent_stop_stay_on_the_minimal_transport_surface(self):
+        """The teardown additions must not widen the injected surface (#46).
+
+        A bare MagicMock answers any attribute, so an accidental publish_and_flush()
+        or stop() on an injected client passes silently there. This stub does not.
+        """
+        from ebus_sdk import MqttDeviceTransport
+
+        class Minimal:
+            is_running = True
+
+            def __init__(self):
+                self.published = []
+
+            def publish(self, topic, data, qos=1, retain=False):
+                self.published.append((topic, data, retain))
+                return None
+
+            def subscribe(self, sub, param, qos=1):
+                return None
+
+            def is_connected(self):
+                return True
+
+        client = Minimal()
+        assert isinstance(client, MqttDeviceTransport)
+        device = Device(id="panel-1", type="dev.test", mqttc=client)
+
+        assert device.declare_lost() is True  # must not reach publish_and_flush()
+        device.stop(announce=False)  # must not reach stop()
+
+        assert (
+            f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/panel-1/$state",
+            DeviceState.LOST.value,
+            True,
+        ) in client.published
 
     def test_owned_client_handle_is_none_when_injected(self):
         client = _mock_mqtt_client()
@@ -2674,6 +2891,7 @@ class TestTransportFreeLogSeverity:
             prop.set_subscribe()
             prop.start_mqtt_client()
             root.start_mqtt_client()
+            root.declare_lost()
             root.stop()
 
         assert self._no_client_records(caplog, logging.WARNING) == []

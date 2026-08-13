@@ -147,13 +147,13 @@ A proxy is not one flat device. Per the eBus [`proxy.md`](https://github.com/ele
 - Publish **one child device per proxied device**, each `Device(id=..., type=..., parent=root)`. The proxied measurements live here.
 - Name each child `{proxier-id}-{proxied-id}` (the proxied id is the device's stable serial when it has one). Consumers correlate a proxy and a native publisher of the same physical device by `info/serial-number`, not by device id.
 
-Children share the root's single MQTT connection automatically (that is what `parent=` does), and one Last Will on the root marks the whole tree `lost` if the process dies. See [Device Trees](../README.md#device-trees-parent--child) in the README.
+Children share the root's single MQTT connection automatically (that is what `parent=` does), and one Last Will on the root marks the whole tree `lost` if the process dies; `root.declare_lost()` publishes exactly the same thing deliberately, when the bridge knows it is dying rather than crashing. See [Device Trees](../README.md#device-trees-parent--child) in the README.
 
 ## Lifecycle and state
 
 - **Batch structural changes.** Adding N nodes/properties inside one `with device.state_transition():` collapses to a single `$description` publish and one `init` to `ready` edge, instead of N. Always build a device's structure inside a transition.
 - **Connect before you publish.** `Device(..., mqtt_cfg=...)` connects asynchronously. If you build and publish before the broker connection is established, the first retained `$description` / `$state` the broker keeps can be a pre-connect snapshot until the SDK's on-connect refresh corrects it. Wait for `device.mqttc.is_connected()` before the initial build so the first retained state is correct.
-- **Drive `$state` from availability.** When your upstream reports a device offline, set the child `DeviceState.LOST` (and `READY` when it returns). The root's Last Will covers process death.
+- **Drive `$state` from availability.** When your upstream reports ONE device offline, `set_state(DeviceState.LOST)` on that child (and `READY` when it returns). When the whole bridge is dying, `root.declare_lost()` publishes the root's `$state=lost`, which per the Homie 5 effective-state rule covers every descendant in a single publish; follow it with `stop(announce=False)` so the teardown does not overwrite it with `disconnected`. Do not reach for `declare_lost()` for one dead upstream: it blanks the entire tree's liveness. The root's Last Will still covers process death, which neither call can, since a crashed process calls nothing.
 
 ## Settable / bidirectional properties (control back to the device)
 
