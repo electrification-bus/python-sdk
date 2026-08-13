@@ -1,5 +1,6 @@
 """Tests for ebus_sdk.property (ObservableProperty, PropertyDict, GroupedPropertyDict)."""
 
+import threading
 from unittest.mock import MagicMock
 
 
@@ -244,6 +245,88 @@ class TestGroupedPropertyDict:
 
         # Should get a single BULK_UPDATE, not individual PROPERTY_CHANGED
         assert ChangeEvent.BULK_UPDATE in events
+
+    def test_concurrent_bulk_updates_do_not_fragment_each_others_batches(self):
+        """GH #55: the active bulk context is per-thread.
+
+        Sharing one _bulk_mode/_bulk_context pair meant a second thread entering a
+        context displaced the first, and whichever exited first ended bulk mode for
+        both. The survivor's remaining changes then escaped as individual events. For
+        a Homie publisher that is extra $description republishes and $state flapping.
+        """
+        gpd = GroupedPropertyDict()
+        gpd.add_property("a", Property(id="x", value=0))
+        gpd.add_property("b", Property(id="x", value=0))
+
+        events = []
+        events_lock = threading.Lock()
+
+        def observe(event_type, **kw):
+            with events_lock:
+                events.append((event_type, kw.get("changes")))
+
+        gpd.add_observer(observe)
+
+        b_entered = threading.Event()
+        b_exited = threading.Event()
+
+        def thread_a():
+            with gpd.bulk_update():
+                gpd.set_value("a", "x", 1)
+                b_entered.wait(timeout=5)  # let B open its context inside ours...
+                b_exited.wait(timeout=5)  # ...and close it, before we make our 2nd change
+                gpd.set_value("a", "x", 2)
+
+        def thread_b():
+            with gpd.bulk_update():
+                gpd.set_value("b", "x", 1)
+                b_entered.set()
+            b_exited.set()
+
+        ta = threading.Thread(target=thread_a, daemon=True)
+        tb = threading.Thread(target=thread_b, daemon=True)
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+        assert not ta.is_alive() and not tb.is_alive()
+
+        bulk = [changes for et, changes in events if et is ChangeEvent.BULK_UPDATE]
+        stray = [et for et, _ in events if et is not ChangeEvent.BULK_UPDATE]
+
+        # Exactly two batches, and nothing escaped as an individual event. Unlocked,
+        # thread A's second set_value fires on its own because B's exit cleared the
+        # shared flag.
+        assert stray == [], f"changes escaped their batch: {stray}"
+        assert len(bulk) == 2, f"expected one batch per thread, got {len(bulk)}"
+
+        # Each batch holds only its own thread's changes.
+        groups_per_batch = [{c.get("group_name") for c in changes} for changes in bulk]
+        assert {"a"} in groups_per_batch, groups_per_batch
+        assert {"b"} in groups_per_batch, groups_per_batch
+        a_batch = next(c for c in bulk if {x.get("group_name") for x in c} == {"a"})
+        assert len(a_batch) == 2, f"thread A's batch was fragmented: {a_batch}"
+
+    def test_a_nested_bulk_update_resumes_the_enclosing_batch(self):
+        # The context restores the previous one on exit rather than clearing it, so an
+        # inner bulk_update() no longer ends the outer batch and leaks the rest of it
+        # as individual events.
+        gpd = GroupedPropertyDict()
+        gpd.add_property("g", Property(id="x", value=0))
+
+        events = []
+        gpd.add_observer(lambda event_type, **kw: events.append((event_type, kw.get("changes"))))
+
+        with gpd.bulk_update():
+            gpd.set_value("g", "x", 1)
+            with gpd.bulk_update():
+                gpd.set_value("g", "x", 2)
+            gpd.set_value("g", "x", 3)  # still batched: the outer context resumed
+
+        stray = [et for et, _ in events if et is not ChangeEvent.BULK_UPDATE]
+        assert stray == [], f"a change escaped the resumed outer batch: {stray}"
+        batches = [changes for et, changes in events if et is ChangeEvent.BULK_UPDATE]
+        assert [len(b) for b in batches] == [1, 2], batches  # inner flushes first, then outer
 
     def test_has_group(self):
         gpd = GroupedPropertyDict()

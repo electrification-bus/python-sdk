@@ -16,7 +16,7 @@ than driving `homie.Device` directly.
 import uuid
 import logging
 from enum import Enum
-from threading import Lock, RLock
+from threading import Lock, RLock, local
 from typing import List, Callable, Union, Optional, Any, Type
 
 
@@ -210,16 +210,28 @@ class BulkUpdateContext:
 
     def __init__(self, grouped_dict: "GroupedPropertyDict") -> None:
         self.grouped_dict = grouped_dict
+        # Only ever appended to by the thread that entered this context, because the
+        # active context is thread-local, so this list needs no lock of its own.
         self.pending_events = []
+        self._previous = None
 
     def __enter__(self):
-        self.grouped_dict._bulk_mode = True
-        self.grouped_dict._bulk_context = self
+        # The active context is per-thread (GH #55). Two threads batching updates to
+        # one GroupedPropertyDict are independent: previously both wrote the same pair
+        # of shared flags, so entering one context displaced the other and whichever
+        # exited first ended bulk mode for both, fragmenting the survivor's batch into
+        # individual events. Thread-local rather than serializing on the existing lock,
+        # because a bulk context can be held across I/O and one thread should not block
+        # for the duration of another's batch.
+        state = self.grouped_dict._bulk_state
+        # Restore rather than clear on exit, so a nested bulk_update() on this thread
+        # resumes the enclosing batch instead of ending it.
+        self._previous = getattr(state, "context", None)
+        state.context = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.grouped_dict._bulk_mode = False
-        self.grouped_dict._bulk_context = None
+        self.grouped_dict._bulk_state.context = self._previous
         if not exc_type and self.pending_events:
             # Fire single BULK_UPDATE event with all changes
             for observer_id, callback in self.grouped_dict._observers.items():
@@ -401,8 +413,9 @@ class GroupedPropertyDict:
         self._lock = RLock()  # RLock needed because _fire_event is called while holding lock
         self._groups = {}
         self._observers = {}
-        self._bulk_mode = False
-        self._bulk_context = None
+        # The bulk-update context in effect FOR THE CALLING THREAD, if any (GH #55).
+        # Replaces a shared _bulk_mode/_bulk_context pair that two threads corrupted.
+        self._bulk_state = local()
 
     def _get_group(self, group: str) -> Optional[PropertyDict]:
         """Get the PropertyDict for the given group name, or None if not found"""
@@ -667,9 +680,13 @@ class GroupedPropertyDict:
 
     def _fire_event(self, event_type: ChangeEvent, **kwargs):
         """Fire an event to all observers"""
-        if self._bulk_mode and self._bulk_context:
+        # Per-thread: a bulk context opened on another thread must not swallow this
+        # thread's events, and must not stop swallowing its own when that other thread
+        # exits (GH #55).
+        bulk_context = getattr(self._bulk_state, "context", None)
+        if bulk_context is not None:
             # In bulk mode, accumulate events
-            self._bulk_context.add_event(event_type, **kwargs)
+            bulk_context.add_event(event_type, **kwargs)
         else:
             # Fire immediately
             with self._lock:
