@@ -9,6 +9,11 @@ jobs:
   pytest:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite runs in ~2s, so anything approaching this is a hang, not slowness.
+    # Since 0.20.1 homie.Property takes a lock, and a lock regression (notably making
+    # it non-reentrant) deadlocks the thread that hits it: without a bound, GitHub
+    # would let that run to the 6-hour default rather than reporting a failure.
+    timeout-minutes: 5
     strategy:
       # Run every version even if one fails, so a single-version break is
       # visible as exactly that rather than masking the rest.

@@ -57,6 +57,7 @@ except ImportError:
 
 from dataclasses import dataclass
 from functools import partial
+from threading import RLock
 
 # from deprecated import deprecated
 from typing import Any, Callable, List, Optional, Type, Union
@@ -530,10 +531,41 @@ class Property:
         # because it is derived at publish time from the node/device ids, and
         # set_node()/set_device() are public: a reparented property must not have
         # its first publish on the new topic suppressed by the old topic's memo.
-        # Held as ONE tuple rather than two fields so the pair cannot tear when the
-        # MQTT loop thread and an application thread publish concurrently (a single
-        # attribute assignment is atomic; two are not).
+        # Held as ONE tuple so the pair is written in a single atomic assignment.
         self._last_published: Optional[tuple] = None
+        # Serializes "compute the payload, publish it, record what was published" so
+        # that triple is atomic per property. Two threads reach it: the application
+        # thread via set_value(), and the MQTT loop thread via on_connect ->
+        # refresh_tree() -> Node.publish() -> publish_value(force=True). Without this
+        # they can interleave so the memo records an OLDER payload than the one that
+        # actually went out last, and the GH #50 gate then suppresses the publish that
+        # would correct the broker, stranding the wrong retained value.
+        #
+        # REENTRANT, and not optionally so: set_value() takes this lock and then calls
+        # publish_value(), which takes it again, so a plain Lock self-deadlocks on the
+        # single most common call in the SDK. publish_value() -> clear_value() (the
+        # retraction path) nests the same way. Same reason GroupedPropertyDict uses an
+        # RLock. Verified by mutation: swapping RLock for Lock hangs set_value().
+        #
+        # Per-property, so it never serializes a tree walk, and no code path holds two
+        # property locks at once, so there is no lock-ordering hazard here.
+        #
+        # It IS held across the transport's publish(), which is deliberate: releasing
+        # it earlier reopens the very window this closes. That is safe for the paho
+        # transport the SDK ships, and the reason is worth recording because it is not
+        # obvious. The dangerous shape would be an A-B/B-A cycle in which the network
+        # thread holds a transport lock while invoking on_connect (-> refresh_tree ->
+        # publish_value, which wants this lock) that publish() also needs. In paho
+        # 2.x it does not arise: _handle_connack invokes on_connect holding only
+        # _in_callback_mutex and acquires _out_message_mutex only AFTER the callback
+        # returns (the two blocks are sequential, not nested), and the one place the
+        # publish path touches _in_callback_mutex (_packet_queue) uses a NON-blocking
+        # acquire(False) that threaded mode skips entirely.
+        #
+        # A bring-your-own transport could still construct that cycle by holding its
+        # own lock across the on-connect handler it wires to refresh_tree() while
+        # requiring the same lock in publish(). Such a transport must not do that.
+        self._publish_lock = RLock()
         self._initial_value_was_none = value is None
         # Check for skip_initial_publish flag from dict
         self._skip_initial_publish = from_dict.get("skip_initial_publish", False) if from_dict else False
@@ -615,9 +647,14 @@ class Property:
         nothing failed, and the broker holds the value. Callers cannot distinguish
         suppressed from published from the return; use ``get_last_published_value()``
         if you need the memo itself.
+
+        Thread-safe: the value write and its publish are one atomic unit per property,
+        so a concurrent forced republish (the MQTT loop thread's reconnect refresh)
+        cannot land between them.
         """
-        self._value = value
-        return self.publish_value()
+        with self._publish_lock:
+            self._value = value
+            return self.publish_value()
 
     def round(self) -> Optional[int]:
         """
@@ -814,83 +851,86 @@ class Property:
         reconnect would find every payload equal to what it "last published", send
         nothing, and leave those topics empty until each value happened to change.
         """
-        mqttc = self.get_mqtt_client()
-        # Gate on connectivity, not just the SDK-owned run flag. A bring-your-own-
-        # transport client (mqttc=) is driven on the caller's loop and never has
-        # is_running set by the SDK's start(), yet can still publish once connected.
-        # is_running covers the owned path (True after start()); for an owned client
-        # connected implies running, so this does not change owned behavior.
-        if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
-            _log_missing_client(
-                f"reason=propertyPublishValueNoMqttClient,id={self._id}", by_design=self._transport_free()
-            )
-            return False
-        node_id = self.get_node_id()
-        device_id = self.get_device_id()
-        if not (device_id and node_id):
-            logger.warning(
-                f"propertyPublishValueInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
-            )
-            return False
-        # FIX: Don't publish if value is None and we've never published before or skip flag is set
-        if self._value is None and (not self._ever_published or self._skip_initial_publish):
-            logger.debug(f"reason=propertySkipPublishNoneValue,propertyID={self._id}")
-            return True
-        topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
-        if self._value is None:
-            # Value was cleared after having been published. Emit the empty
-            # retained message so the prior retained value is retracted from the
-            # broker rather than silently left behind (a reconnecting subscriber
-            # would otherwise read the stale value). Reaching here implies
-            # _ever_published is True and _skip_initial_publish is False — the
-            # earlier guard returns for the never-published / skip-initial case.
-            #
-            # NOTE: this clears the topic (empty MQTT payload). It does NOT
-            # represent an actual empty-string *value*, which the Homie 5
-            # convention encodes as a 1-character 0x00 payload — see the module
-            # header "empty string values" note. That encoding IS implemented,
-            # below, via encode_empty_string(); the two payloads are distinct and
-            # only the zero-length one retracts a retained topic.
-            logger.debug(
-                f"reason=propertyPublishValueIsNoneClearing,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
-            )
-            return self.clear_value()
-        try:
-            value = self.coerced_value()
-            if value is None:
-                logger.warning(
-                    f"reason=propertyPublishValueCoercionFailed,propertyID={self._id},rawValue={self._value}"
+        # Serialize compute-publish-memoize so the memo can never record an older
+        # payload than the one that actually went out last (see _publish_lock).
+        with self._publish_lock:
+            mqttc = self.get_mqtt_client()
+            # Gate on connectivity, not just the SDK-owned run flag. A bring-your-own-
+            # transport client (mqttc=) is driven on the caller's loop and never has
+            # is_running set by the SDK's start(), yet can still publish once connected.
+            # is_running covers the owned path (True after start()); for an owned client
+            # connected implies running, so this does not change owned behavior.
+            if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
+                _log_missing_client(
+                    f"reason=propertyPublishValueNoMqttClient,id={self._id}", by_design=self._transport_free()
                 )
                 return False
-            # Encode an empty-string value as a single 0x00 byte so the broker
-            # does not mistake it for a zero-length "clear retained" payload.
-            payload = encode_empty_string(value)
-            # GH #50: skip a republish whose final wire payload is byte-identical to
-            # the one already sitting on this topic. Compared AFTER coercion and
-            # empty-string encoding, so the rounding/enum/JSON collapse is inside the
-            # comparison and an empty-string value ("\x00") can never alias the
-            # zero-length "clear retained" payload.
-            #
-            # RETAINED only. The broker stores nothing for an event property, so an
-            # identical consecutive payload there is a second real event and dropping
-            # it would lose information rather than save a redundant write.
-            # Truthiness rather than `is True`: retained is Optional[bool] and may be
-            # None, which the publish call below already treats as non-retained.
-            if not force and self.retained() and self._ever_published and self._last_published == (topic, payload):
-                logger.debug(f"reason=propertyPublishValueUnchanged,propertyID={self._id},topic={topic}")
+            node_id = self.get_node_id()
+            device_id = self.get_device_id()
+            if not (device_id and node_id):
+                logger.warning(
+                    f"propertyPublishValueInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
+                )
+                return False
+            # FIX: Don't publish if value is None and we've never published before or skip flag is set
+            if self._value is None and (not self._ever_published or self._skip_initial_publish):
+                logger.debug(f"reason=propertySkipPublishNoneValue,propertyID={self._id}")
                 return True
-            logger.debug(f"reason=propertyPublishValue,value={value},topic={topic},retained={self.retained()}")
-            mqttc.publish(topic, payload, retain=self.retained(), qos=self._qos)
-            self._ever_published = True  # FIX: Mark as published
-            # Memoize only after publish() returns, inside the try: a transport that
-            # raises must not leave a memo claiming the broker holds a payload it
-            # never received, which would suppress that value forever.
-            self._last_published = (topic, payload)
-            self._skip_initial_publish = False  # FIX: Clear skip flag after first publish
-            return True
-        except Exception as e:
-            logger.warning(f"reason=propertyPublishValuePublishException,e={e}")
-            return False
+            topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
+            if self._value is None:
+                # Value was cleared after having been published. Emit the empty
+                # retained message so the prior retained value is retracted from the
+                # broker rather than silently left behind (a reconnecting subscriber
+                # would otherwise read the stale value). Reaching here implies
+                # _ever_published is True and _skip_initial_publish is False — the
+                # earlier guard returns for the never-published / skip-initial case.
+                #
+                # NOTE: this clears the topic (empty MQTT payload). It does NOT
+                # represent an actual empty-string *value*, which the Homie 5
+                # convention encodes as a 1-character 0x00 payload — see the module
+                # header "empty string values" note. That encoding IS implemented,
+                # below, via encode_empty_string(); the two payloads are distinct and
+                # only the zero-length one retracts a retained topic.
+                logger.debug(
+                    f"reason=propertyPublishValueIsNoneClearing,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
+                )
+                return self.clear_value()
+            try:
+                value = self.coerced_value()
+                if value is None:
+                    logger.warning(
+                        f"reason=propertyPublishValueCoercionFailed,propertyID={self._id},rawValue={self._value}"
+                    )
+                    return False
+                # Encode an empty-string value as a single 0x00 byte so the broker
+                # does not mistake it for a zero-length "clear retained" payload.
+                payload = encode_empty_string(value)
+                # GH #50: skip a republish whose final wire payload is byte-identical to
+                # the one already sitting on this topic. Compared AFTER coercion and
+                # empty-string encoding, so the rounding/enum/JSON collapse is inside the
+                # comparison and an empty-string value ("\x00") can never alias the
+                # zero-length "clear retained" payload.
+                #
+                # RETAINED only. The broker stores nothing for an event property, so an
+                # identical consecutive payload there is a second real event and dropping
+                # it would lose information rather than save a redundant write.
+                # Truthiness rather than `is True`: retained is Optional[bool] and may be
+                # None, which the publish call below already treats as non-retained.
+                if not force and self.retained() and self._ever_published and self._last_published == (topic, payload):
+                    logger.debug(f"reason=propertyPublishValueUnchanged,propertyID={self._id},topic={topic}")
+                    return True
+                logger.debug(f"reason=propertyPublishValue,value={value},topic={topic},retained={self.retained()}")
+                mqttc.publish(topic, payload, retain=self.retained(), qos=self._qos)
+                self._ever_published = True  # FIX: Mark as published
+                # Memoize only after publish() returns, inside the try: a transport that
+                # raises must not leave a memo claiming the broker holds a payload it
+                # never received, which would suppress that value forever.
+                self._last_published = (topic, payload)
+                self._skip_initial_publish = False  # FIX: Clear skip flag after first publish
+                return True
+            except Exception as e:
+                logger.warning(f"reason=propertyPublishValuePublishException,e={e}")
+                return False
 
     def clear_value(self) -> bool:
         """
@@ -915,40 +955,43 @@ class Property:
         holds what that memo claims: re-setting the pre-retraction value afterwards
         republishes rather than being skipped.
         """
-        # FIX: Don't clear if we never published a value
-        # This prevents creating phantom topics during cleanup
-        if not self._ever_published:
-            logger.info(f"reason=propertySkipClearNeverPublished,propertyID={self._id}")
-            return True
+        # Same lock as publish_value (reentrant: publish_value delegates here on
+        # the retraction path), so the retract and the memo reset are atomic.
+        with self._publish_lock:
+            # FIX: Don't clear if we never published a value
+            # This prevents creating phantom topics during cleanup
+            if not self._ever_published:
+                logger.info(f"reason=propertySkipClearNeverPublished,propertyID={self._id}")
+                return True
 
-        mqttc = self.get_mqtt_client()
-        # See publish_value: gate on connectivity so an injected (caller-driven)
-        # client can retract a retained value even without the SDK's is_running.
-        if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
-            _log_missing_client(
-                f"reason=propertyClearValueNoMqttClient,propertyID={self._id}", by_design=self._transport_free()
-            )
-            return False
-        node_id = self.get_node_id()
-        device_id = self.get_device_id()
-        if not (device_id and node_id):
-            logger.warning(
-                f"reason=propertyClearValueInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
-            )
-            return False
-        topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
-        try:
-            # Publishing empty string clears retained message
-            mqttc.publish(topic, "", retain=True, qos=self._qos)
-            logger.info(f"reason=propertyClearedValue,propertyID={self._id},topic={topic}")
-            self._ever_published = False  # FIX: Reset the flag
-            # The memo means "the broker holds this payload on this topic"; the
-            # retraction above has just made that false (GH #50).
-            self._last_published = None
-            return True
-        except Exception as e:
-            logger.warning(f"reason=propertyClearValueException,propertyID={self._id},topic={topic},exception={e}")
-            return False
+            mqttc = self.get_mqtt_client()
+            # See publish_value: gate on connectivity so an injected (caller-driven)
+            # client can retract a retained value even without the SDK's is_running.
+            if not mqttc or not (mqttc.is_running or mqttc.is_connected()):
+                _log_missing_client(
+                    f"reason=propertyClearValueNoMqttClient,propertyID={self._id}", by_design=self._transport_free()
+                )
+                return False
+            node_id = self.get_node_id()
+            device_id = self.get_device_id()
+            if not (device_id and node_id):
+                logger.warning(
+                    f"reason=propertyClearValueInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
+                )
+                return False
+            topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
+            try:
+                # Publishing empty string clears retained message
+                mqttc.publish(topic, "", retain=True, qos=self._qos)
+                logger.info(f"reason=propertyClearedValue,propertyID={self._id},topic={topic}")
+                self._ever_published = False  # FIX: Reset the flag
+                # The memo means "the broker holds this payload on this topic"; the
+                # retraction above has just made that false (GH #50).
+                self._last_published = None
+                return True
+            except Exception as e:
+                logger.warning(f"reason=propertyClearValueException,propertyID={self._id},topic={topic},exception={e}")
+                return False
 
     def was_ever_published(self) -> bool:
         """Return whether this property has ever been published to MQTT (FIX for MQTT topic persistence)"""
@@ -967,7 +1010,8 @@ class Property:
         Does NOT touch ``_ever_published``: this says "I no longer know what the
         broker holds", not "I have never published".
         """
-        self._last_published = None
+        with self._publish_lock:
+            self._last_published = None
 
     def get_last_published_value(self) -> Optional[str]:
         """Return the wire PAYLOAD this property last published, or None if it has
@@ -978,7 +1022,12 @@ class Property:
         ``value()`` for that. Before 0.20.0 this returned the current value, which
         was a documented placeholder rather than a real record (GH #50).
         """
-        return self._last_published[1] if self._last_published else None
+        # Read the tuple ONCE into a local. Testing the attribute and then subscripting
+        # it would load it twice, and a concurrent clear_value() / invalidate_publish_
+        # cache() nulling it in between would raise TypeError. The GIL makes that window
+        # practically unreachable today; a free-threaded build removes that accident.
+        memo = self._last_published
+        return memo[1] if memo else None
 
     def description(self) -> dict:
         """

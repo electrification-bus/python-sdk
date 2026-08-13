@@ -4,6 +4,16 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-08-13
+
+### Changed
+
+- CI: the `pytest` and `ruff` jobs, and the publish workflow's test gate, now carry `timeout-minutes: 5`. The suite runs in about two seconds, so anything near that bound is a hang rather than slowness. This matters from this release on: `homie.Property` now takes a lock, and a lock regression deadlocks whichever thread reaches it (making it non-reentrant deadlocks the main thread at the first `set_value`, which is most of the suite). Unbounded, GitHub would let that run to its six-hour default instead of reporting a failure, and a hung job reports nothing useful. The publish and release jobs are deliberately left unbounded, since a slow PyPI upload is not the same kind of event.
+
+### Fixed
+
+- `Property` now serializes "compute the payload, publish it, record what was published" under a per-property reentrant lock, so the publish-on-change memo can never disagree with the last write that actually reached the wire. Two threads reach that sequence: the application thread via `set_value()`, and the MQTT loop thread via `on_connect` → `refresh_tree(force=True)`. Interleaved, the loop thread could publish the old payload, the application thread could then publish and memoize the new one, and the loop thread could finally overwrite the memo with the older payload it had sent first. The property then believed the broker held a value it did not, and the 0.20.0 gate suppressed the very publish that would have corrected it, so the wrong retained value persisted until the next genuine change or reconnect. The window is narrow (it needs a reconnect refresh concurrent with a value update) and the class has never had a lock, so `_value` and `_ever_published` were already exposed to it in kind; 0.20.0 made the consequence durable rather than transient, which is what moves this from a latent wart to a fix. The lock is reentrant because `set_value()` calls `publish_value()` calls `clear_value()`, each taking it; a plain `Lock` self-deadlocks on the commonest call in the SDK. It is per-property, so it never serializes a tree walk, and no path holds two, so there is no ordering hazard. It is deliberately held across the transport's `publish()`: releasing earlier reopens the window it exists to close. No API change. ([#50](https://github.com/electrification-bus/python-sdk/issues/50))
+
 ## [0.20.0] — 2026-08-12
 
 ### Added
@@ -314,7 +324,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.1
 [0.20.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.0
 [0.19.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.19.0
 [0.18.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.18.1

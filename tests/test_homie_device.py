@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from enum import Enum
 from unittest.mock import MagicMock, patch
 
@@ -680,6 +681,83 @@ class TestHomiePropertyPublishSuppression:
         prop.set_value(99.0)
 
         mock_client.publish.assert_called_once()
+
+
+class TestHomiePropertyPublishThreadSafety:
+    """The publish-on-change memo must never disagree with the last wire write.
+
+    Two threads reach ``publish_value``: the application thread via ``set_value``,
+    and the MQTT loop thread via ``on_connect`` -> ``refresh_tree(force=True)``.
+    Compute-publish-memoize has to be atomic per property, or the memo can record
+    an OLDER payload than the one that actually went out last, after which the
+    GH #50 gate suppresses the very publish that would correct the broker.
+    """
+
+    def test_a_concurrent_forced_republish_cannot_leave_a_stale_memo(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, value=1.0)
+
+        in_publish = threading.Event()
+        release = threading.Event()
+        first = {"seen": False}
+
+        def blocking_publish(*args, **kwargs):
+            # Block only the FIRST publish, so the loop thread is parked inside the
+            # transport with its payload already computed.
+            if not first["seen"]:
+                first["seen"] = True
+                in_publish.set()
+                release.wait(timeout=5)
+            return MagicMock(rc=0)
+
+        mock_client.publish.side_effect = blocking_publish
+
+        # daemon=True on both: if a future regression genuinely deadlocks a property,
+        # these threads never finish. The is_alive() assertion below reports that, but
+        # non-daemon threads would then block interpreter exit and CI would hang after
+        # printing the failure (neither the workflows nor pytest set a timeout).
+        loop_thread = threading.Thread(target=lambda: prop.publish_value(force=True), daemon=True)
+        loop_thread.start()
+        assert in_publish.wait(timeout=5), "forced republish never reached the transport"
+
+        # Application thread: a new value arrives mid-flight.
+        app_thread = threading.Thread(target=lambda: prop.set_value(2.0), daemon=True)
+        app_thread.start()
+        app_thread.join(timeout=0.2)  # must NOT complete: it is waiting on the lock
+
+        release.set()
+        loop_thread.join(timeout=5)
+        app_thread.join(timeout=5)
+        assert not loop_thread.is_alive() and not app_thread.is_alive()
+
+        payloads = [c[0][1] for c in mock_client.publish.call_args_list]
+        # The invariant the lock buys: the memo is what the broker last received.
+        # Unlocked, the app thread's "2.0" lands first and the loop thread then
+        # overwrites the memo with the older "1.0", so a later set_value(1.0) is
+        # suppressed while the broker still holds 2.0, which is permanently wrong.
+        assert prop.get_last_published_value() == payloads[-1], (
+            f"memo {prop.get_last_published_value()!r} disagrees with the wire {payloads!r}"
+        )
+        assert payloads == ["1.0", "2.0"]
+
+    def test_retraction_through_the_lock_does_not_deadlock(self):
+        # The lock must be REENTRANT. set_value() takes it and calls publish_value(),
+        # which takes it again; on the None path publish_value() then delegates to
+        # clear_value(), which takes it a third time. A plain Lock self-deadlocks.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+
+        done = threading.Event()
+
+        def retract():
+            prop.set_value(None)
+            done.set()
+
+        t = threading.Thread(target=retract, daemon=True)
+        t.start()
+        assert done.wait(timeout=5), "set_value(None) deadlocked on a non-reentrant lock"
+        assert mock_client.publish.call_args[0][1] == ""  # the retraction reached the wire
 
 
 class TestHomiePropertyClearValue:
