@@ -524,6 +524,16 @@ class Property:
         self._qos = EBUS_HOMIE_MQTT_QOS
         # Track whether this property has ever been published (FIX for MQTT topic persistence)
         self._ever_published = False
+        # The last (topic, payload) pair this property actually put on the wire, or
+        # None. publish_value() skips a retained republish whose final payload is
+        # byte-identical on the same topic (GH #50). The TOPIC is half the key
+        # because it is derived at publish time from the node/device ids, and
+        # set_node()/set_device() are public: a reparented property must not have
+        # its first publish on the new topic suppressed by the old topic's memo.
+        # Held as ONE tuple rather than two fields so the pair cannot tear when the
+        # MQTT loop thread and an application thread publish concurrently (a single
+        # attribute assignment is atomic; two are not).
+        self._last_published: Optional[tuple] = None
         self._initial_value_was_none = value is None
         # Check for skip_initial_publish flag from dict
         self._skip_initial_publish = from_dict.get("skip_initial_publish", False) if from_dict else False
@@ -586,8 +596,25 @@ class Property:
 
     def set_value(self, value: Any) -> bool:
         """
-        Set the property's value to value, and publishes the new value to MQTT
-        Returns False on failure, else True
+        Set the property's value to ``value`` and publish it to MQTT.
+
+        Publishing is gated on change (GH #50): a RETAINED property whose new value
+        produces a wire payload byte-identical to the one it last published on this
+        topic is not republished, because the broker's retained store already holds
+        exactly that payload and every subscriber already has it. The comparison is
+        on the FINAL payload (after rounding, datatype coercion and empty-string
+        encoding), so two distinct Python values that serialize identically collapse
+        to a single publish -- which a caller holding a raw reading cannot determine
+        for itself, since ``round_to`` and the coercion live in here.
+
+        Three carve-outs: a non-retained (event) property is never gated, retraction
+        (``set_value(None)``) is never gated, and ``publish_value(force=True)``
+        bypasses the gate for whole-tree republishes.
+
+        Returns False on failure, else True. A suppressed republish returns True:
+        nothing failed, and the broker holds the value. Callers cannot distinguish
+        suppressed from published from the return; use ``get_last_published_value()``
+        if you need the memo itself.
         """
         self._value = value
         return self.publish_value()
@@ -774,9 +801,18 @@ class Property:
         logger.info(f"reason=propertyPublishTargetValue,propertyID={self._id},value={payload}")
         logger.warning(f"reason=propertyPublishTargetValueNotImplemented,propertyID={self._id},value={payload}")
 
-    def publish_value(self) -> bool:
+    def publish_value(self, *, force: bool = False) -> bool:
         """
-        Publishes the property's value to Homie/eBus broker
+        Publishes the property's value to Homie/eBus broker.
+
+        ``force=True`` bypasses the unchanged-payload skip described in
+        ``set_value`` (GH #50). Every whole-tree republish forces --
+        ``refresh_tree()`` -> ``publish_nodes()`` -> ``Node.publish()`` -> here, plus
+        the structural republishes in ``Node.add_property()`` and
+        ``Device.add_node()``. That is what repopulates a broker whose retained store
+        is empty (one restarted without persistence, or a fresh one): a gated
+        reconnect would find every payload equal to what it "last published", send
+        nothing, and leave those topics empty until each value happened to change.
         """
         mqttc = self.get_mqtt_client()
         # Gate on connectivity, not just the SDK-owned run flag. A bring-your-own-
@@ -828,9 +864,27 @@ class Property:
             # Encode an empty-string value as a single 0x00 byte so the broker
             # does not mistake it for a zero-length "clear retained" payload.
             payload = encode_empty_string(value)
+            # GH #50: skip a republish whose final wire payload is byte-identical to
+            # the one already sitting on this topic. Compared AFTER coercion and
+            # empty-string encoding, so the rounding/enum/JSON collapse is inside the
+            # comparison and an empty-string value ("\x00") can never alias the
+            # zero-length "clear retained" payload.
+            #
+            # RETAINED only. The broker stores nothing for an event property, so an
+            # identical consecutive payload there is a second real event and dropping
+            # it would lose information rather than save a redundant write.
+            # Truthiness rather than `is True`: retained is Optional[bool] and may be
+            # None, which the publish call below already treats as non-retained.
+            if not force and self.retained() and self._ever_published and self._last_published == (topic, payload):
+                logger.debug(f"reason=propertyPublishValueUnchanged,propertyID={self._id},topic={topic}")
+                return True
             logger.debug(f"reason=propertyPublishValue,value={value},topic={topic},retained={self.retained()}")
             mqttc.publish(topic, payload, retain=self.retained(), qos=self._qos)
             self._ever_published = True  # FIX: Mark as published
+            # Memoize only after publish() returns, inside the try: a transport that
+            # raises must not leave a memo claiming the broker holds a payload it
+            # never received, which would suppress that value forever.
+            self._last_published = (topic, payload)
             self._skip_initial_publish = False  # FIX: Clear skip flag after first publish
             return True
         except Exception as e:
@@ -855,6 +909,10 @@ class Property:
         No-ops (returns True) if the property was never published, to avoid
         creating a phantom retained-empty topic. Returns True on success, else
         False.
+
+        Also forgets the publish-on-change memo (GH #50), since the broker no longer
+        holds what that memo claims: re-setting the pre-retraction value afterwards
+        republishes rather than being skipped.
         """
         # FIX: Don't clear if we never published a value
         # This prevents creating phantom topics during cleanup
@@ -883,6 +941,9 @@ class Property:
             mqttc.publish(topic, "", retain=True, qos=self._qos)
             logger.info(f"reason=propertyClearedValue,propertyID={self._id},topic={topic}")
             self._ever_published = False  # FIX: Reset the flag
+            # The memo means "the broker holds this payload on this topic"; the
+            # retraction above has just made that false (GH #50).
+            self._last_published = None
             return True
         except Exception as e:
             logger.warning(f"reason=propertyClearValueException,propertyID={self._id},topic={topic},exception={e}")
@@ -892,9 +953,31 @@ class Property:
         """Return whether this property has ever been published to MQTT (FIX for MQTT topic persistence)"""
         return self._ever_published
 
-    def get_last_published_value(self) -> Any:
-        """Return the last published value (currently just returns current value)"""
-        return self.value()
+    def invalidate_publish_cache(self) -> None:
+        """Forget what this property last published (GH #50).
+
+        The publish-on-change skip assumes the broker still holds the payload this
+        property last sent. Anything that deletes that retained topic behind the
+        property's back -- ``Device.delete_all_from_mqtt()``,
+        ``Device.clear_retained_topic()`` aimed at a property topic, an operator
+        wiping the broker -- must call this, or the next ``set_value()`` of that same
+        value is skipped and the topic stays empty.
+
+        Does NOT touch ``_ever_published``: this says "I no longer know what the
+        broker holds", not "I have never published".
+        """
+        self._last_published = None
+
+    def get_last_published_value(self) -> Optional[str]:
+        """Return the wire PAYLOAD this property last published, or None if it has
+        published nothing since construction or since its last retraction.
+
+        This is the post-coercion, post-encoding string that went to the broker (an
+        empty-string value reads back as ``"\\x00"``), not the Python value -- use
+        ``value()`` for that. Before 0.20.0 this returned the current value, which
+        was a documented placeholder rather than a real record (GH #50).
+        """
+        return self._last_published[1] if self._last_published else None
 
     def description(self) -> dict:
         """
@@ -1144,8 +1227,14 @@ class Node:
         # Add property to dictionary BEFORE publishing description
         self._properties.update({property.id(): property})
         self.device().publish_description()
-        # TODO FIXME DCJ is property.publish_value() the right thing to do here?
-        property.publish_value()
+        # force: announcing a property is a structural republish, so its value must
+        # land regardless of the GH #50 skip. A fresh property would pass the gate
+        # anyway (it has never published), and so would one re-added after
+        # delete_property() (clear_value() resets both gate conjuncts). What force
+        # actually covers is the property whose retained topic was deleted behind its
+        # back -- clear_retained_topic(), or an operator wiping the broker -- where
+        # the memo still claims the broker holds this payload and it does not.
+        property.publish_value(force=True)
         return property
 
     def add_property_from_dict(self, property_dict: dict) -> Property:
@@ -1236,9 +1325,14 @@ class Node:
         description["properties"] = properties
         return description
 
-    def publish(self) -> None:
+    def publish(self, *, force: bool = True) -> None:
         """
-        Publishes Node, specifically its Properties to MQTT
+        Publishes Node, specifically its Properties to MQTT.
+
+        ``force`` defaults to True because this is a republish walk: it exists to put
+        the node's whole property set on the broker, so the GH #50 unchanged-payload
+        skip must not suppress it. Pass ``force=False`` for the gated behavior of the
+        ordinary value path.
         """
         node_id = self.id()
         property_count = len(self._properties)
@@ -1252,7 +1346,7 @@ class Node:
             # properties, its device's $state, and (via refresh_tree) the entire
             # rest of the tree's reconnect. See Device.refresh_tree().
             try:
-                property.publish_value()
+                property.publish_value(force=force)
             except Exception as e:
                 logger.exception(f"reason=nodePublishPropertyFailed,nodeId={node_id},propertyId={property_id},e={e}")
 
@@ -1765,7 +1859,10 @@ class Device:
                 prop.async_loop = self._async_loop
         node_id = node.id()
         self._nodes.update({node_id: node})
-        node.publish()
+        # Explicit force (also Node.publish's default): adopting a node is a
+        # structural republish, so every property lands on the broker under this
+        # device regardless of the GH #50 unchanged-payload skip.
+        node.publish(force=True)
         self.publish_description()
         return node
 
@@ -1876,6 +1973,13 @@ class Device:
                         prop_topic = f"{base_topic}/{node_id}/{prop_id}"
                         try:
                             mqttc.publish(prop_topic, "", retain=True, qos=self._qos)
+                            # The retained topic is gone, so the property's publish-on-
+                            # change memo now describes a broker state that no longer
+                            # exists; without this, re-setting that same value would be
+                            # skipped and the topic would stay empty (GH #50).
+                            # hasattr-guarded to match the duck-typed reads above.
+                            if hasattr(prop, "invalidate_publish_cache"):
+                                prop.invalidate_publish_cache()
                             logger.debug("reason=deviceClearedProperty...")
                         except Exception:
                             logger.warning("reason=deviceClearPropertyFailed...")
@@ -1943,6 +2047,12 @@ class Device:
         """
         Publish empty string to clear retained message on topic
         Returns True on success, False on failure
+
+        This is a raw topic operation: a property's value topic can be cleared this
+        way, but the owning ``Property`` does not know it happened. Call
+        ``Property.invalidate_publish_cache()`` on it too, or the GH #50
+        unchanged-payload skip will suppress the next ``set_value()`` of that same
+        value and the topic will stay deleted.
         """
         mqttc = self.get_mqtt_client()
         if not mqttc:
@@ -2028,11 +2138,19 @@ class Device:
         """
         return StateTransitionContext(self)
 
-    def refresh_tree(self) -> None:
+    def refresh_tree(self, *, force: bool = True) -> None:
         """
         Republish this device and every descendant (description, nodes,
         property values, state). Used on broker reconnect (S6) so the entire
         tree's retained-state is re-established under the root's connection.
+
+        ``force`` defaults to True, so every property value is republished even where
+        its payload is unchanged (GH #50). That is the whole point on reconnect: the
+        broker's retained store may be empty (restarted without persistence, or a new
+        broker), in which case a gated refresh would find every payload equal to what
+        it last published, send nothing, and leave the tree's values missing. It is
+        keyword-only with a default because callers wire this in bare as an
+        on-connect callback.
 
         For a client the SDK owns, ``on_connect`` calls this automatically on
         every (re)connect. A bring-your-own-transport caller must call it from
@@ -2062,7 +2180,7 @@ class Device:
         # This narrows a producer-side window; it is NOT a guarantee a consumer
         # may build on (see doc/consuming-a-homie-tree.md). Message set unchanged.
         self.publish_description(republish=True)
-        self.publish_nodes()
+        self.publish_nodes(force=force)
         # Snapshot — main thread may construct child devices (which append
         # to self._children) while this runs on the MQTT loop thread.
         for child in list(self._children):
@@ -2073,7 +2191,7 @@ class Device:
             # every later sibling AND this device's own state publish below,
             # turning one sick device into a tree-wide reconnect failure.
             try:
-                child.refresh_tree()
+                child.refresh_tree(force=force)
             except Exception as e:
                 logger.exception(f"reason=deviceRefreshTreeChildFailed,deviceId={self._id},childId={child._id},e={e}")
         self.publish_state()
@@ -2188,13 +2306,15 @@ class Device:
                 # Just publish description
                 self.publish("$description")
 
-    def publish_nodes(self) -> None:
+    def publish_nodes(self, *, force: bool = True) -> None:
         # Snapshot — invoked from on_connect() on the MQTT loop thread while
         # the main thread may be inside state_transition() calling add_node().
         # Without the snapshot, dict-size-changed-during-iteration crashes the
         # MQTT thread on initial connect.
+        # force defaults to True for the same reason as Node.publish: this is a
+        # republish walk, not the gated value path (GH #50).
         for node in list(self._nodes.values()):
-            node.publish()
+            node.publish(force=force)
 
     def on_connect(self) -> None:
         """
@@ -2225,7 +2345,10 @@ class Device:
         # The initial-vs-reconnect flag is now observability only — both paths do
         # the same complete republish. Clearing it keeps the log honest.
         self.initial_broker_connection = False
-        self.refresh_tree()
+        # force: this is the site the GH #50 force path exists for. A broker restarted
+        # with an empty retained store must be fully repopulated, and every payload
+        # here matches what the property "last published".
+        self.refresh_tree(force=True)
 
     def _handle_disconnect(self, rc=None) -> None:
         """Transport disconnect handler for the root's MQTT client.

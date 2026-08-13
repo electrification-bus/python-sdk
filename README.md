@@ -51,7 +51,7 @@ temp.set_value(23.5)
 
 #### Resilient connect
 
-Constructing a `Device` never blocks or fails just because the broker is momentarily unreachable (startup, restart, a network blip). The connection is opened asynchronously on the network loop that `start_mqtt_client()` starts, and retried with backoff until the broker appears; when it connects, the SDK publishes the device's complete state (`$state`, `$description`, nodes, and property values), so a device built against a down broker comes up fully published rather than half-published. You can publish before the link is up (values are retained and re-published on connect), or gate on `device.is_connected()` if you must not publish until connected. A genuinely bad configuration (a malformed `mqtt_cfg` or an unreadable TLS certificate) still fails fast: it raises out of the `Device(...)` constructor rather than leaving a silent, dead publisher.
+Constructing a `Device` never blocks or fails just because the broker is momentarily unreachable (startup, restart, a network blip). The connection is opened asynchronously on the network loop that `start_mqtt_client()` starts, and retried with backoff until the broker appears; when it connects, the SDK publishes the device's complete state (`$state`, `$description`, nodes, and property values), so a device built against a down broker comes up fully published rather than half-published. That connect-time republish is never gated by the unchanged-value skip described below: it forces every property value, so a broker whose retained store is empty is fully repopulated. You can publish before the link is up (values are retained and re-published on connect), or gate on `device.is_connected()` if you must not publish until connected. A genuinely bad configuration (a malformed `mqtt_cfg` or an unreadable TLS certificate) still fails fast: it raises out of the `Device(...)` constructor rather than leaving a silent, dead publisher.
 
 #### Transport-free construction
 
@@ -111,6 +111,20 @@ temp.set_value(None)     # retracts the retained topic (subscribers see nothing)
 label.set_value("")      # publishes an empty-string VALUE (0x00 on the wire)
 ```
 
+#### Unchanged values are not republished
+
+Setting a retained property to a value whose wire payload is byte-identical to the one it last published is a no-op: the broker's retained store already holds that payload, every subscriber already has it, and the publish carries no information. The comparison is on the **final** payload, after rounding, datatype coercion and empty-string encoding, which is why the SDK does this rather than leaving it to the caller: a caller holding a raw reading cannot know whether it will change the payload, since `round_to` and the coercion live inside the property. Two readings of `0.14494210481643677` and `0.14501120000000001` are genuinely different values that any caller-side change check calls "changed", and both publish `0.1`.
+
+Three carve-outs, each deliberate:
+
+- **A non-retained (event) property is never gated.** The broker stores nothing for it, so an identical consecutive payload is a second real event, not a redundant write.
+- **Retraction always publishes.** `set_value(None)` / `clear_value()` must reach the broker to delete the topic.
+- **Every whole-tree republish forces.** `refresh_tree()`, and the reconnect that calls it, republish every property value regardless. That is what repopulates a broker whose retained store is empty (restarted without persistence, or a fresh one); a gated refresh would find every payload equal to what it last published and send nothing.
+
+The retained state left on the broker is identical either way: strictly fewer messages, same truth. `Property.get_last_published_value()` returns the memoized wire payload, and `Property.invalidate_publish_cache()` forgets it, which is what you call if something deletes a retained value topic behind the SDK's back.
+
+Liveness is `$state`, never message arrival: a consumer counting messages sees a steady value's topic go quiet, and quiet is indistinguishable from dead if you are counting. See [`doc/consuming-a-homie-tree.md`](doc/consuming-a-homie-tree.md).
+
 ### Device Trees (parent / child)
 
 Build a tree of devices that share a single MQTT connection. The root device owns the connection (and the Last Will), every child borrows it via the `parent=` constructor arg, and `$description` `root` / `parent` / `children` fields are kept in sync automatically. The tree can be any depth.
@@ -135,7 +149,7 @@ panel.children()[0].delete()
 
 Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies — controllers compute effective state per the Homie 5 precedence table (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
 
-`$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content (ignoring its `version` timestamp) is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition.
+`$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content (ignoring its `version` timestamp) is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)).
 
 ### Building a Proxy or Adapter
 

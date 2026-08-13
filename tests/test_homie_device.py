@@ -494,6 +494,194 @@ class TestHomiePropertyPublish:
         assert result is False
 
 
+class TestHomiePropertyPublishSuppression:
+    """GH #50: a retained property does not republish an unchanged wire payload.
+
+    The comparison is on the FINAL payload (post-rounding, post-coercion,
+    post-empty-string-encoding), which is why a caller holding a raw reading cannot
+    make this call for itself. force=True is the exemption every whole-tree
+    republish uses.
+    """
+
+    def test_identical_payload_publishes_once(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+
+        assert prop.set_value(99.0) is True
+        mock_client.publish.reset_mock()
+
+        assert prop.set_value(99.0) is True  # True: nothing failed, broker holds it
+        mock_client.publish.assert_not_called()
+
+    def test_a_changed_payload_publishes_again(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+        mock_client.publish.reset_mock()
+
+        prop.set_value(100.0)
+
+        mock_client.publish.assert_called_once()
+        assert mock_client.publish.call_args[0][1] == "100.0"
+
+    def test_force_republishes_an_unchanged_payload(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+        mock_client.publish.reset_mock()
+
+        assert prop.publish_value(force=True) is True
+
+        mock_client.publish.assert_called_once()
+        assert mock_client.publish.call_args[0][1] == "99.0"
+
+    def test_values_that_coerce_to_the_same_payload_publish_once(self):
+        # Issue #50's motivating example: two genuinely different readings that
+        # both round to "0.1". Any change-detection the CALLER does says "changed";
+        # only the Property knows the payload is identical.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, value=None, round_to=1)
+
+        prop.set_value(0.14494210481643677)
+        assert mock_client.publish.call_args[0][1] == "0.1"
+        mock_client.publish.reset_mock()
+
+        prop.set_value(0.14501120000000001)
+
+        mock_client.publish.assert_not_called()
+
+    def test_a_non_retained_property_publishes_every_identical_value(self):
+        # An event property: the broker stores nothing, so an identical consecutive
+        # payload is a SECOND REAL EVENT. Suppressing it would lose information.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, retained=False)
+
+        prop.set_value(99.0)
+        prop.set_value(99.0)
+        prop.set_value(99.0)
+
+        assert mock_client.publish.call_count == 3
+
+    def test_retained_none_is_never_deduped(self):
+        # retained is Optional[bool] and reachable as None; the publish call already
+        # treats that as non-retained, so the gate must too (truthiness, not `is True`).
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, retained=None)
+
+        prop.set_value(99.0)
+        prop.set_value(99.0)
+
+        assert mock_client.publish.call_count == 2
+
+    def test_clear_then_the_same_value_republishes(self):
+        # publish x -> retract -> set x again. Without a memo reset in clear_value()
+        # the third step is suppressed and the topic stays permanently deleted.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+
+        prop.set_value(99.0)
+        prop.clear_value()
+        mock_client.publish.reset_mock()
+
+        prop.set_value(99.0)
+
+        mock_client.publish.assert_called_once()
+        assert mock_client.publish.call_args[0][1] == "99.0"
+
+    def test_a_suppressed_value_does_not_block_a_later_retraction(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+        prop.set_value(99.0)  # suppressed
+        mock_client.publish.reset_mock()
+
+        assert prop.set_value(None) is True
+
+        mock_client.publish.assert_called_once()
+        assert mock_client.publish.call_args[0][1] == ""  # zero-length: retraction
+        assert mock_client.publish.call_args[1]["retain"] is True
+
+    def test_empty_string_dedups_but_never_aliases_a_clear(self):
+        # The gate compares POST-encoding payloads, so an empty-string value
+        # ("\x00") can never be mistaken for the zero-length clear payload ("").
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, id="label", value=None, datatype=PropertyDatatype.STRING)
+
+        prop.set_value("")
+        assert mock_client.publish.call_args[0][1] == "\x00"
+        mock_client.publish.reset_mock()
+
+        prop.set_value("")  # unchanged empty-string VALUE -> suppressed
+        mock_client.publish.assert_not_called()
+
+        prop.set_value(None)  # retraction -> zero-length, always publishes
+        assert mock_client.publish.call_args[0][1] == ""
+        mock_client.publish.reset_mock()
+
+        prop.set_value("")  # the value is back -> 0x00 again, not suppressed
+        assert mock_client.publish.call_args[0][1] == "\x00"
+
+    def test_reparenting_republishes_on_the_new_topic(self):
+        # The memo is keyed on (topic, payload): set_node() is public, so a moved
+        # property must not have its first publish on the NEW topic suppressed.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+        mock_client.publish.reset_mock()
+
+        other_device = MagicMock()
+        other_device.id.return_value = "dev1"
+        other_device.get_mqtt_client.return_value = mock_client
+        other_device._qos = EBUS_HOMIE_MQTT_QOS
+        prop.set_node(Node(id="node2", device=other_device))
+
+        prop.set_value(99.0)
+
+        mock_client.publish.assert_called_once()
+        assert "/node2/temperature" in mock_client.publish.call_args[0][0]
+
+    def test_a_failed_publish_does_not_poison_the_memo(self):
+        # The memo is written only AFTER publish() returns. If it were written first,
+        # one transient transport failure would suppress that value forever.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(1.0)
+        mock_client.publish.side_effect = [Exception("connection lost"), MagicMock(rc=0)]
+        mock_client.publish.reset_mock()
+
+        assert prop.set_value(2.0) is False  # the wire write failed
+        assert prop.set_value(2.0) is True  # ...so the retry must not be suppressed
+
+        assert mock_client.publish.call_count == 2
+        assert mock_client.publish.call_args[0][1] == "2.0"
+
+    def test_get_last_published_value_returns_the_wire_payload(self):
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client, value=None)
+        assert prop.get_last_published_value() is None
+
+        prop.set_value(72.5)
+        assert prop.get_last_published_value() == "72.5"  # the payload, not the float
+
+        prop.clear_value()
+        assert prop.get_last_published_value() is None
+
+    def test_invalidate_publish_cache_forces_the_next_publish(self):
+        # For anything that deletes the retained topic behind the property's back.
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(mock_client)
+        prop.set_value(99.0)
+        mock_client.publish.reset_mock()
+
+        prop.invalidate_publish_cache()
+        assert prop.get_last_published_value() is None
+        assert prop.was_ever_published() is True  # invalidation is not a retraction
+
+        prop.set_value(99.0)
+
+        mock_client.publish.assert_called_once()
+
+
 class TestHomiePropertyClearValue:
     def test_clear_value_never_published_skips(self):
         mock_client = _mock_mqtt_client()
@@ -726,6 +914,44 @@ class TestNodeAddProperty:
         assert "temp" in node.properties()
         assert prop.node() is node
 
+    def test_a_re_added_property_republishes_its_value(self, mock_paho):
+        # delete_property() clears the retained topic and resets the property's
+        # published state, so re-adding the SAME object must put the value back.
+        # (The GH #50 gate is already open here, since clear_value() reset it: the
+        # force= hop is pinned by the next test instead.)
+        device, mock_client = _make_device(mock_paho)
+        node = device.new_node("core", "Core", "sensor")
+        device.add_node(node)
+        prop = Property(id="temp", value=72.5, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)
+        node.delete_property("temp")
+        mock_client.publish.reset_mock()
+
+        node.add_property(prop)
+
+        value_payloads = [c[0][1] for c in mock_client.publish.call_args_list if c[0][0].endswith("/core/temp")]
+        assert "72.5" in value_payloads
+
+    def test_re_announce_restores_a_value_topic_wiped_behind_the_propertys_back(self, mock_paho):
+        # This is what add_property()'s force=True is actually for. clear_retained_topic()
+        # deletes the value topic without the Property knowing, so its GH #50 memo still
+        # claims the broker holds "72.5" and _ever_published is still True. Without force,
+        # the re-announce is suppressed and $description names a property whose value
+        # topic stays empty.
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        node = device.new_node("core", "Core", "sensor")
+        device.add_node(node)
+        prop = Property(id="temp", value=72.5, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)
+        device.clear_retained_topic(f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev-1/core/temp")
+        assert prop.was_ever_published() is True  # the wipe left the memo intact
+        mock_client.publish.reset_mock()
+
+        node.add_property(prop)
+
+        value_payloads = [c[0][1] for c in mock_client.publish.call_args_list if c[0][0].endswith("/core/temp")]
+        assert value_payloads == ["72.5"]
+
     def test_add_property_from_dict(self, mock_paho):
         device, mock_client = _make_device(mock_paho)
         node = device.new_node("core")
@@ -875,8 +1101,18 @@ class TestNodePublish:
         n._properties = {"a": p1, "b": p2}
 
         n.publish()
-        p1.publish_value.assert_called_once()
-        p2.publish_value.assert_called_once()
+        # force=True, not merely "called": Node.publish is a republish walk, and a
+        # dropped force hop silently disables the reconnect repopulate (GH #50).
+        p1.publish_value.assert_called_once_with(force=True)
+        p2.publish_value.assert_called_once_with(force=True)
+
+    def test_publish_forwards_force_to_each_property(self):
+        n = Node(id="core")
+        p1 = MagicMock()
+        n._properties = {"a": p1}
+
+        n.publish(force=False)
+        p1.publish_value.assert_called_once_with(force=False)
 
 
 # ── Device ───────────────────────────────────────────────────────────────
@@ -1543,7 +1779,15 @@ class TestDevicePublish:
         device._nodes = {"core": mock_node}
 
         device.publish_nodes()
-        mock_node.publish.assert_called_once()
+        mock_node.publish.assert_called_once_with(force=True)
+
+    def test_publish_nodes_forwards_force(self, mock_paho):
+        device, _ = _make_device(mock_paho)
+        mock_node = MagicMock()
+        device._nodes = {"core": mock_node}
+
+        device.publish_nodes(force=False)
+        mock_node.publish.assert_called_once_with(force=False)
 
     def test_publish_nodes_snapshots_against_concurrent_add(self, mock_paho):
         """SDK-e3k: publish_nodes() must snapshot self._nodes so the main
@@ -1555,7 +1799,8 @@ class TestDevicePublish:
         # the underlying dict (as the main thread's add_node would).
         racing_node = MagicMock()
 
-        def mutate_during_publish():
+        def mutate_during_publish(**kwargs):
+            # **kwargs: publish_nodes forwards force= to each node (GH #50).
             device._nodes["late-arrival"] = MagicMock()
 
         racing_node.publish.side_effect = mutate_during_publish
@@ -1584,6 +1829,22 @@ class TestDeviceOnConnect:
         topics = [c[0][0] for c in mock_client.publish.call_args_list]
         assert any("/dev-1/$description" in t for t in topics), topics
         assert any("/dev-1/$state" in t for t in topics), topics
+
+    def test_reconnect_republishes_unchanged_property_values(self, mock_paho):
+        """GH #50: on_connect is the site the force path exists for. A broker that
+        restarted without persistence holds nothing, and every payload matches what
+        the property last published."""
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        node = device.new_node("core", "Core", "sensor")
+        device.add_node(node)
+        node.add_property(Property(id="temp", value=72.5, datatype=PropertyDatatype.FLOAT))
+        device.initial_broker_connection = False  # a RE-connect, not the first
+        mock_client.publish.reset_mock()
+
+        device.on_connect()
+
+        value_payloads = [c[0][1] for c in mock_client.publish.call_args_list if c[0][0].endswith("/core/temp")]
+        assert value_payloads == ["72.5"]
 
     def test_initial_connection_cascades_to_children(self, mock_paho):
         """A child constructed before the first connect (possible when the
@@ -1637,6 +1898,21 @@ class TestDeviceDeleteAllFromMqtt:
         assert device.nodes() == {}
         # Should have cleared the property topic and the description topic
         assert mock_client.publish.call_count >= 2
+
+    def test_delete_all_invalidates_the_publish_cache(self, mock_paho):
+        # This method clears property topics with a raw publish, behind the Property's
+        # back. Without invalidating the memo, re-setting that same value afterwards
+        # is suppressed and the topic stays empty (GH #50).
+        device, mock_client = _make_device(mock_paho)
+        node = device.new_node("core")
+        device.add_node(node)
+        prop = Property(id="temp", value=72.5, datatype=PropertyDatatype.FLOAT)
+        node.add_property(prop)
+        assert prop.get_last_published_value() == "72.5"
+
+        device.delete_all_from_mqtt()
+
+        assert prop.get_last_published_value() is None
 
     def test_delete_all_no_mqtt_client(self, mock_paho):
         device, _ = _make_device(mock_paho)
@@ -1739,6 +2015,34 @@ class TestDeviceRefreshTree:
         topics = [c[0][0] for c in mock_client.publish.call_args_list]
         assert any("$description" in t for t in topics)
         assert any("$state" in t for t in topics)
+
+    def test_refresh_tree_republishes_an_unchanged_property_value(self, mock_paho):
+        """GH #50 acceptance: after a broker restart with an empty retained store, a
+        reconnect must fully repopulate every property topic.
+
+        Every payload here is byte-identical to what the property last published, so
+        a refresh that respected the unchanged-payload gate would send nothing and
+        leave the values missing until each one happened to change.
+        """
+        device, mock_client = _make_device(mock_paho, device_id="dev-1")
+        node = device.new_node("core")
+        device.add_node(node)
+        node.add_property(Property(id="temp", value=72.5, datatype=PropertyDatatype.FLOAT))
+        mock_client.publish.reset_mock()
+
+        device.refresh_tree()
+
+        value_payloads = [c[0][1] for c in mock_client.publish.call_args_list if c[0][0].endswith("/core/temp")]
+        assert value_payloads == ["72.5"]
+
+    def test_refresh_tree_forwards_force_to_children(self, mock_paho):
+        root, _ = _make_device(mock_paho, device_id="panel-1")
+        child = MagicMock()
+        root._children = [child]
+
+        root.refresh_tree()
+
+        child.refresh_tree.assert_called_once_with(force=True)
 
     def test_refresh_tree_cascades_to_children(self, mock_paho):
         """S6: reconnect republish must touch every device in the tree."""

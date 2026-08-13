@@ -60,7 +60,7 @@ GroupedPropertyDict  ──fires──►  PROPERTY_CHANGED
 homie.Property.set_value(...)  ──►  MQTT (ebus/5/<device>/<node>/<property>)
 ```
 
-`GroupedPropertyDict.set_value` fires the change event (and the callback) only when the value actually changes, so re-writing the same value does not republish. That dedup is free.
+`GroupedPropertyDict.set_value` fires the change event (and the callback) only when the value actually changes, so re-writing the same value does not republish. That dedup is free, and it is no longer the only one: `homie.Property` independently skips a retained republish whose final wire payload is unchanged. The two sit at different granularities and compose rather than duplicate. The model gate suppresses the *callback* on an unequal-value comparison; the Homie gate suppresses the *publish* on a byte comparison made after rounding and coercion, so it also catches two distinct model values that serialize to the same payload. A tree driven directly, bypassing the model, still gets the second one.
 
 ## The exported pieces
 
@@ -197,7 +197,7 @@ self._props = {}                     # (node, prop) -> homie.Property
 self._props[("meter", "active-power")].set_value(read_watts())   # from the read loop
 ```
 
-It works, and it is tempting because it is fewer lines at first. But it reinvents, more crudely, what `GroupedPropertyDict` already gives you: it has no queryable local model of the device, no change dedup, no clean seam for settable properties, and it diverges from every other eBus proxy so it reads differently for the next maintainer. If you find yourself storing a `dict` of `homie.Property` handles and calling `.set_value()` on them from your data path, switch to the observable model: put the values in a `GroupedPropertyDict` and `bind_property_to_homie` them.
+It works, and it is tempting because it is fewer lines at first. But it reinvents, more crudely, what `GroupedPropertyDict` already gives you: it has no queryable local model of the device, no clean seam for settable properties, and it diverges from every other eBus proxy so it reads differently for the next maintainer. If you find yourself storing a `dict` of `homie.Property` handles and calling `.set_value()` on them from your data path, switch to the observable model: put the values in a `GroupedPropertyDict` and `bind_property_to_homie` them.
 
 ## Checklist
 

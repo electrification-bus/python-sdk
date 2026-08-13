@@ -22,8 +22,11 @@ Optimizations this SDK already grants itself as a producer:
 | Description suppression (content hash) | An unchanged `$description` is not republished at all |
 | Deferral inside an open transition | Interim `$description` publishes never reach the broker |
 | Cascade ordering (`refresh_tree()`) | A device's own `$state` follows the content it vouches for |
+| Value suppression (unchanged payload) | A retained property value byte-identical to the last one published is not republished |
 
-Every one of those changes *when and whether* a message appears. None of them changes what is true. A consumer that reads current state and reconciles is unaffected by all four; a consumer that awaits an expected message is broken by at least three.
+Every one of those changes *when and whether* a message appears. None of them changes what is true. A consumer that reads current state and reconciles is unaffected by all five; a consumer that awaits an expected message is broken by at least four.
+
+The fifth row deserves separate attention, because it is the first of these to touch the **data** plane rather than `$state` and `$description`. A consumer that treats repeated identical values as a freshness heartbeat is broken by it: the topic goes quiet the moment a value settles, and quiet is indistinguishable from dead if you are counting messages. Liveness is `$state` (and `get_effective_state()`), never message arrival. That is the same rule as the other four, but it is the one an integrator is most likely to report as "the SDK stopped publishing".
 
 ## What `$state = ready` actually means
 
@@ -51,7 +54,7 @@ The one thing a root's state **is** authoritative for is **effective state**. Ho
 
 > "Wait for every declared descendant to describe itself, then report ready."
 
-This is the most common defence and it is a real improvement over gating on the root alone. It is still wrong, because it is a **barrier** rather than a **loop**: it runs once, passes, and stops reconciling. Commission circuit #38 a minute later and the consumer never sees it. The failure moves from startup to steady state, which makes it harder to find, not less real.
+This is the most common defense and it is a real improvement over gating on the root alone. It is still wrong, because it is a **barrier** rather than a **loop**: it runs once, passes, and stops reconciling. Commission circuit #38 a minute later and the consumer never sees it. The failure moves from startup to steady state, which makes it harder to find, not less real.
 
 Correct version: reconcile the declared child set against the subscribed child set on **every** ready edge, forever.
 
