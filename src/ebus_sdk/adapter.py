@@ -24,7 +24,9 @@ def set_homie_property_from_python_property(homie_property: HomieProperty, pytho
 
     This is the on-change adapter that mirrors the observable model to Homie.
     Register it as the ``GroupedPropertyDict`` on-change callback for a
-    ``(group, property_id)`` pair so every value change republishes to MQTT::
+    ``(group, property_id)`` pair so every value change reaches MQTT (subject to
+    the Homie layer's own publish-on-change gate, which drops a republish whose
+    wire payload is unchanged -- see ``homie.Property.set_value``)::
 
         properties.add_property_on_change_callback(
             group,

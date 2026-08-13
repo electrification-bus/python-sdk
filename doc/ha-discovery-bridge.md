@@ -116,17 +116,17 @@ Two mechanisms preserve the `entity_id`:
 
 1. **Set `default_entity_id` at creation.** `HAComponent` carries a typed `default_entity_id` field (emitted as HA's `default_entity_id`); set it to the OLD integration's `entity_id` and Home Assistant uses that id when it first creates the entity. This is the clean path for a device that has not been discovered yet. Set it from an override hook (or the customizer table):
 
-```python
-OLD_IDS = {("meter", "active-power"): "sensor.panel_main_power"}  # prior entity_ids
+   ```python
+   OLD_IDS = {("meter", "active-power"): "sensor.panel_main_power"}  # prior entity_ids
 
-def preserve_ids(component, ctx):
-    old = OLD_IDS.get((ctx.node_id, ctx.prop_id))
-    if old:
-        component.default_entity_id = old
-    return component
+   def preserve_ids(component, ctx):
+       old = OLD_IDS.get((ctx.node_id, ctx.prop_id))
+       if old:
+           component.default_entity_id = old
+       return component
 
-HaDiscoveryBridge(controller, default_override=preserve_ids)
-```
+   HaDiscoveryBridge(controller, default_override=preserve_ids)
+   ```
 
    `default_entity_id` applies only when the entity is first created; it has no effect on an entity that already exists.
 

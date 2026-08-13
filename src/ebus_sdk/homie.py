@@ -848,8 +848,9 @@ class Property:
             # NOTE: this clears the topic (empty MQTT payload). It does NOT
             # represent an actual empty-string *value*, which the Homie 5
             # convention encodes as a 1-character 0x00 payload — see the module
-            # header "empty string values" note; that encoding is not yet
-            # implemented (SDK-ef1 / known limitation).
+            # header "empty string values" note. That encoding IS implemented,
+            # below, via encode_empty_string(); the two payloads are distinct and
+            # only the zero-length one retracts a retained topic.
             logger.debug(
                 f"reason=propertyPublishValueIsNoneClearing,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
             )
@@ -903,8 +904,8 @@ class Property:
         previously-published property (see ``publish_value``).
 
         This clears the topic; it does NOT publish an actual empty-string
-        *value* (which the Homie 5 convention encodes as a 1-character 0x00
-        payload — not yet implemented, see the module header note).
+        *value*, which the Homie 5 convention encodes as a 1-character 0x00
+        payload and ``publish_value()`` emits via ``encode_empty_string()``.
 
         No-ops (returns True) if the property was never published, to avoid
         creating a phantom retained-empty topic. Returns True on success, else

@@ -74,16 +74,20 @@ setup()
 2. Extract the sdist: `tar xzf dist/<pkg>-X.Y.Z.tar.gz -C /tmp`.
 3. Confirm `setup.py` (or `setup.cfg [metadata]`) is present in the extracted tree.
 4. Build a wheel using an **old** setuptools to simulate the legacy environment:
+
    ```bash
    python -m venv /tmp/legacy-env
    /tmp/legacy-env/bin/pip install 'setuptools<61' wheel
    cd /tmp/<pkg>-X.Y.Z
    /tmp/legacy-env/bin/python -m build --wheel --no-isolation
    ```
+
 5. Inspect the produced wheel:
+
    ```bash
    unzip -l dist/<pkg>-X.Y.Z-py3-none-any.whl
    ```
+
 6. Confirm the wheel name is `<pkg>-X.Y.Z-...` (NOT `UNKNOWN-0.0.0-...`) and contains your actual `.py` files (not just `dist-info/` metadata).
 
 If you have a Yocto consumer, a more authoritative test is to build the package via the bitbake recipe (e.g., on dsw-build-01) and inspect the produced `.deb` with `dpkg-deb -c`.
