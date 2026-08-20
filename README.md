@@ -174,6 +174,25 @@ Children may have children of their own. A single Last Will registered on the ro
 
 `$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content (ignoring its `version` timestamp) is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)).
 
+### Publishing under a different Homie domain
+
+Every topic is prefixed by a *domain*: `ebus/5/...`. The eBus specification mandates `ebus` for energy devices, and that is the default, so an eBus publisher never has to think about this.
+
+A publisher that also speaks for non-energy devices can put a tree under the standard `homie` domain, or any other, by passing `homie_domain=` to the **root**:
+
+```python
+lamp = Device('lamp-1', type='...', mqtt_cfg={...}, homie_domain='homie')
+lamp.start_mqtt_client()
+# -> homie/5/lamp-1/$state, homie/5/lamp-1/light/brightness, and a
+#    Last Will on homie/5/lamp-1/$state
+```
+
+The domain covers everything the tree derives: property values, `/set` subscriptions, `$state`, `$description`, the retraction topics `delete()` clears, and the Last Will. An inbound `/set` is accepted on the tree's own domain and ignored on any other.
+
+It is a property of the **tree**, not of a device. Children inherit the root's domain, and a child passing its own is refused the same way a child passing its own `mqtt_cfg` is, because a tree shares one connection and one prefix. Read it back with `device.homie_domain()` from any handle in the tree.
+
+The consumer side has always been configurable: `Controller(homie_domain=...)` monitors one domain, so watching both trees means two `Controller`s.
+
 ### Building a Proxy or Adapter
 
 To publish a device whose state changes over time (a proxy for a non-eBus device, an adapter for a local device, a gateway/bridge), use the **observable-model pattern**: keep the device's live state in a `GroupedPropertyDict` of observable `Property` objects, and mirror each change onto the Homie tree with a per-property on-change callback. Your acquisition code only updates the model; publishing to MQTT is an automatic side-effect.
@@ -279,7 +298,7 @@ MQTT transport lives in the separate [`ebus-mqtt-client`](https://github.com/ele
 
 Core Homie convention implementation:
 
-- **Device** - Represents a Homie device; pass `parent=` to build a child in a tree, or `on_disconnect=` for a push disconnect hook (`clean: bool`); `declare_lost()` announces deliberate death and `stop(announce=False)` tears down without announcing
+- **Device** - Represents a Homie device; pass `parent=` to build a child in a tree, `homie_domain=` on a root to publish under a domain other than `ebus`, or `on_disconnect=` for a push disconnect hook (`clean: bool`); `declare_lost()` announces deliberate death and `stop(announce=False)` tears down without announcing
 - **Node** - Groups related properties within a device
 - **Property** - Individual data points (sensors, controls)
 - **Controller** - Discovers and monitors Homie devices on a broker; navigates trees and computes effective state; `set_on_disconnect_callback` for push disconnect notification

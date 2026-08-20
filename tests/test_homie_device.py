@@ -58,6 +58,7 @@ def _make_wired_property(mock_client, device_id="dev1", node_id="node1", **prop_
     mock_device.id.return_value = device_id
     mock_device.get_mqtt_client.return_value = mock_client
     mock_device._qos = EBUS_HOMIE_MQTT_QOS
+    mock_device.homie_domain.return_value = EBUS_HOMIE_DOMAIN
 
     node = Node(id=node_id, device=mock_device)
     defaults = dict(id="temperature", value=72.5, datatype=PropertyDatatype.FLOAT)

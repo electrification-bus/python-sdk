@@ -597,6 +597,17 @@ class Property:
         device = node.device() if node is not None else None
         return device._transport_free() if device is not None else False
 
+    def _homie_domain(self) -> str:
+        """The domain of the tree this property belongs to.
+
+        Same node -> device walk as ``_transport_free``. A property not yet
+        attached to a tree falls back to the eBus domain, which is what every
+        topic here was hardcoded to before the domain was configurable.
+        """
+        node = self.node()
+        device = node.device() if node is not None else self._device
+        return device.homie_domain() if device is not None else EBUS_HOMIE_DOMAIN
+
     def get_node_id(self) -> str:
         """
         Why is this needed?
@@ -876,7 +887,7 @@ class Property:
             if self._value is None and (not self._ever_published or self._skip_initial_publish):
                 logger.debug(f"reason=propertySkipPublishNoneValue,propertyID={self._id}")
                 return True
-            topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
+            topic = f"{self._homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
             if self._value is None:
                 # Value was cleared after having been published. Emit the empty
                 # retained message so the prior retained value is retracted from the
@@ -979,7 +990,7 @@ class Property:
                     f"reason=propertyClearValueInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
                 )
                 return False
-            topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
+            topic = f"{self._homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}"
             try:
                 # Publishing empty string clears retained message
                 mqttc.publish(topic, "", retain=True, qos=self._qos)
@@ -1068,7 +1079,7 @@ class Property:
             logger.warning(f"reason=nodeSetCallbackTopicParseException,e={e}")
             return
         if not (
-            (homie_domain == EBUS_HOMIE_DOMAIN)
+            (homie_domain == self._homie_domain())
             and (homie_version == str(EBUS_HOMIE_VERSION_MAJOR))
             and (property_id_set == "set")
         ):
@@ -1156,7 +1167,7 @@ class Property:
                 f"propertySetSubscribeInsufficientIDs,deviceID={device_id},nodeID={node_id},propertyID={self._id}"
             )
             return
-        topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}/set"
+        topic = f"{self._homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}/set"
         try:
             mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos)
         except Exception as e:
@@ -1486,7 +1497,9 @@ class Device:
                             "username": "MyUserName",
                             "password": "SECRET"}}
 
-    homie_domains config for future use, not currently supported by this code
+    The ``homie_domains`` key in the broker config is not read by this class. To
+    publish a tree under a domain other than ``ebus``, pass ``homie_domain=`` to
+    the ROOT Device; see ``homie_domain()``.
 
     mqtt_cfg={} connects using ebus-mqtt-client's defaults. mqtt_cfg=None opens no socket:
     the tree still composes $description and resolves ids and topics, it just never
@@ -1520,6 +1533,7 @@ class Device:
         description_extras: Optional[dict] = None,
         mqtt_cfg: Optional[dict] = None,
         mqttc: Optional[MqttDeviceTransport] = None,
+        homie_domain: Optional[str] = None,
         qos: int = EBUS_HOMIE_MQTT_QOS,
         async_loop: Optional[asyncio.AbstractEventLoop] = None,
         on_disconnect: Optional[Callable[[bool], None]] = None,
@@ -1534,6 +1548,15 @@ class Device:
         if parent is not None and mqttc is not None:
             raise ValueError(
                 f"Device id={id}: cannot pass both parent= and mqttc=; children share the root's MQTT connection"
+            )
+        # The domain is a per-TREE property, like the connection and the QoS: one
+        # tree publishes under one prefix, and a child under a different domain
+        # would sit outside its own root's subtree. Refuse it on a child rather
+        # than silently ignoring it, matching the mqtt_cfg/mqttc rule above.
+        if parent is not None and homie_domain is not None:
+            raise ValueError(
+                f"Device id={id}: cannot pass both parent= and homie_domain=; a tree shares one domain, "
+                "set it on the root"
             )
         if mqtt_cfg is not None and mqttc is not None:
             raise ValueError(
@@ -1585,6 +1608,10 @@ class Device:
             # register disconnect handling on their own client.
             logger.warning(f"reason=deviceInjectedClientOnDisconnectInert,id={id}")
         self._id = id
+        # Only a root carries the domain; descendants read the root's via
+        # homie_domain(). Defaults to the eBus domain, so a publisher that never
+        # mentions it is unaffected.
+        self._homie_domain = (homie_domain or EBUS_HOMIE_DOMAIN) if parent is None else None
         self._name = name if name else id
         self._type = type
         self._parent: Optional[Device] = parent
@@ -1732,6 +1759,20 @@ class Device:
         """
         return self._extensions
 
+    def homie_domain(self) -> str:
+        """The Homie domain (topic prefix) this device's TREE publishes under.
+
+        Defaults to ``ebus``, which the eBus specification mandates for energy
+        devices. A publisher that also speaks for non-energy home-automation
+        devices can put a tree under the standard ``homie`` domain, or any
+        other, by passing ``homie_domain=`` to the ROOT device; every topic the
+        tree derives follows, including the Last Will.
+
+        Per-tree, never per-device: a child inherits its root's domain and is
+        refused its own, the same way it is refused its own connection.
+        """
+        return self.root()._homie_domain or EBUS_HOMIE_DOMAIN
+
     @property
     def qos(self) -> int:
         """Returns the MQTT QoS level for this device"""
@@ -1839,7 +1880,7 @@ class Device:
             logger.info(f"reason=deviceStopSilent,id={root._id}")
         elif mqttc.is_connected():
             root._state = DeviceState.DISCONNECTED
-            state_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
+            state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
             if root._owns_client and root._owned_client is not None:
                 flushed = root._owned_client.publish_and_flush(
                     state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
@@ -1913,7 +1954,7 @@ class Device:
             # `lost` long after recovery, which is worse than not sending it.
             logger.info(f"reason=deviceDeclareLostBrokerUnreachable,id={root._id}")
             return changed
-        state_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
+        state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
         # Ownership decides, never isinstance: a caller may legitimately inject a real
         # MqttClient (driven by asyncio_driver), and publish_and_flush/stop must not be
         # called on a client the SDK does not own.
@@ -2087,7 +2128,7 @@ class Device:
             )
             return
 
-        base_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
+        base_topic = f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
 
         # Step 1: Clear all property values that were actually published
         for node_id, node in list(self._nodes.items()):
@@ -2168,7 +2209,7 @@ class Device:
             # the retained $state and "the device will cease to exist", then clear
             # its other retained topics). delete_all_from_mqtt only handles property
             # values and $description, so $state is cleared here separately.
-            base_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
+            base_topic = f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
             self.clear_retained_topic(f"{base_topic}/$state")
             self.delete_all_from_mqtt()
         finally:
@@ -2354,7 +2395,7 @@ class Device:
             logger.info("reason=devicePublishNoDeviceID")
             return
         try:
-            base_topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/"
+            base_topic = f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/"
             if attribute == "$state":
                 topic = base_topic + "$state"
                 if value:
@@ -2515,7 +2556,7 @@ class Device:
         """
         root = self.root()
         return {
-            "topic": f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state",
+            "topic": f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state",
             "payload": DeviceState.LOST.value,
         }
 
