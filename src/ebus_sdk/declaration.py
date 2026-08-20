@@ -144,6 +144,7 @@ def build_from_declarations(
     *,
     node_type: Callable[[str], str] = _default_node_type,
     node_name: Callable[[str], str] = lambda capability: capability,
+    node_id: Callable[[str], str] = lambda capability: capability,
     values: Optional[dict] = None,
 ) -> dict:
     """Build bound Homie nodes/properties + observable properties from `specs`.
@@ -168,6 +169,13 @@ def build_from_declarations(
     `values` map by hand therefore passes values in the property's own unit, not
     raw source units.
 
+    `node_id` renames the Homie node a capability materializes onto, defaulting
+    to the capability itself. It exists for the case a single device carries two
+    instances of one capability: two meters, two lugs. `capability` stays the
+    declaration's vocabulary and `node_id` is the rendering, so call this once
+    per instance with a distinct `node_id` (and a distinct `PropertySpec.model_group`,
+    or the instances collide in the model instead of on the wire).
+
     A spec may split its observable-model identity from its wire identity via
     `source_id` / `model_group` (see `PropertySpec`). Everything on the model
     side of the binding uses `spec.group_key` / `spec.model_key`; everything on
@@ -185,7 +193,7 @@ def build_from_declarations(
     command, but its `entity_setter` is still registered, so `model.set_entity`
     reaches it.
     """
-    built = _materialize(device, model, specs, node_type=node_type, node_name=node_name)
+    built = _materialize(device, model, specs, node_type=node_type, node_name=node_name, node_id=node_id)
     _seed(model, built.declared, values)
     return built.homie_props
 
@@ -220,6 +228,7 @@ def _materialize(
     *,
     node_type: Callable[[str], str],
     node_name: Callable[[str], str],
+    node_id: Callable[[str], str] = lambda capability: capability,
     default_group: Optional[str] = None,
 ) -> _Materialized:
     """Build one device's nodes, properties, model entries and bindings.
@@ -228,6 +237,11 @@ def _materialize(
     device, model groups keyed by capability) and `DeviceTreeBuilder` (many
     devices, model groups keyed per device). Runs inside one
     `device.state_transition()`, so a device announces its structure once.
+
+    `node_id` maps a capability to the Homie node id it materializes onto,
+    defaulting to the capability itself. Only the id is renamed: the model group
+    still comes from the spec, and the returned map is still keyed by the
+    declared capability.
     """
     grouped: dict[str, list[PropertySpec]] = {}
     for spec in specs:
@@ -244,7 +258,11 @@ def _materialize(
             published = [spec for spec in cap_specs if not spec.internal_only]
             node = (
                 device.add_node_from_dict(
-                    {"id": capability, "name": node_name(capability), "type": node_type(capability)}
+                    {
+                        "id": node_id(capability),
+                        "name": node_name(capability),
+                        "type": node_type(capability),
+                    }
                 )
                 if published
                 else None
@@ -401,6 +419,12 @@ class DeviceTreeBuilder:
     Batching: each `add()` announces its own device, and the parent republishes
     its `$description` to name the new child. To collapse a burst of adds into
     one parent announcement, wrap them in the parent's `state_transition()`.
+
+    `node_id` is passed through to every device this builder materializes, for a
+    publisher whose node ids are not simply their capability names. A tree whose
+    entities are devices does not need it, since each device has its own node
+    namespace; it is for the caller that also places several instances of one
+    capability onto a single device.
     """
 
     def __init__(
@@ -410,11 +434,13 @@ class DeviceTreeBuilder:
         *,
         node_type: Callable[[str], str] = _default_node_type,
         node_name: Callable[[str], str] = lambda capability: capability,
+        node_id: Callable[[str], str] = lambda capability: capability,
     ) -> None:
         self._root = root
         self._model = model
         self._node_type = node_type
         self._node_name = node_name
+        self._node_id = node_id
         self._devices: dict = {}
         self._homie_props: dict = {}
         self._model_keys: dict = {}
@@ -460,6 +486,7 @@ class DeviceTreeBuilder:
             spec.specs,
             node_type=self._node_type,
             node_name=self._node_name,
+            node_id=self._node_id,
             default_group=group,
         )
         _seed(self._model, built.declared, default_group=group)

@@ -4,6 +4,8 @@ import pytest
 
 from ebus_sdk import (
     Device,
+    DeviceSpec,
+    DeviceTreeBuilder,
     GroupedPropertyDict,
     PropertyDatatype,
     PropertySpec,
@@ -408,3 +410,95 @@ def test_build_does_not_apply_scale_to_seeded_values(mock_paho):
         ],
     )
     assert model2.value("meter", "imported-energy") == 22500.0
+
+
+# --- node_id: renaming the node a capability materializes onto ---------------
+
+
+def test_node_id_defaults_to_the_capability(mock_paho):
+    device = _device(mock_paho, "dev-nodeid-default")
+    model = GroupedPropertyDict()
+    build_from_declarations(device, model, [PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)])
+    assert device.get_node("meter") is not None
+
+
+def test_node_id_renames_the_node_without_moving_anything_else(mock_paho):
+    device = _device(mock_paho, "dev-nodeid")
+    model = GroupedPropertyDict()
+    homie_props = build_from_declarations(
+        device,
+        model,
+        [PropertySpec("meter", "active-power", PropertyDatatype.FLOAT, Unit.WATT)],
+        node_id=lambda capability: f"lugs-up-{capability}",
+    )
+    # The wire node is renamed.
+    assert device.get_node("lugs-up-meter") is not None
+    assert device.get_node("meter") is None
+    # The declaration's vocabulary is unchanged: model group and returned key
+    # both still say "meter".
+    assert "meter" in model.groups()
+    assert set(homie_props) == {("meter", "active-power")}
+    model.set_value("meter", "active-power", 240.0)
+    assert homie_props[("meter", "active-power")].value() == 240.0
+
+
+def test_node_id_and_node_name_are_independent(mock_paho):
+    device = _device(mock_paho, "dev-nodeid-name")
+    model = GroupedPropertyDict()
+    build_from_declarations(
+        device,
+        model,
+        [PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)],
+        node_id=lambda capability: f"a-{capability}",
+        node_name=lambda capability: "Upstream lugs",
+        node_type=lambda capability: "energy.ebus.capability.meter",
+    )
+    node = device.get_node("a-meter")
+    assert node.name() == "Upstream lugs"
+    assert node.type() == "energy.ebus.capability.meter"
+
+
+def test_two_instances_of_one_capability_coexist_on_one_device(mock_paho):
+    """The node-on-parent shape: several instances placed on a device that already exists."""
+    device = _device(mock_paho, "enclosure-1")
+    model = GroupedPropertyDict()
+
+    built = {}
+    for instance in ("lugs-up", "lugs-dn"):
+        built[instance] = build_from_declarations(
+            device,
+            model,
+            [
+                PropertySpec(
+                    "meter",
+                    "active-power",
+                    PropertyDatatype.FLOAT,
+                    Unit.WATT,
+                    model_group=f"{instance}-meter",
+                )
+            ],
+            node_id=lambda capability, i=instance: f"{i}-{capability}",
+        )
+
+    # Two nodes on one device, neither shadowing the other.
+    assert device.get_node("lugs-up-meter") is not None
+    assert device.get_node("lugs-dn-meter") is not None
+    assert set(device.description()["nodes"]) == {"lugs-up-meter", "lugs-dn-meter"}
+
+    # node_id separates them on the wire; model_group separates them in the
+    # model. Without the second they would collide even with distinct nodes.
+    model.set_value("lugs-up-meter", "active-power", 1000.0)
+    model.set_value("lugs-dn-meter", "active-power", -250.0)
+    assert built["lugs-up"][("meter", "active-power")].value() == 1000.0
+    assert built["lugs-dn"][("meter", "active-power")].value() == -250.0
+
+
+def test_device_tree_builder_passes_node_id_through(mock_paho):
+    device = _device(mock_paho, "root-nodeid")
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(device, model, node_id=lambda capability: f"x-{capability}")
+    child = builder.add(
+        DeviceSpec("bess", [PropertySpec("info", "serial-number", PropertyDatatype.STRING)], device_id="bess-1")
+    )
+    assert child.get_node("x-info") is not None
+    assert child.get_node("info") is None

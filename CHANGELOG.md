@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `node_id` on `build_from_declarations` and `DeviceTreeBuilder`: a callable mapping a capability to the Homie node id it materializes onto, defaulting to the capability itself. The node id was hardcoded to the capability name, which is right until one device carries two instances of the same capability (two lugs, two meters), at which point the second silently lands on the first one's node. `node_type` and `node_name` were already callables, so the id was the one part of a node a caller could not choose. Renaming is all it does: the declaration's vocabulary stays `capability`, the model group still comes from the spec, and the returned map is still keyed by the declared capability, so a caller who ignores it sees no change. Pairs with `PropertySpec.model_group` from 0.21.0, which separates the same two instances in the model the way this separates them on the wire; using one without the other moves the collision rather than removing it. ([#47](https://github.com/electrification-bus/python-sdk/issues/47))
+
 ## [0.21.0] — 2026-08-20
 
 ### Added

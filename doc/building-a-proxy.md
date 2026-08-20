@@ -100,7 +100,7 @@ homie_props = build_from_declarations(device, model, SUBMETER)
 model.set_value("meter", "active-power", 1850.0)
 ```
 
-`build_from_declarations` groups specs by `capability` (one Homie node each), defaulting each node's type to `energy.ebus.capability.<capability>` (override with `node_type=`). Pass `values={(capability, prop_id): value}` to seed initial values through the model, overriding any `initial_value` on the spec. Note `PropertySpec.scale` is applied by `resolve`, not by the builder: `specs_and_values` hands the builder values `resolve` has already scaled, and scaling them again would double-apply it. If you assemble a `values` map by hand, pass values already in the property's own unit.
+`build_from_declarations` groups specs by `capability` (one Homie node each), defaulting each node's type to `energy.ebus.capability.<capability>` (override with `node_type=`) and each node's id to the capability itself (override with `node_id=`, which is what lets one device carry two instances of a capability: call it once per instance with a distinct `node_id` and a distinct `PropertySpec.model_group`). Pass `values={(capability, prop_id): value}` to seed initial values through the model, overriding any `initial_value` on the spec. Note `PropertySpec.scale` is applied by `resolve`, not by the builder: `specs_and_values` hands the builder values `resolve` has already scaled, and scaling them again would double-apply it. If you assemble a `values` map by hand, pass values already in the property's own unit.
 
 ## Beyond the basic fields
 
