@@ -404,12 +404,28 @@ class DeviceTreeBuilder:
     This builder covers that shape, and differs from the single-device one in
     four ways that all follow from there being more than one device:
 
-    1. **The model is external.** It is passed in, never created, and each
-       device gets its own group (its id by default). Keying by capability
-       would collide the moment two children both expose `info`.
+    1. **The model is external, and it is yours.** It is passed in, never
+       created, and each device gets its own group (its id by default). Keying
+       by capability would collide the moment two children both expose `info`.
+       The division: a `GroupedPropertyDict` is the model a producer is meant to
+       OWN, not an adapter seam a producer maps a foreign model type onto. That
+       is the observable-model pattern `doc/building-a-proxy.md` prescribes,
+       where acquisition code writes values into the model and publishing is a
+       reactive side effect of the bindings. The builder accepts rather than
+       creates one so a single model can span a whole tree, and so a producer
+       that already holds one (populated before any Homie tree exists) can hand
+       it over.
     2. **Ids can be late-bound.** `add()` returns `None` for a spec whose id is
        not yet knowable and remembers it; `resolve_deferred()` retries, and a
        deferred parent unblocking its deferred children resolves in one call.
+       Note the limit of that: `add()` orders late-bound IDS, and builds an
+       unbuilt parent it was handed. It does not order the construction of the
+       specs themselves. `DeviceSpec` is frozen and `parent` is a direct
+       reference, so a child spec cannot exist before its parent spec does, and
+       a caller deriving specs from a declarative source that names parents
+       indirectly (by class, by type, by key) still owns that dependency
+       ordering. `add()` reads as though ordering is handled generally; it is
+       handled for ids.
     3. **It is incremental.** Devices come and go over a tree's life, so `add()`
        is idempotent (lifecycles re-fire) and `remove()` tears one down.
     4. **Removal is depth-first**, grandchild before parent, derived from the
