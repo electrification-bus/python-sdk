@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
 from .adapter import bind_property_to_homie
 from .homie import Device, PropertyDatatype, Unit
@@ -185,12 +185,58 @@ def build_from_declarations(
     command, but its `entity_setter` is still registered, so `model.set_entity`
     reaches it.
     """
+    built = _materialize(device, model, specs, node_type=node_type, node_name=node_name)
+    _seed(model, built.declared, values)
+    return built.homie_props
+
+
+@dataclass(frozen=True)
+class _Materialized:
+    """What one device's materialization produced, for the caller's bookkeeping."""
+
+    homie_props: dict
+    declared: dict
+    model_keys: list
+    created_groups: list
+
+
+def _group_for(spec: PropertySpec, default_group: Optional[str]) -> str:
+    """The observable-model group a spec's value lives in.
+
+    An explicit `model_group` on the spec always wins: the caller is naming a
+    group in a model they own. Otherwise `default_group` applies, which is how a
+    device tree gives each device its own group; with neither, the group is the
+    capability, which is what a single-device build has always done.
+    """
+    if spec.model_group is not None:
+        return spec.model_group
+    return default_group if default_group is not None else spec.capability
+
+
+def _materialize(
+    device: Device,
+    model: GroupedPropertyDict,
+    specs: Iterable[PropertySpec],
+    *,
+    node_type: Callable[[str], str],
+    node_name: Callable[[str], str],
+    default_group: Optional[str] = None,
+) -> _Materialized:
+    """Build one device's nodes, properties, model entries and bindings.
+
+    The single materialization path, shared by `build_from_declarations` (one
+    device, model groups keyed by capability) and `DeviceTreeBuilder` (many
+    devices, model groups keyed per device). Runs inside one
+    `device.state_transition()`, so a device announces its structure once.
+    """
     grouped: dict[str, list[PropertySpec]] = {}
     for spec in specs:
         grouped.setdefault(spec.capability, []).append(spec)
 
     homie_props: dict = {}
     declared: dict[tuple, PropertySpec] = {}
+    model_keys: list = []
+    created_groups: list = []
     with device.state_transition():
         for capability, cap_specs in grouped.items():
             # A node exists to carry published properties. If every spec on this
@@ -204,12 +250,14 @@ def build_from_declarations(
                 else None
             )
             for spec in cap_specs:
-                group = spec.group_key
+                group = _group_for(spec, default_group)
                 if not model.has_group(group):
                     model.create_group(group)
+                    created_groups.append(group)
                 py_type = spec.python_type if spec.python_type is not None else python_type_for(spec.datatype)
                 model.add_property(group, ObservableProperty(id=spec.model_key, type=py_type))
                 declared[(capability, spec.prop_id)] = spec
+                model_keys.append((group, spec.model_key))
                 # An entity_setter is the translator toward the entity, so it is
                 # registered whenever one is given and the model can reach it.
                 if spec.entity_setter is not None and (spec.settable or spec.internal_only):
@@ -238,8 +286,22 @@ def build_from_declarations(
                     homie_prop.set_set_callback(partial(model.set_entity, group, spec.model_key))
                 homie_props[(capability, spec.prop_id)] = homie_prop
 
-    # Seed declared initial values first, then let an explicit `values` entry
-    # override: the runtime map is the more specific statement of the two.
+    return _Materialized(homie_props, declared, model_keys, created_groups)
+
+
+def _seed(
+    model: GroupedPropertyDict,
+    declared: dict,
+    values: Optional[dict] = None,
+    *,
+    default_group: Optional[str] = None,
+) -> None:
+    """Seed values through the model, so they publish via the bindings.
+
+    Declared `initial_value`s first, then any explicit `values` entry overriding
+    them: a caller passing a runtime map is being more specific than the static
+    declaration. Entries naming an undeclared property are ignored.
+    """
     seed: dict[tuple, Any] = {
         key: spec.initial_value for key, spec in declared.items() if spec.initial_value is not None
     }
@@ -247,8 +309,243 @@ def build_from_declarations(
         seed.update({key: value for key, value in values.items() if key in declared})
     for key, value in seed.items():
         spec = declared[key]
-        model.set_value(spec.group_key, spec.model_key, value)
-    return homie_props
+        model.set_value(_group_for(spec, default_group), spec.model_key, value)
+
+
+@dataclass(frozen=True, eq=False)
+class DeviceSpec:
+    """Declaration of one device in a tree: what it is, where it sits, what it carries.
+
+    The device-level counterpart to `PropertySpec`. Device class, device id and
+    parent are device-level facts, so they live here rather than being repeated
+    on every property of the device.
+
+    * `device_class` is the eBus class (`circuit`, `bess`, `distribution-enclosure`).
+      `device_type` defaults to `energy.ebus.device.{device_class}`, and that
+      default is the main guard a consumer gets: the SDK stores `Device.type`
+      verbatim and validates nothing against a registry, so a hand-written
+      misspelling ships silently. Prefer the default; override only for a type
+      outside the eBus namespace.
+    * `device_id` is either the id or a callable returning it, returning `None`
+      while it is still unknown. Child ids are often only known once an
+      asynchronous identifier arrives (a DER's serial number), and a child
+      published under a wrong-but-stable id leaves retained topics that outlive
+      restarts and firmware updates, so waiting is worth the deferral machinery.
+      Ids are used verbatim: run them through `sanitize_homie_id` yourself if
+      they come from a vendor.
+    * `parent` names the parent DEVICE SPEC, or `None` for a child of the
+      builder's root. The builder resolves it to a live `Device`.
+    * `model_group` is this device's group in the externally-owned model,
+      defaulting to its resolved device id. A `PropertySpec` that names its own
+      `model_group` still wins, so a consumer with an existing model keyed its
+      own way keeps that keying.
+    * `on_created` runs once, with the live `Device`, right after the device and
+      its properties exist. For per-child side effects (ACL emission, registry
+      entries) that would otherwise force the caller to post-process the tree.
+
+    Compared by IDENTITY, not by value: a `DeviceSpec` stands for one device in
+    one tree, and two devices declared with identical fields are still two
+    devices. It is also what the builder keys its bookkeeping on.
+    """
+
+    device_class: str
+    specs: Sequence[PropertySpec] = ()
+    device_id: Union[str, Callable[[], Optional[str]]] = ""
+    parent: Optional["DeviceSpec"] = None
+    model_group: Union[str, Callable[[], str], None] = None
+    device_type: Optional[str] = None
+    name: Optional[str] = None
+    on_created: Optional[Callable[[Device], None]] = None
+
+    def resolve_device_id(self) -> Optional[str]:
+        """This device's id, or None while a late-bound id is still unresolved."""
+        if callable(self.device_id):
+            return self.device_id()
+        return self.device_id or None
+
+    def resolve_device_type(self) -> str:
+        """`device_type` if given, else the eBus type derived from `device_class`."""
+        return self.device_type or f"energy.ebus.device.{self.device_class}"
+
+    def resolve_model_group(self, device_id: str) -> str:
+        """This device's model group: `model_group` if given, else its device id."""
+        if callable(self.model_group):
+            return self.model_group()
+        return self.model_group or device_id
+
+
+class DeviceTreeBuilder:
+    """Materialize a set of `DeviceSpec`s into a live parent/child device tree.
+
+    `build_from_declarations` builds exactly ONE device and creates the
+    observable model itself, keyed by capability. That fits a single-device
+    proxy and cannot express the shape the eBus framework actually describes: a
+    root device whose circuits, lugs, MID and DERs are child devices, each with
+    its own id, `$state`, `$description` and capability set.
+
+    This builder covers that shape, and differs from the single-device one in
+    four ways that all follow from there being more than one device:
+
+    1. **The model is external.** It is passed in, never created, and each
+       device gets its own group (its id by default). Keying by capability
+       would collide the moment two children both expose `info`.
+    2. **Ids can be late-bound.** `add()` returns `None` for a spec whose id is
+       not yet knowable and remembers it; `resolve_deferred()` retries, and a
+       deferred parent unblocking its deferred children resolves in one call.
+    3. **It is incremental.** Devices come and go over a tree's life, so `add()`
+       is idempotent (lifecycles re-fire) and `remove()` tears one down.
+    4. **Removal is depth-first**, grandchild before parent, derived from the
+       live tree rather than a caller-maintained ordering, so nothing ever
+       observes an orphaned child.
+
+    Batching: each `add()` announces its own device, and the parent republishes
+    its `$description` to name the new child. To collapse a burst of adds into
+    one parent announcement, wrap them in the parent's `state_transition()`.
+    """
+
+    def __init__(
+        self,
+        root: Device,
+        model: GroupedPropertyDict,
+        *,
+        node_type: Callable[[str], str] = _default_node_type,
+        node_name: Callable[[str], str] = lambda capability: capability,
+    ) -> None:
+        self._root = root
+        self._model = model
+        self._node_type = node_type
+        self._node_name = node_name
+        self._devices: dict = {}
+        self._homie_props: dict = {}
+        self._model_keys: dict = {}
+        self._created_groups: dict = {}
+        self._deferred: list = []
+
+    def add(self, spec: DeviceSpec) -> Optional[Device]:
+        """Materialize `spec` as a device, or defer it while its id is unknown.
+
+        Returns the live `Device`, or `None` when the spec (or an ancestor of
+        it) has no id yet, in which case it is remembered for
+        `resolve_deferred()`. Idempotent: re-adding a spec already built returns
+        the same `Device` without touching the tree, because incremental
+        lifecycles re-fire and a second add must not republish or duplicate.
+        """
+        existing = self._devices.get(spec)
+        if existing is not None:
+            return existing
+
+        if spec.parent is None:
+            parent_device: Optional[Device] = self._root
+        else:
+            parent_device = self._devices.get(spec.parent) or self.add(spec.parent)
+        if parent_device is None:
+            self._defer(spec)  # the parent is itself waiting on an id
+            return None
+
+        device_id = spec.resolve_device_id()
+        if device_id is None:
+            self._defer(spec)
+            return None
+
+        device = Device(
+            device_id,
+            name=spec.name or device_id,
+            type=spec.resolve_device_type(),
+            parent=parent_device,
+        )
+        group = spec.resolve_model_group(device_id)
+        built = _materialize(
+            device,
+            self._model,
+            spec.specs,
+            node_type=self._node_type,
+            node_name=self._node_name,
+            default_group=group,
+        )
+        _seed(self._model, built.declared, default_group=group)
+
+        self._devices[spec] = device
+        self._homie_props[spec] = built.homie_props
+        self._model_keys[spec] = built.model_keys
+        self._created_groups[spec] = built.created_groups
+        if spec in self._deferred:
+            self._deferred.remove(spec)
+        if spec.on_created is not None:
+            spec.on_created(device)
+        return device
+
+    def resolve_deferred(self) -> list:
+        """Retry every deferred spec, returning the devices that could now be built.
+
+        Repeats while progress is being made, so a parent whose id has just
+        arrived and the children waiting behind it resolve in one call rather
+        than one call per generation.
+        """
+        built: list = []
+        progress = True
+        while progress:
+            progress = False
+            for spec in list(self._deferred):
+                device = self.add(spec)
+                if device is not None:
+                    built.append(device)
+                    progress = True
+        return built
+
+    def remove(self, spec: DeviceSpec) -> None:
+        """Tear down `spec`'s device and everything under it, grandchild first.
+
+        `Device.delete()` walks the live tree depth-first, so the ordering comes
+        from the tree rather than from a list the caller has to keep correct.
+        The model entries this builder added for the removed devices are deleted
+        too, along with any group it created that is now empty; a group the
+        caller created, or one still in use, is left alone.
+        """
+        device = self._devices.get(spec)
+        if device is None:
+            if spec in self._deferred:
+                self._deferred.remove(spec)  # never built, just stop waiting for it
+            return
+
+        doomed = {id(d) for d in _descendants(device)}
+        removed = [s for s, d in self._devices.items() if id(d) in doomed]
+        device.delete()
+        for gone in removed:
+            for group, model_key in self._model_keys.pop(gone, []):
+                self._model.delete_property(group, model_key)
+            for group in self._created_groups.pop(gone, []):
+                if not self._model.items(group):
+                    self._model.delete_group(group)
+            self._devices.pop(gone, None)
+            self._homie_props.pop(gone, None)
+
+    def device_for(self, spec: DeviceSpec) -> Optional[Device]:
+        """The live `Device` for `spec`, or None if it is deferred or removed."""
+        return self._devices.get(spec)
+
+    def homie_properties(self, spec: DeviceSpec) -> dict:
+        """`{(capability, prop_id): homie.Property}` for `spec`, as the single-device builder returns.
+
+        Empty for a spec that is not built. An `internal_only` property has no
+        Homie twin and so is absent, exactly as in `build_from_declarations`.
+        """
+        return self._homie_props.get(spec, {})
+
+    def deferred(self) -> list:
+        """The specs waiting on an id, in the order they were first attempted."""
+        return list(self._deferred)
+
+    def _defer(self, spec: DeviceSpec) -> None:
+        if spec not in self._deferred:
+            self._deferred.append(spec)
+
+
+def _descendants(device: Device) -> list:
+    """`device` and every device beneath it, parents before children."""
+    found = [device]
+    for child in device.children():
+        found.extend(_descendants(child))
+    return found
 
 
 @dataclass(frozen=True)

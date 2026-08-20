@@ -310,7 +310,9 @@ Helpers that mirror the observable model onto the Homie tree, so you never hand-
 The declarative "schema" layer for proxies (see [`doc/building-a-proxy.md`](doc/building-a-proxy.md)):
 
 - **PropertySpec** - declares one eBus property (capability/node, id, datatype, unit, scale, settable, plus `round_to`, `initial_value`, `retained`, `internal_only`, `conditionally_settable`, and the `source_id` / `model_group` model-identity splits)
-- **build_from_declarations** - materializes a set of specs into Homie nodes/properties, the observable model, and their bindings in one call
+- **build_from_declarations** - materializes a set of specs into Homie nodes/properties, the observable model, and their bindings in one call (one device)
+- **DeviceSpec** - declares one device in a tree (class, id or late-bound id resolver, parent, model group, `on_created` hook)
+- **DeviceTreeBuilder** - materializes a set of `DeviceSpec`s into a parent/child tree over an externally-owned model: late-bound ids, idempotent `add()`, depth-first `remove()`
 - **resolve** / **specs_and_values** / **ResolvedProperty** - the two-tier mapping (hand-authored `mapping` first, generic `fallback` for the rest) that turns source fields into specs and scaled values
 
 ### topology.py

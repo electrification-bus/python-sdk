@@ -58,6 +58,8 @@ from .adapter import (
 
 # Declarative property specs + builder + resolver (see doc/building-a-proxy.md)
 from .declaration import (
+    DeviceSpec,
+    DeviceTreeBuilder,
     PropertySpec,
     ResolvedProperty,
     build_from_declarations,
@@ -121,6 +123,8 @@ __all__ = [
     # Declarative specs + builder + resolver
     "PropertySpec",
     "ResolvedProperty",
+    "DeviceSpec",
+    "DeviceTreeBuilder",
     "build_from_declarations",
     "python_type_for",
     "resolve",

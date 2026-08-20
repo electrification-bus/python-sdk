@@ -68,6 +68,7 @@ homie.Property.set_value(...)  ──►  MQTT (ebus/5/<device>/<node>/<property
 
 - `PropertySpec`: the declaration for one property (its `capability`/node, `prop_id`, `datatype`, `unit`, `scale`, `settable`, and an optional `entity_setter` for the inbound/control path). The schema layer, complementary to the observable `Property` (which holds the live value). It also carries `round_to`, `initial_value`, `retained`, `internal_only`, `conditionally_settable`, and the `source_id` / `model_group` identity splits; see [Beyond the basic fields](#beyond-the-basic-fields).
 - `build_from_declarations(device, model, specs, ...)`: materializes a set of `PropertySpec`s into a live device in one call: one Homie node per capability, an observable `Property` plus a Homie property per spec, and the on-change binding between them, all inside one `state_transition()`. Returns the `{(capability, prop_id): homie.Property}` map.
+- `DeviceSpec` / `DeviceTreeBuilder`: the device-level declaration and the tree-aware, incremental builder over a model you own. See [Declaring the tree instead of building it by hand](#declaring-the-tree-instead-of-building-it-by-hand).
 - `resolve(field_names, values, mapping, *, fallback=...)`: the two-tier mapping mechanism. Turns source fields into `PropertySpec`s (and scaled values) using a hand-authored `mapping` first, then a generic `fallback` for the rest (e.g. `ebus_sdk.ha.derive_spec` over discovered components). `specs_and_values(resolved)` splits the result straight into the `specs` and `values=` that `build_from_declarations` wants.
 - `set_homie_property_from_python_property(homie_property, python_property)`: the low-level on-change mirror (copies an observable property's value onto its Homie twin).
 - `bind_property_to_homie(properties, group, property_id, homie_property)`: registers that mirror as a `GroupedPropertyDict` callback. `build_from_declarations` calls it for you; use it directly when you build the tree yourself. A retained twin binds on-change, so a repeated value costs nothing; a non-retained (event) twin binds on-set, because for an event the repeat is the point.
@@ -164,6 +165,36 @@ A proxy is not one flat device. Per the eBus [`proxy.md`](https://github.com/ele
 - Name each child `{proxier-id}-{proxied-id}` (the proxied id is the device's stable serial when it has one). Consumers correlate a proxy and a native publisher of the same physical device by `info/serial-number`, not by device id.
 
 Children share the root's single MQTT connection automatically (that is what `parent=` does), and one Last Will on the root marks the whole tree `lost` if the process dies; `root.declare_lost()` publishes exactly the same thing deliberately, when the bridge knows it is dying rather than crashing. See [Device Trees](../README.md#device-trees-parent--child) in the README.
+
+### Declaring the tree instead of building it by hand
+
+`build_from_declarations` materializes exactly one device and creates the observable model itself, keyed by capability. For a tree, use `DeviceSpec` and `DeviceTreeBuilder`, which take a model you own and give each device its own group:
+
+```python
+from ebus_sdk import DeviceSpec, DeviceTreeBuilder, GroupedPropertyDict
+
+model = GroupedPropertyDict()               # yours, not the builder's
+builder = DeviceTreeBuilder(root, model)
+
+bess = DeviceSpec("bess", BESS_SPECS, device_id=lambda: serial_when_known())
+mid  = DeviceSpec("mid", MID_SPECS, device_id=lambda: f"{serial_when_known()}-mid", parent=bess)
+
+builder.add(bess)                            # None while the serial is unknown
+builder.add(mid)                             # deferred behind its parent
+...                                          # the serial arrives
+builder.resolve_deferred()                   # both devices appear, parent first
+```
+
+Device class, id and parent are device-level facts, so they live on the `DeviceSpec` rather than being repeated on every `PropertySpec` of that device. `device_type` defaults to `energy.ebus.device.{device_class}`; prefer that default, because the SDK stores `Device.type` verbatim and validates nothing against a registry, so a hand-written type ships misspelled without complaint.
+
+Four things the tree builder does that the single-device one has no need to:
+
+- **The model group is the device**, not the capability. Two children that both expose `info` collide the moment they share a capability-keyed model. A `PropertySpec` that names its own `model_group` still wins, so an existing model keyed your way keeps that keying.
+- **Ids can be late-bound.** `device_id` may be a callable returning `None` while an asynchronous identifier has not arrived. `add()` returns `None` and remembers the spec; `resolve_deferred()` retries and resolves a whole generation, including children waiting behind a deferred parent. Waiting beats guessing: a child published under a wrong-but-stable id leaves retained topics that survive restarts and firmware updates.
+- **`add()` is idempotent.** Incremental lifecycles re-fire, and a second `add()` of a built spec returns the same `Device` without republishing anything.
+- **`remove()` is depth-first**, grandchild before parent, derived from the live tree rather than an ordering you maintain, so nothing ever observes an orphaned child. It also deletes the model entries it added, and any group it created that is now empty.
+
+Each `add()` announces its own device and makes the parent republish its `$description`. To collapse a burst of adds into one parent announcement, wrap them in the parent's `state_transition()`. Use `on_created` for per-child side effects rather than post-processing the returned tree.
 
 ## Lifecycle and state
 
