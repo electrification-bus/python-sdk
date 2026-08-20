@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-08-20
+
 ### Added
 
 - `Device(homie_domain=...)`: a tree can publish under any Homie 5 domain, not only `ebus`. The consumer side was already configurable (`Controller(homie_domain=...)` and `DiscoveredDevice` both take one, and `_on_state_message` even parses the domain out of the topic), while the publisher side hardcoded the `EBUS_HOMIE_DOMAIN` constant at ten topic-construction sites across `Device`, `Node` and `Property`, plus the Last Will, so the SDK could consume any Homie 5 tree and produce only an eBus one. The default is unchanged and eBus energy devices keep publishing under `ebus`, which the specification mandates; what this buys is that the same SDK can also publish non-energy devices under the standard `homie` domain, which is the difference between an eBus library and a Homie 5 library that defaults to eBus. The domain covers everything a tree derives: property values, `/set` subscriptions, `$state`, `$description`, the retraction topics `delete()` clears, and the will. Inbound `/set` validation follows too: the topic check accepted only `ebus` and now accepts the tree's own domain, so a device under `homie` can actually be commanded. It is a property of the TREE rather than of a device, so only a root carries it, descendants read it through the new `Device.homie_domain()`, and a child passing its own is refused with a `ValueError` exactly as a child passing its own `mqtt_cfg` is; refused even when the value would have matched, because the rule is structural rather than a value check. The `Device` docstring's "homie_domains config for future use, not currently supported by this code" stub is replaced by what to actually do. ([#61](https://github.com/electrification-bus/python-sdk/issues/61))
@@ -345,6 +347,7 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
 [Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[0.21.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.21.0
 [0.20.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.1
 [0.20.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.0
 [0.19.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.19.0
