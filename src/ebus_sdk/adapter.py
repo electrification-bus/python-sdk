@@ -45,11 +45,28 @@ def bind_property_to_homie(
     """Wire an observable model property to its Homie twin so changes mirror across.
 
     Convenience wrapper over
-    :func:`set_homie_property_from_python_property`: registers the on-change
-    callback that republishes ``properties[group][property_id]`` onto
-    ``homie_property`` whenever the model value changes. Returns the callback id
-    from ``GroupedPropertyDict.add_property_on_change_callback``.
+    :func:`set_homie_property_from_python_property`: registers the callback that
+    republishes ``properties[group][property_id]`` onto ``homie_property``.
+    Returns the callback id from the ``GroupedPropertyDict`` registration.
+
+    Which callback depends on what the twin is, because the two kinds of Homie
+    property disagree about what a repeated value means:
+
+    * A **retained** property (the default) binds to *on-change*. The broker
+      holds its last payload, so re-setting the same value is a redundant write
+      and the model drops it before it costs anything. The Homie layer's own
+      publish-on-change gate is a second line of defense on the final payload.
+    * A **non-retained** (event) property binds to *on-set*. The broker stores
+      nothing for it, so an identical consecutive payload is a second real
+      event, not a redundant write, and dropping it would lose an event. The
+      Homie layer already exempts these from its gate; binding on-change would
+      have made that exemption unreachable, since the model would have swallowed
+      the repeat first.
+
+    A twin that does not answer ``retained()`` is treated as retained, which is
+    what this function did for every twin before the distinction existed.
     """
-    return properties.add_property_on_change_callback(
-        group, property_id, partial(set_homie_property_from_python_property, homie_property)
-    )
+    retained = getattr(homie_property, "retained", None)
+    is_event = callable(retained) and retained() is False
+    register = properties.add_property_on_set_callback if is_event else properties.add_property_on_change_callback
+    return register(group, property_id, partial(set_homie_property_from_python_property, homie_property))

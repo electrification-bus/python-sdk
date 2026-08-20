@@ -4,9 +4,10 @@
 `GroupedPropertyDict` organizes many of them by group (typically one group per
 eBus capability / Homie node). This is the "observable model" layer of the
 recommended proxy pattern: keep a device's live state here, and mirror each
-change onto a Homie `Device`/`Node`/`Property` tree via a per-property on-change
-callback (`ebus_sdk.set_homie_property_from_python_property` /
-`ebus_sdk.bind_property_to_homie`). Acquisition code updates this model;
+change onto a Homie `Device`/`Node`/`Property` tree via a per-property callback
+(`ebus_sdk.set_homie_property_from_python_property` /
+`ebus_sdk.bind_property_to_homie`, which binds on-change for a retained twin and
+on-set for an event one). Acquisition code updates this model;
 publishing to MQTT is a reactive side-effect.
 
 If you are building a proxy/adapter, start with `doc/building-a-proxy.md` rather

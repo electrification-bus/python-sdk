@@ -4,6 +4,20 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `PropertySpec` reaches property-level parity with the private declaration types that multi-device publishers were keeping instead of using it. Seven new fields, each defaulting to what the spec did before it existed, so no existing declaration set changes: `round_to` (decimal places applied on publish, which the property already supported and the declaration could not reach); `initial_value` (a seed applied through the model at build, overridden by the builder's `values=` argument); `retained=False` (an event property rather than a state); `internal_only` (the model tracks the value and the wire never sees it, so no Homie property is created and a capability whose specs are all internal gets no node); `conditionally_settable` (settability decided per instance at runtime, materialized not-settable so `$description` stays honest and no `/set` topic is opened on a property that would reject the command); and `source_id` / `model_group`, which split the observable-model identity from the wire identity. That last split is the load-bearing one: `capability` was simultaneously the Homie node id and the model group key, which is the same string only while one device is in play, and two child devices in a tree that both expose `info` collide in a shared model while remaining perfectly distinct on the wire. Two contradictions are now refused when the spec is constructed rather than when it publishes: `settable` with `conditionally_settable`, and `internal_only` with either. ([#58](https://github.com/electrification-bus/python-sdk/issues/58))
+
+### Fixed
+
+- `bind_property_to_homie` now binds a **non-retained** property on-set rather than on-change, so an event property can actually emit repeated events. The observable model fires on-change callbacks only when the value differs, and that gate sits *above* the Homie layer, so the publish-on-change exemption 0.20.0 gave non-retained properties was unreachable through the SDK's own recommended path: two identical consecutive events were swallowed by the model before the Homie property ever saw the second one. For a retained property nothing changes, and the model gate remains the cheap first line of defense; for an event property the repeat is the point, since the broker stores nothing and a subscriber learns of the event only by receiving it. A twin that does not answer `retained()` is treated as retained, which is what every twin got before the distinction existed. Found while testing the new `retained` field, which would otherwise have shipped as a declaration that looks like it enables event semantics and does not. ([#58](https://github.com/electrification-bus/python-sdk/issues/58))
+
+### Documentation
+
+- `PropertySpec.scale`'s docstring said the value is "metadata for a caller's mapping/resolver and is NOT applied by the builder", which is half the story and the half that misleads: `resolve()` **does** apply it, and `specs_and_values()` hands `build_from_declarations` values that have already been scaled, which is exactly why the builder must not scale them again. Stated positively in both docstrings and in [`doc/building-a-proxy.md`](doc/building-a-proxy.md), with a test that pins it, so the next reader of either call site learns the rule from the one they happen to open. A caller assembling a `values` map by hand passes values in the property's own unit.
+
+- [`doc/building-a-proxy.md`](doc/building-a-proxy.md) gains a "Beyond the basic fields" section: one row per `PropertySpec` field beyond the common five, written as "use it when" rather than "it means", since the fields are individually obvious and it is knowing which problem each solves that is not.
+
 ## [0.20.1] — 2026-08-13
 
 ### Changed

@@ -44,7 +44,7 @@ You can skip it for the trivial case: publishing a handful of static values once
 
 A proxy built this way has three clean layers. Keep them separate.
 
-1. **Declarative definitions (the schema).** A list of `PropertySpec`s describing each property: its capability (Homie node), id, datatype, unit, scale, settable. This is the single source of truth for both the observable model and the Homie tree, and `build_from_declarations` materializes both from it. See [Declarative definitions](#declarative-definitions-in-practice).
+1. **Declarative definitions (the schema).** A list of `PropertySpec`s describing each property: its capability (Homie node), id, datatype, unit, scale, settable, and optionally its rounding, retention, seed value, and observable-model identity. This is the single source of truth for both the observable model and the Homie tree, and `build_from_declarations` materializes both from it. See [Declarative definitions](#declarative-definitions-in-practice).
 2. **The observable model (`GroupedPropertyDict`).** Homie-agnostic. Holds the device's live values as observable `Property` objects grouped by capability (one group per Homie node, conventionally). Your acquisition code calls `model.set_value(group, property_id, value)` and nothing else. It knows nothing about MQTT.
 3. **The adapter.** Builds the Homie `Device` / `Node` / `Property` tree from the declarations, and wires each observable property to its Homie twin with an on-change callback. This is the only layer that touches both the model and Homie.
 
@@ -66,11 +66,11 @@ homie.Property.set_value(...)  ──►  MQTT (ebus/5/<device>/<node>/<property
 
 `ebus_sdk` exports the whole layer so you never hand-roll it:
 
-- `PropertySpec`: the declaration for one property (its `capability`/node, `prop_id`, `datatype`, `unit`, `scale`, `settable`, and an optional `entity_setter` for the inbound/control path). The schema layer, complementary to the observable `Property` (which holds the live value).
+- `PropertySpec`: the declaration for one property (its `capability`/node, `prop_id`, `datatype`, `unit`, `scale`, `settable`, and an optional `entity_setter` for the inbound/control path). The schema layer, complementary to the observable `Property` (which holds the live value). It also carries `round_to`, `initial_value`, `retained`, `internal_only`, `conditionally_settable`, and the `source_id` / `model_group` identity splits; see [Beyond the basic fields](#beyond-the-basic-fields).
 - `build_from_declarations(device, model, specs, ...)`: materializes a set of `PropertySpec`s into a live device in one call: one Homie node per capability, an observable `Property` plus a Homie property per spec, and the on-change binding between them, all inside one `state_transition()`. Returns the `{(capability, prop_id): homie.Property}` map.
 - `resolve(field_names, values, mapping, *, fallback=...)`: the two-tier mapping mechanism. Turns source fields into `PropertySpec`s (and scaled values) using a hand-authored `mapping` first, then a generic `fallback` for the rest (e.g. `ebus_sdk.ha.derive_spec` over discovered components). `specs_and_values(resolved)` splits the result straight into the `specs` and `values=` that `build_from_declarations` wants.
 - `set_homie_property_from_python_property(homie_property, python_property)`: the low-level on-change mirror (copies an observable property's value onto its Homie twin).
-- `bind_property_to_homie(properties, group, property_id, homie_property)`: registers that mirror as a `GroupedPropertyDict` on-change callback. `build_from_declarations` calls it for you; use it directly when you build the tree yourself.
+- `bind_property_to_homie(properties, group, property_id, homie_property)`: registers that mirror as a `GroupedPropertyDict` callback. `build_from_declarations` calls it for you; use it directly when you build the tree yourself. A retained twin binds on-change, so a repeated value costs nothing; a non-retained (event) twin binds on-set, because for an event the repeat is the point.
 
 ## Declarative definitions in practice
 
@@ -99,7 +99,23 @@ homie_props = build_from_declarations(device, model, SUBMETER)
 model.set_value("meter", "active-power", 1850.0)
 ```
 
-`build_from_declarations` groups specs by `capability` (one Homie node each), defaulting each node's type to `energy.ebus.capability.<capability>` (override with `node_type=`). Pass `values={(capability, prop_id): value}` to seed initial values through the model. Note `PropertySpec.scale` is metadata for your own value mapping (unit conversion); the builder does not apply it, so scale the value before you `set_value` it.
+`build_from_declarations` groups specs by `capability` (one Homie node each), defaulting each node's type to `energy.ebus.capability.<capability>` (override with `node_type=`). Pass `values={(capability, prop_id): value}` to seed initial values through the model, overriding any `initial_value` on the spec. Note `PropertySpec.scale` is applied by `resolve`, not by the builder: `specs_and_values` hands the builder values `resolve` has already scaled, and scaling them again would double-apply it. If you assemble a `values` map by hand, pass values already in the property's own unit.
+
+## Beyond the basic fields
+
+`capability`, `prop_id`, `datatype`, `unit` and `settable` cover most properties. The rest of `PropertySpec` exists for the ones they do not, and every field defaults to what the spec did before that field existed, so you can ignore all of them until you need one.
+
+| Field | Use it when |
+| --- | --- |
+| `round_to` | The source gives you more precision than the property means. The Homie property rounds on publish, and because the publish-on-change gate compares the *final* payload, rounding also decides whether two consecutive readings count as the same value. A property rounded to 1 decimal publishes far less than the raw float behind it. |
+| `initial_value` | The property has a known value at build time (a vendor name, a rating). Seeds through the model, so it publishes via the binding like any other value. The `values=` argument to the builder overrides it. |
+| `retained=False` | The property is an *event*, not a state: a demand-response command, a fault pulse. The broker stores nothing for it, so a subscriber that connects later sees nothing, and two identical events in a row are two events. The SDK binds these on-set rather than on-change for exactly that reason. |
+| `internal_only=True` | The model should track the value but the wire should never see it: an intermediate reading, a raw counter behind a derived property, a credential. No Homie property is created and nothing appears in `$description`. A capability whose specs are *all* internal gets no node at all. |
+| `conditionally_settable=True` | Whether this property accepts commands depends on runtime state, per instance. The builder leaves it not settable, which keeps `$description` honest and avoids subscribing a `/set` topic that would reject what arrives; enable it with `homie_property.set_settable(True)` inside a `state_transition()` once you know. |
+| `source_id` | Your model is populated under the source system's field name, but the wire must carry the eBus name. `source_id="RMS_Watts_Tot"` with `prop_id="active-power"` populates one and publishes the other. |
+| `model_group` | Two devices in one tree expose the same capability. `capability` is the Homie node id and is fine to repeat across devices, but the model group is a flat key, so two children both exposing `info` would collide in a shared `GroupedPropertyDict`. `model_group` gives each its own. |
+
+`settable` and `conditionally_settable` are mutually exclusive, and neither can combine with `internal_only`: a property that is never published has no `/set` topic to receive a command on. Both are rejected when you construct the spec, not when you publish.
 
 ## Ingesting Home Assistant MQTT discovery
 
