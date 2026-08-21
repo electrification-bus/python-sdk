@@ -4,6 +4,16 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- `DeviceTreeBuilder.resolve_deferred()` no longer spins forever when the device a deferred spec was waiting for has already been built by an equal-but-distinct `DeviceSpec`. 0.23.0 moved `add()`'s bookkeeping to the resolved device id and did not move the deferred paths with it: `add()`'s id short-circuit returned the existing device before reaching the identity-based `self._deferred.remove(spec)`, so the spec stayed queued while `resolve_deferred()` counted the returned device as progress and looped over an unchanged queue. This is a regression of exactly the pattern the id-keying was introduced to enable, which is what made it reachable by following the new guidance. Two changes, because one of them would have been enough and the other makes the class of bug degrade instead of hang: the queue drains on the short-circuit path as well as the full-materialization path, keyed by resolved id rather than object identity; and `resolve_deferred()`'s progress is now the queue actually shrinking, never `add()` returning something, so a future path that answers without draining is a no-op rather than a spin. ([#82](https://github.com/electrification-bus/python-sdk/issues/82))
+
+- `DeviceTreeBuilder` latches the id a spec resolved to when it was built, so a resolver that stops answering cannot orphan its device. A producer's `device_id` callable commonly reads the producer's own model, and that model can stop answering exactly when teardown begins; `remove()` re-resolved through the callable, got `None`, and returned silently, leaving the device live on the broker with its retained topics. `remove()`, `device_for()`, `homie_properties()` and `extend()` now consult the latch first and fall back to resolving afresh, so a stale resolver is safe and an equal-but-distinct spec still works. The latch is dropped with the device it named, so a rebuilt spec resolves again rather than answering from a dead entry.
+
+### Changed
+
+- A `PropertySpec` whose python type disagrees with a property already in the model is reused rather than refused. The check added in 0.23.0 guarded a difference with no runtime consequence: the observable property's `type` is metadata, nothing reads it, `set_value` neither coerces nor validates against it, and wire coercion belongs to the Homie property. It also misfired on the normal case, a producer whose model uses a richer python type than the datatype-derived default (an `Enum` subclass for an `ENUM` property, which in one real declaration set is 30 of 134 definitions), and it raised MID materialization, leaving a half-built device behind rather than failing at declaration time. Logged at debug instead.
+
 ## [0.23.0] — 2026-08-20
 
 ### Added

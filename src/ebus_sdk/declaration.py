@@ -18,6 +18,8 @@ transition. Acquisition code then only calls
 
 from __future__ import annotations
 
+import logging
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -27,6 +29,8 @@ from .adapter import bind_property_to_homie
 from .homie import Device, PropertyDatatype, Unit
 from .property import GroupedPropertyDict
 from .property import Property as ObservableProperty
+
+logger = logging.getLogger("homie")
 
 _PYTHON_TYPE = {
     PropertyDatatype.FLOAT: float,
@@ -299,12 +303,18 @@ def _materialize(
                     # it added and leaves anything the producer owned first.
                     model_keys.append((capability, group, spec.model_key))
                 elif existing.type() is not py_type:
-                    raise ValueError(
-                        f"{capability}/{spec.prop_id}: the model already holds "
-                        f"{group}/{spec.model_key} with type {existing.type()!r}, but this spec "
-                        f"declares {py_type!r}. Reusing it would publish values of one type through "
-                        "a property built for another; align the spec's datatype (or python_type) "
-                        "with the model, or give the spec its own source_id/model_group."
+                    # Reuse anyway, and do not raise. The observable property's
+                    # `type` is metadata: nothing reads it, `set_value` neither
+                    # coerces nor validates against it, and wire coercion belongs
+                    # to the Homie property. Raising guarded a difference with no
+                    # runtime consequence, and it misfired on the normal case, a
+                    # producer whose model uses a richer python type than a
+                    # datatype-derived default (an Enum subclass for an ENUM).
+                    # Worse, it raised MID materialization, leaving half a device.
+                    logger.debug(
+                        "reason=declarationReusedPropertyOfDifferentType,"
+                        f"group={group},id={spec.model_key},"
+                        f"model={existing.type()!r},spec={py_type!r}"
                     )
                 declared[(capability, spec.prop_id)] = spec
                 # An entity_setter is the translator toward the entity, so it is
@@ -551,6 +561,23 @@ class DeviceTreeBuilder:
         # per-spec maps rather than inside them. Nothing removes a root.
         self._root_props: dict = {}
         self._root_model_keys: list = []
+        self._spec_ids: dict = {}  # spec object -> the id it resolved to when built
+
+    def _resolve_id(self, spec: DeviceSpec) -> Optional[str]:
+        """The device id this spec names.
+
+        What it resolved to when built, if this builder has seen this object,
+        else whatever it resolves to now. The latch makes a resolver that goes
+        stale safe (a producer's resolver may read the producer's own model,
+        which can stop answering once teardown begins); the fallback makes an
+        equal-but-distinct spec work, which is the point of keying on ids.
+        """
+        latched = self._spec_ids.get(spec)
+        return latched if latched is not None else spec.resolve_device_id()
+
+    def _undefer(self, device_id: str) -> None:
+        """Drop every queued spec naming this device, whichever object queued it."""
+        self._deferred = [s for s in self._deferred if s.resolve_device_id() != device_id]
 
     def add(self, spec: DeviceSpec) -> Optional[Device]:
         """Materialize `spec` as a device, or defer it while its id is unknown.
@@ -569,16 +596,23 @@ class DeviceTreeBuilder:
         # re-derive, which defeats the point of a declarative API. A spec whose
         # id is already built returns that device unchanged: to give a built
         # device more capabilities, use extend().
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         if device_id is not None:
             existing = self._devices.get(device_id)
             if existing is not None:
+                # Drain the queue on THIS path too. Missing it made
+                # resolve_deferred() spin: it called add(), got a device back,
+                # counted that as progress, and looped over an unchanged queue
+                # forever. An equal-but-distinct spec having built the device is
+                # exactly the pattern id-keying was introduced to support.
+                self._spec_ids[spec] = device_id
+                self._undefer(device_id)
                 return existing
 
         if spec.parent is None:
             parent_device: Optional[Device] = self._root
         else:
-            parent_id = spec.parent.resolve_device_id()
+            parent_id = self._resolve_id(spec.parent)
             parent_device = (self._devices.get(parent_id) if parent_id else None) or self.add(spec.parent)
         if parent_device is None:
             self._defer(spec)  # the parent is itself waiting on an id
@@ -600,6 +634,7 @@ class DeviceTreeBuilder:
         # dispatch synchronously) must not leave a live device the builder has no
         # record of: device_for() would return None and remove() would be a
         # silent no-op, stranding retained topics.
+        self._spec_ids[spec] = device_id
         self._devices[device_id] = device
         self._homie_props[device_id] = {}
         self._model_keys[device_id] = []
@@ -620,8 +655,7 @@ class DeviceTreeBuilder:
         self._homie_props[device_id].update(built.homie_props)
         self._model_keys[device_id].extend(built.model_keys)
         self._created_groups[device_id].extend(built.created_groups)
-        if spec in self._deferred:
-            self._deferred.remove(spec)
+        self._undefer(device_id)
         if spec.on_created is not None:
             spec.on_created(device)
         return device
@@ -634,14 +668,17 @@ class DeviceTreeBuilder:
         than one call per generation.
         """
         built: list = []
-        progress = True
-        while progress:
-            progress = False
+        while self._deferred:
+            before = len(self._deferred)
             for spec in list(self._deferred):
                 device = self.add(spec)
-                if device is not None:
+                if device is not None and device not in built:
                     built.append(device)
-                    progress = True
+            # Progress is the QUEUE SHRINKING, never add() returning something.
+            # Driving it off the return value means any future path that answers
+            # without draining spins here rather than degrading to a no-op.
+            if len(self._deferred) >= before:
+                break
         return built
 
     def remove(self, spec: DeviceSpec) -> None:
@@ -659,7 +696,7 @@ class DeviceTreeBuilder:
         # deliberately torn down.
         self._deferred = [s for s in self._deferred if not _descends_from(s, spec)]
 
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         device = self._devices.get(device_id) if device_id is not None else None
         if device is None:
             return  # never built (or already removed); the queue is now clean
@@ -686,6 +723,8 @@ class DeviceTreeBuilder:
                 self._created_groups.pop(gone, None)
                 self._devices.pop(gone, None)
                 self._homie_props.pop(gone, None)
+                for known in [sp for sp, did in self._spec_ids.items() if did == gone]:
+                    self._spec_ids.pop(known, None)
 
     def add_root_capabilities(self, specs: Iterable[PropertySpec], *, model_group: Optional[str] = None) -> dict:
         """Materialize capabilities onto the tree's ROOT device.
@@ -741,7 +780,7 @@ class DeviceTreeBuilder:
         Raises `KeyError` for a spec that is not built. Use `add()` first; a
         deferred device has no tree to extend.
         """
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         device = self._devices.get(device_id) if device_id is not None else None
         if device is None:
             raise KeyError(
@@ -782,7 +821,7 @@ class DeviceTreeBuilder:
 
         Raises `KeyError` for a spec that is not built.
         """
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         device = self._devices.get(device_id) if device_id is not None else None
         if device is None:
             raise KeyError(f"{spec.device_class}: not built, so there is nothing to remove from. add() it first.")
@@ -815,7 +854,7 @@ class DeviceTreeBuilder:
 
         Resolved by device id, so any spec naming the same device answers.
         """
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         return self._devices.get(device_id) if device_id is not None else None
 
     def homie_properties(self, spec: DeviceSpec) -> dict:
@@ -824,7 +863,7 @@ class DeviceTreeBuilder:
         Empty for a spec that is not built. An `internal_only` property has no
         Homie twin and so is absent, exactly as in `build_from_declarations`.
         """
-        device_id = spec.resolve_device_id()
+        device_id = self._resolve_id(spec)
         return dict(self._homie_props.get(device_id, {})) if device_id is not None else {}
 
     def deferred(self) -> list:

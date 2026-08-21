@@ -576,11 +576,21 @@ def test_remove_deletes_what_the_builder_created_and_nothing_else(mock_paho):
     assert model.value("dev-1", "serial-number") == "SN-LIVE"
 
 
-def test_a_type_disagreement_with_an_existing_property_is_refused(mock_paho):
+def test_a_type_disagreement_with_an_existing_property_reuses_it(mock_paho):
+    """The observable `type` is metadata: nothing reads it, and `set_value` neither
+    coerces nor validates against it, so a difference has no runtime consequence.
+    Raising here misfired on the normal case of a producer using a richer python
+    type than the datatype-derived default, and it raised mid-materialization."""
     device = _device(mock_paho, "dev-mismatch")
     model = _live_model(group="info")  # holds a str property
-    with pytest.raises(ValueError, match="already holds"):
-        build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.FLOAT)])
+    before = model.get("info", "serial-number")
+
+    props = build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.FLOAT)])
+
+    assert model.get("info", "serial-number") is before  # reused, not replaced
+    assert model.value("info", "serial-number") == "SN-LIVE"
+    # And the wire still works: coercion belongs to the Homie property.
+    assert props[("info", "serial-number")].value() == "SN-LIVE"
 
 
 def test_reuse_still_binds_and_publishes(mock_paho):
