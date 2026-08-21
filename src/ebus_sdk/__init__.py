@@ -83,7 +83,7 @@ from ebus_mqtt_client import MqttClient
 # Structural types for a caller-supplied MQTT client
 from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport, MqttTransport
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 __all__ = [
     # Homie classes
