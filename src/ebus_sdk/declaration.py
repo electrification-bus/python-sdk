@@ -151,8 +151,10 @@ def build_from_declarations(
 
     Groups `specs` by capability (one Homie node each) and, for every spec,
     creates an observable `Property` in `model` and a Homie property on the node,
-    wired together with `bind_property_to_homie` (the outbound/report path). Runs
-    inside one `device.state_transition()`. Returns
+    wired together with `bind_property_to_homie` (the outbound/report path). An
+    observable property the model ALREADY holds is reused, never replaced, since
+    replacing it would discard the live value and every callback and
+    `entity_setter` attached to it. Runs inside one `device.state_transition()`. Returns
     `{(capability, prop_id): homie.Property}`, keyed by WIRE identity; a spec
     with `internal_only=True` creates no Homie property and so is absent from it.
 
@@ -238,6 +240,12 @@ def _materialize(
     devices, model groups keyed per device). Runs inside one
     `device.state_transition()`, so a device announces its structure once.
 
+    An observable property already present in `model` is REUSED rather than
+    replaced, and is not recorded in `model_keys`, so a later teardown removes
+    only what this call created. A spec whose python type disagrees with the
+    property already there raises instead of silently binding a Homie property to
+    a mismatched twin.
+
     `node_id` maps a capability to the Homie node id it materializes onto,
     defaulting to the capability itself. Only the id is renamed: the model group
     still comes from the spec, and the returned map is still keyed by the
@@ -273,9 +281,21 @@ def _materialize(
                     model.create_group(group)
                     created_groups.append(group)
                 py_type = spec.python_type if spec.python_type is not None else python_type_for(spec.datatype)
-                model.add_property(group, ObservableProperty(id=spec.model_key, type=py_type))
+                existing = model.get(group, spec.model_key)
+                if existing is None:
+                    model.add_property(group, ObservableProperty(id=spec.model_key, type=py_type))
+                    # Only what this call created, so a later remove() deletes what
+                    # it added and leaves anything the producer owned first.
+                    model_keys.append((group, spec.model_key))
+                elif existing.type() is not py_type:
+                    raise ValueError(
+                        f"{capability}/{spec.prop_id}: the model already holds "
+                        f"{group}/{spec.model_key} with type {existing.type()!r}, but this spec "
+                        f"declares {py_type!r}. Reusing it would publish values of one type through "
+                        "a property built for another; align the spec's datatype (or python_type) "
+                        "with the model, or give the spec its own source_id/model_group."
+                    )
                 declared[(capability, spec.prop_id)] = spec
-                model_keys.append((group, spec.model_key))
                 # An entity_setter is the translator toward the entity, so it is
                 # registered whenever one is given and the model can reach it.
                 if spec.entity_setter is not None and (spec.settable or spec.internal_only):

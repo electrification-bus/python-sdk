@@ -1549,6 +1549,32 @@ class Device:
             raise ValueError(
                 f"Device id={id}: cannot pass both parent= and mqttc=; children share the root's MQTT connection"
             )
+        # A device id that collides with an ancestor's is always a mistake, and a
+        # silent one: Device.__init__ appends to parent._children with no check, so
+        # a child carrying the root's id makes the root name itself as its own
+        # child in $description, and both publish to the same topics. Refuse it at
+        # construction, where the caller can still see which id was wrong.
+        if parent is not None:
+            ancestor: Optional[Device] = parent
+            while ancestor is not None:
+                if id == ancestor.id():
+                    raise ValueError(
+                        f"Device id={id}: a child cannot carry the same id as its "
+                        f"{'parent' if ancestor is parent else 'ancestor'}; both would publish to the "
+                        "same topics and the ancestor would name itself in its own children"
+                    )
+                ancestor = ancestor.parent()
+            # Same defect one step sideways: two children of one parent sharing an
+            # id derive the same base topic, so their $description publishes
+            # overwrite each other on the broker and the parent names the child
+            # twice in its own `children`. The parent already tracks its children,
+            # so this costs no new state.
+            if any(child.id() == id for child in parent.children()):
+                raise ValueError(
+                    f"Device id={id}: parent id={parent.id()} already has a child with this id; "
+                    "both would publish to the same topics and the parent would name it twice"
+                )
+
         # The domain is a per-TREE property, like the connection and the QoS: one
         # tree publishes under one prefix, and a child under a different domain
         # would sit outside its own root's subtree. Refuse it on a child rather

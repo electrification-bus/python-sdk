@@ -3031,3 +3031,63 @@ class TestTransportFreeLogSeverity:
         assert [
             r for r in caplog.records if r.levelno == logging.INFO and "devicePublishNoMqttClient" in r.getMessage()
         ]
+
+
+class TestChildIdCollidesWithAnAncestor:
+    """A child carrying an ancestor's id is always a mistake, and used to be silent (GH #67).
+
+    Device.__init__ appends to parent._children with no check, so the ancestor
+    ended up naming itself in its own `children` and both devices published to
+    the same topics.
+    """
+
+    def test_child_carrying_its_parents_id_is_refused(self, mock_paho):
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        with pytest.raises(ValueError, match="same id as its parent"):
+            Device("enclosure-1", parent=root)
+
+    def test_grandchild_carrying_the_roots_id_is_refused(self, mock_paho):
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        bess = Device("bess-1", parent=root)
+        with pytest.raises(ValueError, match="same id as its ancestor"):
+            Device("enclosure-1", parent=bess)
+
+    def test_the_root_never_names_itself_as_its_own_child(self, mock_paho):
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        with pytest.raises(ValueError):
+            Device("enclosure-1", parent=root)
+        assert root.children_ids() == []
+        assert "enclosure-1" not in root.description()["children"]
+
+    def test_a_legitimate_child_is_unaffected(self, mock_paho):
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        child = Device("circuit-1", parent=root)
+        grandchild = Device("mid-1", parent=child)
+        assert root.children_ids() == ["circuit-1"]
+        assert grandchild.root() is root
+
+    def test_the_same_id_under_a_different_root_is_fine(self, mock_paho):
+        """Ids only have to be unique within a tree's ancestry, not globally."""
+        root_a, _ = _make_device(mock_paho, device_id="enclosure-a")
+        root_b, _ = _make_device(mock_paho, device_id="enclosure-b")
+        Device("circuit-1", parent=root_a)
+        Device("circuit-1", parent=root_b)
+        assert root_a.children_ids() == ["circuit-1"]
+        assert root_b.children_ids() == ["circuit-1"]
+
+    def test_two_children_of_one_parent_cannot_share_an_id(self, mock_paho):
+        """Same defect one step sideways: identical base topics, and a child named twice."""
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        Device("circuit-1", parent=root)
+        with pytest.raises(ValueError, match="already has a child with this id"):
+            Device("circuit-1", parent=root)
+        assert root.children_ids() == ["circuit-1"]
+
+    def test_recreating_a_deleted_child_is_allowed(self, mock_paho):
+        """delete() detaches, so rebuild-after-delete is not a false positive."""
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        child = Device("circuit-1", parent=root)
+        child.delete()
+        assert root.children_ids() == []
+        Device("circuit-1", parent=root)  # must not raise
+        assert root.children_ids() == ["circuit-1"]
