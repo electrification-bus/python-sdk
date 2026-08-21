@@ -196,6 +196,8 @@ Four things the tree builder does that the single-device one has no need to:
 - **`add()` is idempotent.** Incremental lifecycles re-fire, and a second `add()` of a built spec returns the same `Device` without republishing anything.
 - **`remove()` is depth-first**, grandchild before parent, derived from the live tree rather than an ordering you maintain, so nothing ever observes an orphaned child. It also deletes the model entries it added, and any group it created that is now empty.
 
+Specs are matched by the device id they resolve to, not by object identity, so you can re-derive your spec set from a manifest on every pass and `add()` / `extend()` / `remove()` keep answering for the same device. `add()` is idempotent on the device rather than the declaration: a differing capability set on a built id returns the existing device, and `extend(spec, specs)` / `remove_capabilities(spec, capabilities)` are how a built device grows and shrinks.
+
 The root is not only a parent: `builder.add_root_capabilities(specs)` materializes capabilities onto the root device itself, keyed in the model by the root's device id, and `builder.extend(spec, specs)` gives an already-built device a capability it did not have at boot. Both are idempotent, and a call that would create nothing does not open a state transition at all, so a re-fired lifecycle costs no `init` to `ready` edge (an empty one still forces every controller on the bus to resync).
 
 Each `add()` announces its own device and makes the parent republish its `$description`. To collapse a burst of adds into one parent announcement, wrap them in the parent's `state_transition()`. Use `on_created` for per-child side effects rather than post-processing the returned tree.

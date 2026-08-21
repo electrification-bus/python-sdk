@@ -210,7 +210,7 @@ class _Materialized:
 
     homie_props: dict
     declared: dict
-    model_keys: list
+    model_keys: list  # (capability, group, model_key), so a node's share is identifiable
     created_groups: list
 
 
@@ -297,7 +297,7 @@ def _materialize(
                     model.add_property(group, ObservableProperty(id=spec.model_key, type=py_type))
                     # Only what this call created, so a later remove() deletes what
                     # it added and leaves anything the producer owned first.
-                    model_keys.append((group, spec.model_key))
+                    model_keys.append((capability, group, spec.model_key))
                 elif existing.type() is not py_type:
                     raise ValueError(
                         f"{capability}/{spec.prop_id}: the model already holds "
@@ -561,19 +561,29 @@ class DeviceTreeBuilder:
         the same `Device` without touching the tree, because incremental
         lifecycles re-fire and a second add must not republish or duplicate.
         """
-        existing = self._devices.get(spec)
-        if existing is not None:
-            return existing
+        # Keyed on the RESOLVED DEVICE ID, not on this spec object. A producer
+        # deriving its spec set from a manifest re-derives equal-but-distinct
+        # objects on every pass, and identity keying silently made each pass a
+        # new device; the alternative was an unstated obligation to hold a
+        # device_id -> DeviceSpec map for the process lifetime and never
+        # re-derive, which defeats the point of a declarative API. A spec whose
+        # id is already built returns that device unchanged: to give a built
+        # device more capabilities, use extend().
+        device_id = spec.resolve_device_id()
+        if device_id is not None:
+            existing = self._devices.get(device_id)
+            if existing is not None:
+                return existing
 
         if spec.parent is None:
             parent_device: Optional[Device] = self._root
         else:
-            parent_device = self._devices.get(spec.parent) or self.add(spec.parent)
+            parent_id = spec.parent.resolve_device_id()
+            parent_device = (self._devices.get(parent_id) if parent_id else None) or self.add(spec.parent)
         if parent_device is None:
             self._defer(spec)  # the parent is itself waiting on an id
             return None
 
-        device_id = spec.resolve_device_id()
         if device_id is None:
             self._defer(spec)
             return None
@@ -590,10 +600,10 @@ class DeviceTreeBuilder:
         # dispatch synchronously) must not leave a live device the builder has no
         # record of: device_for() would return None and remove() would be a
         # silent no-op, stranding retained topics.
-        self._devices[spec] = device
-        self._homie_props[spec] = {}
-        self._model_keys[spec] = []
-        self._created_groups[spec] = []
+        self._devices[device_id] = device
+        self._homie_props[device_id] = {}
+        self._model_keys[device_id] = []
+        self._created_groups[device_id] = []
 
         group = spec.resolve_model_group(device_id)
         built = _materialize(
@@ -607,9 +617,9 @@ class DeviceTreeBuilder:
         )
         _seed(self._model, built.declared, default_group=group)
 
-        self._homie_props[spec].update(built.homie_props)
-        self._model_keys[spec].extend(built.model_keys)
-        self._created_groups[spec].extend(built.created_groups)
+        self._homie_props[device_id].update(built.homie_props)
+        self._model_keys[device_id].extend(built.model_keys)
+        self._created_groups[device_id].extend(built.created_groups)
         if spec in self._deferred:
             self._deferred.remove(spec)
         if spec.on_created is not None:
@@ -649,12 +659,13 @@ class DeviceTreeBuilder:
         # deliberately torn down.
         self._deferred = [s for s in self._deferred if not _descends_from(s, spec)]
 
-        device = self._devices.get(spec)
+        device_id = spec.resolve_device_id()
+        device = self._devices.get(device_id) if device_id is not None else None
         if device is None:
             return  # never built (or already removed); the queue is now clean
 
         doomed = {id(d) for d in _descendants(device)}
-        removed = [s for s, d in self._devices.items() if id(d) in doomed]
+        removed = [k for k, d in self._devices.items() if id(d) in doomed]
         device.delete()
         for gone in removed:
             # Bookkeeping is dropped whatever the model does, so a teardown can
@@ -664,7 +675,7 @@ class DeviceTreeBuilder:
             # arrive after the group is gone, since delete_group removes it
             # before firing and dispatch is synchronous.
             try:
-                for group, model_key in self._model_keys.get(gone, []):
+                for _capability, group, model_key in self._model_keys.get(gone, []):
                     if self._model.has_group(group) and self._model.get(group, model_key) is not None:
                         self._model.delete_property(group, model_key)
                 for group in self._created_groups.get(gone, []):
@@ -706,7 +717,7 @@ class DeviceTreeBuilder:
         )
         _seed(self._model, built.declared, default_group=group)
         self._root_props.update(built.homie_props)
-        self._root_model_keys.extend(built.model_keys)
+        self._root_model_keys.extend(built.model_keys)  # (capability, group, model_key)
         return dict(self._root_props)
 
     def root_capabilities(self) -> dict:
@@ -730,7 +741,8 @@ class DeviceTreeBuilder:
         Raises `KeyError` for a spec that is not built. Use `add()` first; a
         deferred device has no tree to extend.
         """
-        device = self._devices.get(spec)
+        device_id = spec.resolve_device_id()
+        device = self._devices.get(device_id) if device_id is not None else None
         if device is None:
             raise KeyError(
                 f"{spec.device_class}: not built, so there is nothing to extend. "
@@ -747,14 +759,64 @@ class DeviceTreeBuilder:
             default_group=group,
         )
         _seed(self._model, built.declared, default_group=group)
-        self._homie_props[spec].update(built.homie_props)
-        self._model_keys[spec].extend(built.model_keys)
-        self._created_groups[spec].extend(built.created_groups)
-        return dict(self._homie_props[spec])
+        self._homie_props[device_id].update(built.homie_props)
+        self._model_keys[device_id].extend(built.model_keys)
+        self._created_groups[device_id].extend(built.created_groups)
+        return dict(self._homie_props[device_id])
+
+    def remove_capabilities(self, spec: DeviceSpec, capabilities: Iterable[str]) -> None:
+        """Take capabilities away from a built device: the inverse of `extend()`.
+
+        A capability that becomes relevant at runtime can stop being relevant,
+        and without this its node stayed advertised in `$description` with
+        retained topics behind it. `Device.delete_node()` already clears those
+        and re-announces, so the gap this closes is the bookkeeping: reaching
+        around the builder to call it left `model_keys` and `created_groups`
+        describing properties that no longer exist, and a later `remove()`
+        working from that stale record.
+
+        Idempotent, like `extend()`: a capability the device does not have is
+        skipped rather than an error, because incremental lifecycles re-fire.
+        Named for capabilities rather than nodes because that is the declarative
+        vocabulary; the node id is resolved through the builder's `node_id`.
+
+        Raises `KeyError` for a spec that is not built.
+        """
+        device_id = spec.resolve_device_id()
+        device = self._devices.get(device_id) if device_id is not None else None
+        if device is None:
+            raise KeyError(f"{spec.device_class}: not built, so there is nothing to remove from. add() it first.")
+
+        for capability in capabilities:
+            if device.get_node(self._node_id(capability)) is None:
+                continue  # already gone, or never had it
+            device.delete_node(self._node_id(capability))
+
+            doomed = [entry for entry in self._model_keys[device_id] if entry[0] == capability]
+            for _capability, group, model_key in doomed:
+                if self._model.has_group(group) and self._model.get(group, model_key) is not None:
+                    self._model.delete_property(group, model_key)
+            self._model_keys[device_id] = [entry for entry in self._model_keys[device_id] if entry[0] != capability]
+            self._homie_props[device_id] = {
+                key: prop for key, prop in self._homie_props[device_id].items() if key[0] != capability
+            }
+            # A group this builder created and that is now empty goes with it.
+            for group in {entry[1] for entry in doomed}:
+                if (
+                    group in self._created_groups[device_id]
+                    and self._model.has_group(group)
+                    and not self._model.items(group)
+                ):
+                    self._model.delete_group(group)
+                    self._created_groups[device_id] = [g for g in self._created_groups[device_id] if g != group]
 
     def device_for(self, spec: DeviceSpec) -> Optional[Device]:
-        """The live `Device` for `spec`, or None if it is deferred or removed."""
-        return self._devices.get(spec)
+        """The live `Device` for `spec`, or None if it is deferred or removed.
+
+        Resolved by device id, so any spec naming the same device answers.
+        """
+        device_id = spec.resolve_device_id()
+        return self._devices.get(device_id) if device_id is not None else None
 
     def homie_properties(self, spec: DeviceSpec) -> dict:
         """`{(capability, prop_id): homie.Property}` for `spec`, as the single-device builder returns.
@@ -762,7 +824,8 @@ class DeviceTreeBuilder:
         Empty for a spec that is not built. An `internal_only` property has no
         Homie twin and so is absent, exactly as in `build_from_declarations`.
         """
-        return self._homie_props.get(spec, {})
+        device_id = spec.resolve_device_id()
+        return dict(self._homie_props.get(device_id, {})) if device_id is not None else {}
 
     def deferred(self) -> list:
         """The specs waiting on an id, in the order they were first attempted."""

@@ -4,6 +4,14 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `DeviceTreeBuilder.remove_capabilities()`: the inverse of `extend()`. A capability that becomes relevant at runtime can stop being relevant, and without this its node stayed advertised in `$description` with retained topics behind it. `Device.delete_node()` already clears those and re-announces, so what this closes is the bookkeeping: reaching around the builder to call it left `model_keys` and `created_groups` describing properties that no longer existed, and a later `remove()` working from that stale record. Idempotent like `extend()`, and named for capabilities rather than nodes because that is the declarative vocabulary. ([#78](https://github.com/electrification-bus/python-sdk/issues/78))
+
+### Changed
+
+- `DeviceTreeBuilder` keys its bookkeeping on the **resolved device id** rather than on `DeviceSpec` object identity. A producer deriving its spec set from a manifest re-derives equal-but-distinct objects on every pass, and identity keying made each pass a new device; the alternative was an unstated obligation to hold a `device_id -> DeviceSpec` map for the process lifetime and never re-derive, which is precisely what a declarative API exists to avoid. `add()`, `remove()`, `extend()`, `device_for()` and `homie_properties()` now all answer for any spec naming the same device. `add()` remains idempotent on the DEVICE rather than on the declaration: a differing capability set on an already-built id returns the existing device unchanged rather than applying the difference, since `add()` mutating a live tree is not what its name suggests; `extend()` is how a built device grows. Deferred specs stay keyed by identity, having no id yet by definition. ([#74](https://github.com/electrification-bus/python-sdk/issues/74))
+
 ### Fixed
 
 - `conditionally_settable` was inert: `_materialize` never read it. The half that looked right is that the property did come out not-settable; the half that bit is that the `entity_setter` was registered only when `settable` was true, so the caller's later `set_settable(True)` opened a `/set` topic with no translator behind it. The property then advertised that it accepts commands and silently discarded them, which is the exact failure the field was introduced to avoid, one step further along. It is the only route the API offers for per-instance settability decided at runtime, and it was the route that did not work. The translator is now wired at build time even though the property starts not-settable. The test that shipped with the feature asserted only the not-settable half, which is why this survived review: a test written from the design rationale checks the rationale rather than the feature. ([#72](https://github.com/electrification-bus/python-sdk/issues/72))
