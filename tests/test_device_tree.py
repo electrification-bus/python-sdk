@@ -301,3 +301,128 @@ def test_specs_are_compared_by_identity(root):
     assert a != b  # identical fields, still two declarations
     builder.add(a)
     assert builder.device_for(b) is None
+
+
+# --- Root capabilities (GH #67) ---------------------------------------------
+
+
+def test_the_root_can_carry_its_own_capabilities(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+
+    props = builder.add_root_capabilities([PropertySpec("meter", "active-power", PropertyDatatype.FLOAT, Unit.WATT)])
+
+    # Materialized onto the root itself, not as a child of it.
+    assert root.get_node("meter") is not None
+    assert root.children_ids() == []
+    assert set(props) == {("meter", "active-power")}
+    # Keyed by the root's device id, matching how add() keys a child's group.
+    model.set_value("enclosure-1", "active-power", 4200.0)
+    assert props[("meter", "active-power")].value() == 4200.0
+
+
+def test_root_capabilities_accumulate_and_are_idempotent(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    builder.add_root_capabilities([PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)])
+    builder.add_root_capabilities([PropertySpec("info", "vendor-name", PropertyDatatype.STRING)])
+
+    assert set(builder.root_capabilities()) == {("meter", "active-power"), ("info", "vendor-name")}
+
+    quiet = len(mock_paho.publish.call_args_list)
+    builder.add_root_capabilities([PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)])
+    # Re-declaring publishes nothing: a re-fired lifecycle must not re-announce.
+    assert len(mock_paho.publish.call_args_list) == quiet
+
+
+def test_root_capabilities_coexist_with_children(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    builder.add_root_capabilities([PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)])
+    builder.add(DeviceSpec("circuit", INFO, device_id="c-1"))
+
+    assert root.get_node("meter") is not None
+    assert root.children_ids() == ["c-1"]
+    assert "meter" in root.description()["nodes"]
+    assert "c-1" in root.description()["children"]
+
+
+def test_root_capabilities_can_name_their_own_model_group(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    builder.add_root_capabilities([PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)], model_group="panel")
+    assert "panel" in model.groups()
+    assert "enclosure-1" not in model.groups()
+
+
+# --- Growing an existing device (GH #68) ------------------------------------
+
+
+def test_extend_gives_a_built_device_a_new_capability(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    assert builder.device_for(spec).get_node("shed") is None
+
+    props = builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+
+    device = builder.device_for(spec)
+    assert device.get_node("shed") is not None
+    # The returned map is everything the device has, not only the addition.
+    assert set(props) == {("info", "serial-number"), ("shed", "shed-state")}
+    model.set_value("bess-1", "shed-state", "SHED")
+    assert props[("shed", "shed-state")].value() == "SHED"
+
+
+def test_extend_is_idempotent(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+
+    quiet = len(mock_paho.publish.call_args_list)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    assert len(mock_paho.publish.call_args_list) == quiet
+
+
+def test_extend_does_not_drop_the_devices_existing_properties(root, mock_paho):
+    """The hazard the workaround had: re-declaring dropped properties from
+    $description while leaving their retained topics on the broker."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    model.set_value("bess-1", "serial-number", "B-1")
+
+    builder.extend(spec, [PropertySpec("info", "vendor-name", PropertyDatatype.STRING)])
+
+    device = builder.device_for(spec)
+    described = device.description()["nodes"]["info"]["properties"]
+    assert set(described) == {"serial-number", "vendor-name"}
+    # The pre-existing property kept its live value rather than being replaced.
+    assert model.value("bess-1", "serial-number") == "B-1"
+
+
+def test_extend_folds_into_the_bookkeeping_remove_uses(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+
+    builder.remove(spec)
+    # Both the original and the extended model entries are gone.
+    assert model.get("bess-1", "serial-number") is None
+    assert model.get("bess-1", "shed-state") is None
+    assert "bess-1" not in model.groups()
+
+
+def test_extend_refuses_a_device_that_is_not_built(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id=lambda: None)
+    builder.add(spec)  # deferred, so no tree to extend
+    with pytest.raises(KeyError, match="not built"):
+        builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
