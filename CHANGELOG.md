@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-08-20
+
 ### Added
 
 - `DeviceTreeBuilder.add_root_capabilities()`: the tree's root can carry its own capabilities. `add()` only ever creates children, so a root's own surfaces (an enclosure's aggregate metering, its state, its controls) had no declarative expression and had to be hand-rolled beside the builder, which left one model with two construction styles and put the root outside every guarantee the builder gives (idempotence, ordered teardown, model cleanup). The root already exists, so this materializes onto it rather than constructing anything; the model group defaults to the root's device id, matching how `add()` keys a child. `root_capabilities()` reads back what has accumulated. ([#67](https://github.com/electrification-bus/python-sdk/issues/67))
@@ -369,6 +371,7 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
 [Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[0.22.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.22.0
 [0.21.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.21.0
 [0.20.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.1
 [0.20.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.0
