@@ -7,6 +7,7 @@ from ebus_sdk import (
     DeviceSpec,
     DeviceTreeBuilder,
     GroupedPropertyDict,
+    ObservableProperty,
     PropertyDatatype,
     PropertySpec,
     Unit,
@@ -502,3 +503,92 @@ def test_device_tree_builder_passes_node_id_through(mock_paho):
     )
     assert child.get_node("x-info") is not None
     assert child.get_node("info") is None
+
+
+# --- Reusing a model the builder does not own (GH #66) -----------------------
+
+
+def _live_model(group="dev-1", prop_id="serial-number"):
+    """A model a producer already populated, before any Homie tree existed."""
+    model = GroupedPropertyDict()
+    model.create_group(group)
+    model.add_property(group, ObservableProperty(id=prop_id, type=str))
+    model.set_value(group, prop_id, "SN-LIVE")
+    return model
+
+
+def test_an_existing_model_property_is_reused_not_replaced(mock_paho):
+    device = _device(mock_paho, "dev-reuse")
+    model = _live_model(group="info")
+    before = model.get("info", "serial-number")
+
+    build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.STRING)])
+
+    # The same object, so nothing attached to it was discarded.
+    assert model.get("info", "serial-number") is before
+    assert model.value("info", "serial-number") == "SN-LIVE"
+
+
+def test_reuse_preserves_callbacks_and_the_entity_setter(mock_paho):
+    device = _device(mock_paho, "dev-reuse-cb")
+    model = _live_model(group="info")
+    changed, commanded = [], []
+    model.add_property_on_change_callback("info", "serial-number", lambda p: changed.append(p.value()))
+    model.set_entity_setter("info", "serial-number", commanded.append)
+
+    build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.STRING)])
+
+    model.set_value("info", "serial-number", "SN-NEW")
+    assert changed == ["SN-NEW"], "the producer's on-change callback died with the replaced property"
+    model.set_entity("info", "serial-number", "CMD")
+    assert commanded == ["CMD"], "the producer's actuator died while $description still advertises settable"
+
+
+def test_the_tree_builder_reuses_a_producers_property_too(mock_paho):
+    root = _device(mock_paho, "enclosure-1")
+    model = _live_model(group="dev-1")
+    builder = DeviceTreeBuilder(root, model)
+    builder.add(
+        DeviceSpec("circuit", [PropertySpec("info", "serial-number", PropertyDatatype.STRING)], device_id="dev-1")
+    )
+    assert model.value("dev-1", "serial-number") == "SN-LIVE"
+
+
+def test_remove_deletes_what_the_builder_created_and_nothing_else(mock_paho):
+    root = _device(mock_paho, "enclosure-2")
+    model = _live_model(group="dev-1")
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec(
+        "circuit",
+        [
+            PropertySpec("info", "serial-number", PropertyDatatype.STRING),  # the producer's
+            PropertySpec("meter", "active-power", PropertyDatatype.FLOAT),  # the builder's
+        ],
+        device_id="dev-1",
+    )
+    builder.add(spec)
+    assert model.get("dev-1", "active-power") is not None
+
+    builder.remove(spec)
+    # What it created is gone; what it found is left where it was.
+    assert model.get("dev-1", "active-power") is None
+    assert model.get("dev-1", "serial-number") is not None
+    assert model.value("dev-1", "serial-number") == "SN-LIVE"
+
+
+def test_a_type_disagreement_with_an_existing_property_is_refused(mock_paho):
+    device = _device(mock_paho, "dev-mismatch")
+    model = _live_model(group="info")  # holds a str property
+    with pytest.raises(ValueError, match="already holds"):
+        build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.FLOAT)])
+
+
+def test_reuse_still_binds_and_publishes(mock_paho):
+    """Reusing the twin must not skip the wiring: a later model write still reaches Homie."""
+    device = _device(mock_paho, "dev-reuse-bind")
+    model = _live_model(group="info")
+    homie_props = build_from_declarations(
+        device, model, [PropertySpec("info", "serial-number", PropertyDatatype.STRING)]
+    )
+    model.set_value("info", "serial-number", "SN-NEW")
+    assert homie_props[("info", "serial-number")].value() == "SN-NEW"
