@@ -522,12 +522,16 @@ def test_a_failure_during_materialization_does_not_strand_the_device(root, mock_
     """The device is constructed, attached and broker-visible before materialization,
     so a raise must still leave it recorded and therefore removable."""
     model = GroupedPropertyDict()
-    model.create_group("c-9")
-    model.add_property("c-9", ObservableProperty(id="serial-number", type=float))  # type disagrees
-    builder = DeviceTreeBuilder(root, model)
-    spec = DeviceSpec("circuit", INFO, device_id="c-9")
 
-    with pytest.raises(ValueError, match="already holds"):
+    def explode_on_the_second_capability(capability):
+        if capability == "meter":
+            raise RuntimeError("boom")
+        return f"energy.ebus.capability.{capability}"
+
+    builder = DeviceTreeBuilder(root, model, node_type=explode_on_the_second_capability)
+    spec = DeviceSpec("circuit", INFO + METER, device_id="c-9")
+
+    with pytest.raises(RuntimeError, match="boom"):
         builder.add(spec)
 
     assert builder.device_for(spec) is not None, "a live device with no record is unrecoverable"
@@ -647,3 +651,106 @@ def test_remove_capabilities_refuses_an_unbuilt_device(root):
     builder = DeviceTreeBuilder(root, model)
     with pytest.raises(KeyError, match="not built"):
         builder.remove_capabilities(DeviceSpec("bess", INFO, device_id="nope"), ["shed"])
+
+
+# --- The deferred queue keys on ids too (GH #82) -----------------------------
+
+
+def test_resolve_deferred_returns_when_another_spec_built_the_device(root):
+    """The regression 0.23.0's id-keying introduced: add() short-circuits on the id
+    before draining the queue, so resolve_deferred() saw a device, called it
+    progress, and looped over an unchanged queue forever.
+
+    If this regresses it HANGS rather than fails; CI's timeout-minutes is the net.
+    """
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    box = {"id": None}
+
+    builder.add(DeviceSpec("bess", INFO, device_id=lambda: box["id"]))
+    assert len(builder.deferred()) == 1
+
+    box["id"] = "bess-1"
+    builder.add(DeviceSpec("bess", INFO, device_id=lambda: box["id"]))  # equal but NEW object
+
+    assert builder.deferred() == [], "the queue must drain on the id short-circuit path"
+    assert builder.resolve_deferred() == []
+    assert root.children_ids() == ["bess-1"]
+
+
+def test_resolve_deferred_stops_when_the_queue_stops_shrinking(root):
+    """Progress is the queue shrinking, never add() returning something."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    builder.add(DeviceSpec("bess", INFO, device_id=lambda: None))
+    builder.add(DeviceSpec("pv", INFO, device_id=lambda: None))
+
+    assert builder.resolve_deferred() == []
+    assert len(builder.deferred()) == 2  # still waiting, but it returned
+
+
+def test_a_deferred_spec_resolving_late_still_builds(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    box = {"id": None}
+    spec = DeviceSpec("bess", INFO, device_id=lambda: box["id"])
+    builder.add(spec)
+
+    box["id"] = "bess-1"
+    built = builder.resolve_deferred()
+
+    assert [d.id() for d in built] == ["bess-1"]
+    assert builder.deferred() == []
+
+
+# --- A resolver that goes stale must not orphan its device -------------------
+
+
+def test_remove_works_when_the_id_resolver_has_stopped_answering(root):
+    """A producer's resolver often reads the producer's own model, which can stop
+    answering exactly when teardown begins. Re-resolving then found nothing and
+    remove() returned silently, leaving the device live with its retained topics."""
+    model = GroupedPropertyDict()
+    model.create_group("src")
+    model.add_property("src", ObservableProperty(id="serial", type=str))
+    model.set_value("src", "serial", "bess-1")
+    builder = DeviceTreeBuilder(root, model)
+
+    def id_from_model():
+        return model.value("src", "serial") if model.has_group("src") else None
+
+    spec = DeviceSpec("bess", INFO, device_id=id_from_model)
+    builder.add(spec)
+    assert root.children_ids() == ["bess-1"]
+
+    model.delete_group("src")  # the resolver's source goes away
+    builder.remove(spec)
+
+    assert root.children_ids() == [], "the device was left live with its retained topics"
+    assert builder.device_for(spec) is None
+
+
+def test_device_for_survives_a_stale_resolver(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    box = {"id": "bess-1"}
+    spec = DeviceSpec("bess", INFO, device_id=lambda: box["id"])
+    device = builder.add(spec)
+
+    box["id"] = None  # the resolver stops answering
+    assert builder.device_for(spec) is device
+    assert builder.homie_properties(spec) != {}
+
+
+def test_the_latch_is_dropped_with_the_device(root):
+    """A rebuilt spec must resolve afresh rather than answering from a dead latch."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    box = {"id": "bess-1"}
+    spec = DeviceSpec("bess", INFO, device_id=lambda: box["id"])
+    builder.add(spec)
+    builder.remove(spec)
+
+    box["id"] = "bess-2"
+    rebuilt = builder.add(spec)
+    assert rebuilt.id() == "bess-2"
