@@ -3074,3 +3074,20 @@ class TestChildIdCollidesWithAnAncestor:
         Device("circuit-1", parent=root_b)
         assert root_a.children_ids() == ["circuit-1"]
         assert root_b.children_ids() == ["circuit-1"]
+
+    def test_two_children_of_one_parent_cannot_share_an_id(self, mock_paho):
+        """Same defect one step sideways: identical base topics, and a child named twice."""
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        Device("circuit-1", parent=root)
+        with pytest.raises(ValueError, match="already has a child with this id"):
+            Device("circuit-1", parent=root)
+        assert root.children_ids() == ["circuit-1"]
+
+    def test_recreating_a_deleted_child_is_allowed(self, mock_paho):
+        """delete() detaches, so rebuild-after-delete is not a false positive."""
+        root, _ = _make_device(mock_paho, device_id="enclosure-1")
+        child = Device("circuit-1", parent=root)
+        child.delete()
+        assert root.children_ids() == []
+        Device("circuit-1", parent=root)  # must not raise
+        assert root.children_ids() == ["circuit-1"]

@@ -1564,6 +1564,16 @@ class Device:
                         "same topics and the ancestor would name itself in its own children"
                     )
                 ancestor = ancestor.parent()
+            # Same defect one step sideways: two children of one parent sharing an
+            # id derive the same base topic, so their $description publishes
+            # overwrite each other on the broker and the parent names the child
+            # twice in its own `children`. The parent already tracks its children,
+            # so this costs no new state.
+            if any(child.id() == id for child in parent.children()):
+                raise ValueError(
+                    f"Device id={id}: parent id={parent.id()} already has a child with this id; "
+                    "both would publish to the same topics and the parent would name it twice"
+                )
 
         # The domain is a per-TREE property, like the connection and the QoS: one
         # tree publishes under one prefix, and a child under a different domain
