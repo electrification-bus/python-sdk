@@ -18,6 +18,7 @@ transition. Acquisition code then only calls
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
@@ -259,22 +260,29 @@ def _materialize(
     declared: dict[tuple, PropertySpec] = {}
     model_keys: list = []
     created_groups: list = []
-    with device.state_transition():
+    # Open a state transition only if there is something to announce. An empty
+    # one still emits init -> ready, and that edge forces every controller on the
+    # bus to resync, so a re-declaration that changes nothing must not cost one.
+    needs_transition = _needs_materializing(device, model, grouped, node_id, default_group)
+    with device.state_transition() if needs_transition else nullcontext():
         for capability, cap_specs in grouped.items():
             # A node exists to carry published properties. If every spec on this
             # capability is internal, creating one would announce an empty node.
             published = [spec for spec in cap_specs if not spec.internal_only]
-            node = (
-                device.add_node_from_dict(
+            # Reuse an existing node. Device.add_node is a wholesale
+            # `self._nodes.update(...)`, so re-declaring would drop the previous
+            # node's properties from $description while LEAVING their retained
+            # topics on the broker (only delete_node clears those), producing a
+            # tree whose description and whose broker state disagree.
+            node = None
+            if published:
+                node = device.get_node(node_id(capability)) or device.add_node_from_dict(
                     {
                         "id": node_id(capability),
                         "name": node_name(capability),
                         "type": node_type(capability),
                     }
                 )
-                if published
-                else None
-            )
             for spec in cap_specs:
                 group = _group_for(spec, default_group)
                 if not model.has_group(group):
@@ -315,6 +323,14 @@ def _materialize(
                     prop_dict["round_to"] = spec.round_to
                 if not spec.retained:
                     prop_dict["retained"] = False
+                # Reuse likewise: Node.add_property replaces wholesale and
+                # republishes with force=True, so re-declaring an unchanged
+                # property would re-announce it. A datatype that actually changed
+                # is caught on the model side above, which raises.
+                existing_prop = node.get_property(spec.prop_id)
+                if existing_prop is not None:
+                    homie_props[(capability, spec.prop_id)] = existing_prop
+                    continue
                 homie_prop = node.add_property_from_dict(prop_dict)
                 bind_property_to_homie(model, group, spec.model_key, homie_prop)
                 # Inbound/control path for a settable property with a translator:
@@ -325,6 +341,31 @@ def _materialize(
                 homie_props[(capability, spec.prop_id)] = homie_prop
 
     return _Materialized(homie_props, declared, model_keys, created_groups)
+
+
+def _needs_materializing(
+    device: Device,
+    model: GroupedPropertyDict,
+    grouped: dict,
+    node_id: Callable[[str], str],
+    default_group: Optional[str],
+) -> bool:
+    """True when any spec still has something to create on the device or the model.
+
+    Answered BEFORE the transition opens, because the question is whether to open
+    one at all: an init -> ready edge that announces nothing is a cost paid by
+    every controller on the bus.
+    """
+    for capability, cap_specs in grouped.items():
+        for spec in cap_specs:
+            if model.get(_group_for(spec, default_group), spec.model_key) is None:
+                return True
+            if spec.internal_only:
+                continue
+            node = device.get_node(node_id(capability))
+            if node is None or node.get_property(spec.prop_id) is None:
+                return True
+    return False
 
 
 def _seed(
@@ -482,6 +523,10 @@ class DeviceTreeBuilder:
         self._model_keys: dict = {}
         self._created_groups: dict = {}
         self._deferred: list = []
+        # The root is not a DeviceSpec, so its bookkeeping lives beside the
+        # per-spec maps rather than inside them. Nothing removes a root.
+        self._root_props: dict = {}
+        self._root_model_keys: list = []
 
     def add(self, spec: DeviceSpec) -> Optional[Device]:
         """Materialize `spec` as a device, or defer it while its id is unknown.
@@ -581,6 +626,82 @@ class DeviceTreeBuilder:
                     self._model.delete_group(group)
             self._devices.pop(gone, None)
             self._homie_props.pop(gone, None)
+
+    def add_root_capabilities(self, specs: Iterable[PropertySpec], *, model_group: Optional[str] = None) -> dict:
+        """Materialize capabilities onto the tree's ROOT device.
+
+        `add()` only ever creates children, so a root's own capabilities (an
+        enclosure's aggregate metering, its state, its control surfaces) had no
+        declarative expression and had to be hand-rolled beside the builder: one
+        model, two construction styles, and the root outside every guarantee the
+        builder gives.
+
+        The root already exists, so this materializes onto it rather than
+        constructing anything. `model_group` defaults to the root's device id,
+        matching how `add()` keys a child's group. Idempotent, so a re-fired
+        lifecycle re-declares nothing.
+
+        Returns `{(capability, prop_id): homie.Property}` for the root, and the
+        map accumulates across calls, so `add_root_capabilities` twice returns
+        everything the root has.
+        """
+        group = model_group or self._root.id()
+        built = _materialize(
+            self._root,
+            self._model,
+            specs,
+            node_type=self._node_type,
+            node_name=self._node_name,
+            node_id=self._node_id,
+            default_group=group,
+        )
+        _seed(self._model, built.declared, default_group=group)
+        self._root_props.update(built.homie_props)
+        self._root_model_keys.extend(built.model_keys)
+        return dict(self._root_props)
+
+    def root_capabilities(self) -> dict:
+        """`{(capability, prop_id): homie.Property}` materialized onto the root so far."""
+        return dict(self._root_props)
+
+    def extend(self, spec: DeviceSpec, specs: Iterable[PropertySpec]) -> dict:
+        """Give a device this builder already built additional capabilities.
+
+        A device's capability set is not always known when it is first published:
+        a storage system is commissioned and the enclosure gains shed and
+        forecast surfaces it did not have at boot. `add()` short-circuits an
+        already-built spec, so the builder modeled devices appearing and
+        disappearing but not a device GROWING.
+
+        Materializes inside one `state_transition()`, so the device announces
+        once, and folds the new model keys into the same bookkeeping `remove()`
+        uses. Idempotent: extending with a capability already present is a no-op
+        rather than a republish, because incremental lifecycles re-fire.
+
+        Raises `KeyError` for a spec that is not built. Use `add()` first; a
+        deferred device has no tree to extend.
+        """
+        device = self._devices.get(spec)
+        if device is None:
+            raise KeyError(
+                f"{spec.device_class}: not built, so there is nothing to extend. "
+                "add() it first (a deferred device has no tree yet)."
+            )
+        group = spec.resolve_model_group(device.id())
+        built = _materialize(
+            device,
+            self._model,
+            specs,
+            node_type=self._node_type,
+            node_name=self._node_name,
+            node_id=self._node_id,
+            default_group=group,
+        )
+        _seed(self._model, built.declared, default_group=group)
+        self._homie_props[spec].update(built.homie_props)
+        self._model_keys[spec].extend(built.model_keys)
+        self._created_groups[spec].extend(built.created_groups)
+        return dict(self._homie_props[spec])
 
     def device_for(self, spec: DeviceSpec) -> Optional[Device]:
         """The live `Device` for `spec`, or None if it is deferred or removed."""
