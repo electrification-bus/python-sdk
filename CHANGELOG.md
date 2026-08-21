@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.23.1] — 2026-08-21
+
 ### Fixed
 
 - `DeviceTreeBuilder.resolve_deferred()` no longer spins forever when the device a deferred spec was waiting for has already been built by an equal-but-distinct `DeviceSpec`. 0.23.0 moved `add()`'s bookkeeping to the resolved device id and did not move the deferred paths with it: `add()`'s id short-circuit returned the existing device before reaching the identity-based `self._deferred.remove(spec)`, so the spec stayed queued while `resolve_deferred()` counted the returned device as progress and looped over an unchanged queue. This is a regression of exactly the pattern the id-keying was introduced to enable, which is what made it reachable by following the new guidance. Two changes, because one of them would have been enough and the other makes the class of bug degrade instead of hang: the queue drains on the short-circuit path as well as the full-materialization path, keyed by resolved id rather than object identity; and `resolve_deferred()`'s progress is now the queue actually shrinking, never `add()` returning something, so a future path that answers without draining is a no-op rather than a spin. ([#82](https://github.com/electrification-bus/python-sdk/issues/82))
@@ -403,6 +405,7 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
 [Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[0.23.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.1
 [0.23.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.0
 [0.22.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.22.0
 [0.21.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.21.0
