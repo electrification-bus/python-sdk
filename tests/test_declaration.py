@@ -592,3 +592,105 @@ def test_reuse_still_binds_and_publishes(mock_paho):
     )
     model.set_value("info", "serial-number", "SN-NEW")
     assert homie_props[("info", "serial-number")].value() == "SN-NEW"
+
+
+# --- conditionally_settable reaches the inbound path (GH #72) ----------------
+
+
+def test_conditionally_settable_registers_its_entity_setter(mock_paho):
+    device = _device(mock_paho, "dev-cond-setter")
+    model = GroupedPropertyDict()
+    received = []
+    build_from_declarations(
+        device,
+        model,
+        [
+            PropertySpec(
+                "control",
+                "limit",
+                PropertyDatatype.FLOAT,
+                conditionally_settable=True,
+                entity_setter=received.append,
+            )
+        ],
+    )
+    model.set_entity("control", "limit", 42.0)
+    assert received == [42.0], "the translator was never registered on the model"
+
+
+def test_enabling_a_conditionally_settable_property_gives_a_working_set_topic(mock_paho):
+    """The whole point of the field: the /set topic opened later must have a handler."""
+    device = _device(mock_paho, "dev-cond-flip")
+    model = GroupedPropertyDict()
+    received = []
+    props = build_from_declarations(
+        device,
+        model,
+        [
+            PropertySpec(
+                "control",
+                "limit",
+                PropertyDatatype.FLOAT,
+                conditionally_settable=True,
+                entity_setter=received.append,
+            )
+        ],
+    )
+    hp = props[("control", "limit")]
+    assert hp.settable() is False  # still built not-settable
+
+    with device.state_transition():
+        hp.set_settable(True)
+
+    # Subscribed AND wired: a topic that accepts commands and discards them is
+    # the failure this field exists to avoid.
+    assert [c for c in mock_paho.subscribe.call_args_list if c.args and str(c.args[0]).endswith("/control/limit/set")]
+    assert hp.get_set_callback() is not None
+    hp.get_set_callback()("42.0")
+    assert received == ["42.0"]
+
+
+# --- a live model value reaches the wire (GH #77) ----------------------------
+
+
+def test_a_value_the_model_already_held_is_published(mock_paho):
+    device = _device(mock_paho, "dev-live")
+    model = _live_model(group="info")  # holds SN-LIVE before any tree exists
+    props = build_from_declarations(device, model, [PropertySpec("info", "serial-number", PropertyDatatype.STRING)])
+    # The binding is on-change and the twin starts empty, so without an explicit
+    # push the wire would show the declared default for the process lifetime.
+    assert props[("info", "serial-number")].value() == "SN-LIVE"
+    assert "SN-LIVE" in [c.args[1] for c in mock_paho.publish.call_args_list if len(c.args) > 1]
+
+
+def test_initial_value_seeds_but_does_not_clobber_a_live_value(mock_paho):
+    device = _device(mock_paho, "dev-live-2")
+    model = _live_model(group="info")
+    build_from_declarations(
+        device,
+        model,
+        [PropertySpec("info", "serial-number", PropertyDatatype.STRING, initial_value="DECLARED")],
+    )
+    assert model.value("info", "serial-number") == "SN-LIVE"
+
+
+def test_an_explicit_values_entry_still_wins_over_a_live_value(mock_paho):
+    """`values` is a statement about this run, so it is more specific than either."""
+    device = _device(mock_paho, "dev-live-3")
+    model = _live_model(group="info")
+    build_from_declarations(
+        device,
+        model,
+        [PropertySpec("info", "serial-number", PropertyDatatype.STRING)],
+        values={("info", "serial-number"): "RUNTIME"},
+    )
+    assert model.value("info", "serial-number") == "RUNTIME"
+
+
+def test_the_tree_builder_publishes_live_values_too(mock_paho):
+    root = _device(mock_paho, "enclosure-live")
+    model = _live_model(group="dev-1")
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("circuit", [PropertySpec("info", "serial-number", PropertyDatatype.STRING)], device_id="dev-1")
+    builder.add(spec)
+    assert builder.homie_properties(spec)[("info", "serial-number")].value() == "SN-LIVE"

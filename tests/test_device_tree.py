@@ -6,10 +6,12 @@ One test per acceptance criterion, plus the tree shape the criteria assume.
 import pytest
 
 from ebus_sdk import (
+    ChangeEvent,
     DeviceSpec,
     DeviceTreeBuilder,
     Device,
     GroupedPropertyDict,
+    ObservableProperty,
     PropertyDatatype,
     PropertySpec,
     Unit,
@@ -426,3 +428,101 @@ def test_extend_refuses_a_device_that_is_not_built(root):
     builder.add(spec)  # deferred, so no tree to extend
     with pytest.raises(KeyError, match="not built"):
         builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+
+
+# --- Teardown and bookkeeping robustness (GH #73, #75, #76) ------------------
+
+
+def test_remove_survives_a_group_the_producer_already_deleted(root, mock_paho):
+    """A consumer driving remove() from a GROUP_DELETED observer always arrives late:
+    delete_group removes the group before firing, and dispatch is synchronous."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("circuit", INFO, device_id="c-1")
+    builder.add(spec)
+
+    model.delete_group("c-1")
+    builder.remove(spec)  # must not raise
+
+    # And no corpse: a corpse would short-circuit the next add() for the whole
+    # process lifetime, with the device already gone from the broker.
+    assert builder.device_for(spec) is None
+    assert builder.add(spec) is not None
+
+
+def test_remove_drops_bookkeeping_even_when_the_model_is_uncooperative(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("circuit", INFO, device_id="c-1")
+    builder.add(spec)
+    model.delete_property("c-1", "serial-number")  # producer got there first
+
+    builder.remove(spec)
+    assert builder.device_for(spec) is None
+    assert builder.homie_properties(spec) == {}
+
+
+def test_remove_prunes_deferred_descendants(root, mock_paho):
+    """A deferred child holds a frozen reference to its parent spec, so leaving it
+    queued lets resolve_deferred() rebuild a device that was torn down."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    parent = DeviceSpec("bess", INFO, device_id="bess-1")
+    child = DeviceSpec("mid", METER, device_id=lambda: None, parent=parent)
+    builder.add(parent)
+    assert builder.add(child) is None  # deferred on a late identifier
+
+    builder.remove(parent)
+
+    assert builder.deferred() == []
+    assert builder.resolve_deferred() == []
+    assert root.children_ids() == []
+
+
+def test_removing_a_deferred_parent_also_prunes_its_deferred_child(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    parent = DeviceSpec("bess", INFO, device_id=lambda: None)
+    child = DeviceSpec("mid", METER, device_id="mid-1", parent=parent)
+    builder.add(parent)
+    builder.add(child)
+    assert len(builder.deferred()) == 2
+
+    builder.remove(parent)
+    assert builder.deferred() == []
+
+
+def test_a_failure_during_materialization_does_not_strand_the_device(root, mock_paho):
+    """The device is constructed, attached and broker-visible before materialization,
+    so a raise must still leave it recorded and therefore removable."""
+    model = GroupedPropertyDict()
+    model.create_group("c-9")
+    model.add_property("c-9", ObservableProperty(id="serial-number", type=float))  # type disagrees
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("circuit", INFO, device_id="c-9")
+
+    with pytest.raises(ValueError, match="already holds"):
+        builder.add(spec)
+
+    assert builder.device_for(spec) is not None, "a live device with no record is unrecoverable"
+    builder.remove(spec)
+    assert builder.device_for(spec) is None
+    assert root.children_ids() == []
+
+
+def test_a_reentrant_add_from_a_model_observer_does_not_duplicate(root, mock_paho):
+    """The model dispatches synchronously, so a producer watching its own model can
+    re-enter add() while the first call is still materializing."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("circuit", INFO, device_id="c-1")
+    seen = []
+
+    def reenter(*args, **kwargs):
+        seen.append(builder.add(spec))
+
+    model.add_observer(reenter, event_types=[ChangeEvent.PROPERTY_ADDED])
+    device = builder.add(spec)
+
+    assert all(d is device for d in seen if d is not None)
+    assert root.children_ids() == ["c-1"]
