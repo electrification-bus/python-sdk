@@ -81,8 +81,11 @@ class PropertySpec:
       runtime, per instance. The builder materializes it NOT settable, which
       keeps `$description` truthful and leaves no `/set` subscription open on a
       property that would reject the command; the caller enables it with
-      `homie.Property.set_settable(True)` inside a `state_transition()`. It is
-      mutually exclusive with `settable`, which means "settable now".
+      `homie.Property.set_settable(True)` inside a `state_transition()`. The
+      `entity_setter` is wired at build time even though the property starts
+      not-settable, because `set_settable(True)` subscribes immediately and a
+      `/set` topic with no translator behind it accepts commands and discards
+      them. It is mutually exclusive with `settable`, which means "settable now".
     * `source_id` / `model_group`: the observable-model identity, when it
       differs from the wire identity. `source_id` defaults to `prop_id` and
       `model_group` to `capability`, so they are fused unless split. Splitting
@@ -306,7 +309,9 @@ def _materialize(
                 declared[(capability, spec.prop_id)] = spec
                 # An entity_setter is the translator toward the entity, so it is
                 # registered whenever one is given and the model can reach it.
-                if spec.entity_setter is not None and (spec.settable or spec.internal_only):
+                if spec.entity_setter is not None and (
+                    spec.settable or spec.conditionally_settable or spec.internal_only
+                ):
                     model.set_entity_setter(group, spec.model_key, spec.entity_setter)
                 if spec.internal_only or node is None:
                     continue
@@ -333,10 +338,23 @@ def _materialize(
                     continue
                 homie_prop = node.add_property_from_dict(prop_dict)
                 bind_property_to_homie(model, group, spec.model_key, homie_prop)
+                # The binding is on-change, and the twin starts empty, so a value
+                # the model was already holding would never reach the wire: a
+                # producer whose model predates the tree would publish its
+                # declared default forever, and it would not self-heal, because
+                # set_value fires callbacks only on an actual change.
+                current = model.value(group, spec.model_key)
+                if current is not None:
+                    homie_prop.set_value(current)
                 # Inbound/control path for a settable property with a translator:
                 # /set payload -> model.set_entity -> entity_setter. The /set
                 # subscription is already live from add_property -> set_subscribe.
-                if spec.settable and spec.entity_setter is not None:
+                # conditionally_settable too, and this is the whole point of it:
+                # the property is built not-settable, so no /set topic is open
+                # yet, but the caller flips it with set_settable(True) later and
+                # that subscribes immediately. Wiring the translator now is what
+                # stops that topic from accepting commands and discarding them.
+                if spec.entity_setter is not None and (spec.settable or spec.conditionally_settable):
                     homie_prop.set_set_callback(partial(model.set_entity, group, spec.model_key))
                 homie_props[(capability, spec.prop_id)] = homie_prop
 
@@ -381,8 +399,14 @@ def _seed(
     them: a caller passing a runtime map is being more specific than the static
     declaration. Entries naming an undeclared property are ignored.
     """
+    # A declared initial_value SEEDS, it does not overwrite: a model that already
+    # holds a value for this property holds a fresher one than the declaration.
+    # An explicit `values` entry still wins below, since that caller is being
+    # specific about this run rather than about the property in general.
     seed: dict[tuple, Any] = {
-        key: spec.initial_value for key, spec in declared.items() if spec.initial_value is not None
+        key: spec.initial_value
+        for key, spec in declared.items()
+        if spec.initial_value is not None and model.value(_group_for(spec, default_group), spec.model_key) is None
     }
     if values:
         seed.update({key: value for key, value in values.items() if key in declared})
@@ -560,6 +584,17 @@ class DeviceTreeBuilder:
             type=spec.resolve_device_type(),
             parent=parent_device,
         )
+        # Record BEFORE materializing. The device is already constructed,
+        # attached and visible on the broker, so a raise below (or a re-entrant
+        # add() from a producer observing its own model, since the model's events
+        # dispatch synchronously) must not leave a live device the builder has no
+        # record of: device_for() would return None and remove() would be a
+        # silent no-op, stranding retained topics.
+        self._devices[spec] = device
+        self._homie_props[spec] = {}
+        self._model_keys[spec] = []
+        self._created_groups[spec] = []
+
         group = spec.resolve_model_group(device_id)
         built = _materialize(
             device,
@@ -572,10 +607,9 @@ class DeviceTreeBuilder:
         )
         _seed(self._model, built.declared, default_group=group)
 
-        self._devices[spec] = device
-        self._homie_props[spec] = built.homie_props
-        self._model_keys[spec] = built.model_keys
-        self._created_groups[spec] = built.created_groups
+        self._homie_props[spec].update(built.homie_props)
+        self._model_keys[spec].extend(built.model_keys)
+        self._created_groups[spec].extend(built.created_groups)
         if spec in self._deferred:
             self._deferred.remove(spec)
         if spec.on_created is not None:
@@ -609,23 +643,38 @@ class DeviceTreeBuilder:
         too, along with any group it created that is now empty; a group the
         caller created, or one still in use, is left alone.
         """
+        # Deferred descendants go whether or not this spec was ever built: a
+        # deferred child holds a frozen reference to its parent spec, so leaving
+        # it in the queue lets resolve_deferred() rebuild a device that was
+        # deliberately torn down.
+        self._deferred = [s for s in self._deferred if not _descends_from(s, spec)]
+
         device = self._devices.get(spec)
         if device is None:
-            if spec in self._deferred:
-                self._deferred.remove(spec)  # never built, just stop waiting for it
-            return
+            return  # never built (or already removed); the queue is now clean
 
         doomed = {id(d) for d in _descendants(device)}
         removed = [s for s, d in self._devices.items() if id(d) in doomed]
         device.delete()
         for gone in removed:
-            for group, model_key in self._model_keys.pop(gone, []):
-                self._model.delete_property(group, model_key)
-            for group in self._created_groups.pop(gone, []):
-                if not self._model.items(group):
-                    self._model.delete_group(group)
-            self._devices.pop(gone, None)
-            self._homie_props.pop(gone, None)
+            # Bookkeeping is dropped whatever the model does, so a teardown can
+            # never leave a corpse in _devices that short-circuits the next
+            # add(). The model may legitimately have moved on already: a consumer
+            # driving remove() from a GROUP_DELETED observer is guaranteed to
+            # arrive after the group is gone, since delete_group removes it
+            # before firing and dispatch is synchronous.
+            try:
+                for group, model_key in self._model_keys.get(gone, []):
+                    if self._model.has_group(group) and self._model.get(group, model_key) is not None:
+                        self._model.delete_property(group, model_key)
+                for group in self._created_groups.get(gone, []):
+                    if self._model.has_group(group) and not self._model.items(group):
+                        self._model.delete_group(group)
+            finally:
+                self._model_keys.pop(gone, None)
+                self._created_groups.pop(gone, None)
+                self._devices.pop(gone, None)
+                self._homie_props.pop(gone, None)
 
     def add_root_capabilities(self, specs: Iterable[PropertySpec], *, model_group: Optional[str] = None) -> dict:
         """Materialize capabilities onto the tree's ROOT device.
@@ -722,6 +771,16 @@ class DeviceTreeBuilder:
     def _defer(self, spec: DeviceSpec) -> None:
         if spec not in self._deferred:
             self._deferred.append(spec)
+
+
+def _descends_from(spec: DeviceSpec, ancestor: DeviceSpec) -> bool:
+    """True when `spec` is `ancestor` or is declared beneath it."""
+    current: Optional[DeviceSpec] = spec
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = current.parent
+    return False
 
 
 def _descendants(device: Device) -> list:
