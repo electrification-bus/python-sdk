@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-08-20
+
 ### Added
 
 - `DeviceTreeBuilder.remove_capabilities()`: the inverse of `extend()`. A capability that becomes relevant at runtime can stop being relevant, and without this its node stayed advertised in `$description` with retained topics behind it. `Device.delete_node()` already clears those and re-announces, so what this closes is the bookkeeping: reaching around the builder to call it left `model_keys` and `created_groups` describing properties that no longer existed, and a later `remove()` working from that stale record. Idempotent like `extend()`, and named for capabilities rather than nodes because that is the declarative vocabulary. ([#78](https://github.com/electrification-bus/python-sdk/issues/78))
@@ -391,6 +393,7 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
 [Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[0.23.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.0
 [0.22.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.22.0
 [0.21.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.21.0
 [0.20.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.20.1
