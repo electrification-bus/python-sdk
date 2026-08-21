@@ -295,14 +295,40 @@ def test_homie_properties_returns_the_twins_like_the_single_device_builder(root)
     assert builder.homie_properties(DeviceSpec("pv", INFO, device_id="pv-1")) == {}
 
 
-def test_specs_are_compared_by_identity(root):
+def test_a_respec_of_the_same_device_id_is_the_same_device(root):
+    """A producer re-deriving its spec set from a manifest makes equal-but-distinct
+    objects on every pass; the builder keys on the device those specs name (GH #74)."""
     model = GroupedPropertyDict()
     builder = DeviceTreeBuilder(root, model)
     a = DeviceSpec("circuit", INFO, device_id="c-1")
     b = DeviceSpec("circuit", INFO, device_id="c-1")
-    assert a != b  # identical fields, still two declarations
-    builder.add(a)
-    assert builder.device_for(b) is None
+    assert a != b  # the dataclass itself is still identity-compared
+
+    device = builder.add(a)
+    assert builder.add(b) is device, "re-deriving the spec set must not build a second device"
+    assert builder.device_for(b) is device
+    assert builder.homie_properties(b) == builder.homie_properties(a)
+    assert root.children_ids() == ["c-1"]
+
+
+def test_a_respec_can_drive_removal(root):
+    """The obligation #74 removes: a caller no longer has to hold the original object."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    builder.add(DeviceSpec("circuit", INFO, device_id="c-1"))
+    builder.remove(DeviceSpec("circuit", INFO, device_id="c-1"))
+    assert root.children_ids() == []
+
+
+def test_a_differing_spec_on_a_built_id_returns_the_existing_device(root):
+    """Documented: add() is idempotent on the device, it does not apply a new
+    capability set. extend() is how a built device grows."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    device = builder.add(DeviceSpec("circuit", INFO, device_id="c-1"))
+    same = builder.add(DeviceSpec("circuit", INFO + METER, device_id="c-1"))
+    assert same is device
+    assert device.get_node("meter") is None  # not applied; use extend()
 
 
 # --- Root capabilities (GH #67) ---------------------------------------------
@@ -526,3 +552,98 @@ def test_a_reentrant_add_from_a_model_observer_does_not_duplicate(root, mock_pah
 
     assert all(d is device for d in seen if d is not None)
     assert root.children_ids() == ["c-1"]
+
+
+# --- Taking a capability away again (GH #78) --------------------------------
+
+
+def test_remove_capabilities_is_the_inverse_of_extend(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    device = builder.device_for(spec)
+    assert device.get_node("shed") is not None
+
+    builder.remove_capabilities(spec, ["shed"])
+
+    # Gone from the tree, from $description, and from the model.
+    assert device.get_node("shed") is None
+    assert "shed" not in device.description()["nodes"]
+    assert model.get("bess-1", "shed-state") is None
+    # What it did not touch is untouched.
+    assert device.get_node("info") is not None
+    assert model.get("bess-1", "serial-number") is not None
+
+
+def test_remove_capabilities_clears_the_retained_topics(root, mock_paho):
+    """The point of going through the builder: delete_node clears them, and
+    reaching around it would leave the bookkeeping describing what is gone."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    model.set_value("bess-1", "shed-state", "SHED")
+
+    before = len(mock_paho.publish.call_args_list)
+    builder.remove_capabilities(spec, ["shed"])
+    after = [c for c in mock_paho.publish.call_args_list[before:] if c.args]
+
+    retractions = [c for c in after if str(c.args[0]).endswith("/shed/shed-state") and c.args[1] == ""]
+    assert retractions, "the retained value topic was left on the broker"
+
+
+def test_remove_capabilities_is_idempotent(root, mock_paho):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.remove_capabilities(spec, ["shed"])
+
+    quiet = len(mock_paho.publish.call_args_list)
+    builder.remove_capabilities(spec, ["shed", "never-had-this"])
+    assert len(mock_paho.publish.call_args_list) == quiet
+
+
+def test_a_capability_can_be_added_removed_and_added_again(root, mock_paho):
+    """The lifecycle the issue describes: relevant, then not, then relevant again."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    shed = [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)]
+
+    builder.extend(spec, shed)
+    builder.remove_capabilities(spec, ["shed"])
+    builder.extend(spec, shed)
+
+    device = builder.device_for(spec)
+    assert device.get_node("shed") is not None
+    model.set_value("bess-1", "shed-state", "SHED")
+    assert builder.homie_properties(spec)[("shed", "shed-state")].value() == "SHED"
+
+
+def test_remove_after_remove_capabilities_stays_consistent(root, mock_paho):
+    """The stale-bookkeeping hazard: remove() must not work from a record of
+    properties that no longer exist."""
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    spec = DeviceSpec("bess", INFO, device_id="bess-1")
+    builder.add(spec)
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.remove_capabilities(spec, ["shed"])
+
+    builder.remove(spec)
+    assert builder.device_for(spec) is None
+    assert "bess-1" not in model.groups()
+    assert root.children_ids() == []
+
+
+def test_remove_capabilities_refuses_an_unbuilt_device(root):
+    model = GroupedPropertyDict()
+    builder = DeviceTreeBuilder(root, model)
+    with pytest.raises(KeyError, match="not built"):
+        builder.remove_capabilities(DeviceSpec("bess", INFO, device_id="nope"), ["shed"])
