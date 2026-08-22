@@ -30,7 +30,15 @@ classifiers = [
 dependencies = [
     # MQTT transport lives in ebus-mqtt-client, which pins paho-mqtt; the SDK
     # does not import paho directly, so paho is a transitive dependency (not
-    # declared here). Floor 0.4.0: it adds the loop-native AsyncioMqttDriver
+    # declared here). Floor 0.5.0: it holds retained QoS 0 publishes issued
+    # before the link is up and flushes them on connect, and stops warning about
+    # each one. That window is one the SDK creates by design, not an edge case: a
+    # root built with mqtt_cfg= connects asynchronously, so a construction-time
+    # state_transition can publish before CONNACK. At the default QoS 2 paho
+    # already queued those, so what 0.5.0 changes there is the warning burst (3
+    # per boot to 0, measured on a Gen3 panel); at QoS 0 it is the difference
+    # between those retained publishes arriving and being dropped. Earlier
+    # floors, still relied on: 0.4.0 adds the loop-native AsyncioMqttDriver
     # (MqttClient.asyncio_driver()), which the bring-your-own-transport section of
     # the README now documents as the answer for a host that forbids paho's
     # background thread; the SDK does not import it, but a consumer following that
@@ -42,7 +50,7 @@ dependencies = [
     # on_disconnect_callback the disconnect hook adopts (SDK-al5); 0.1.8 added the
     # connect_async construction the resilient-connect behavior relies on (older
     # clients raised ConnectionRefusedError on a down broker).
-    "ebus-mqtt-client>=0.4.0",
+    "ebus-mqtt-client>=0.5.0",
 ]
 
 [project.optional-dependencies]
