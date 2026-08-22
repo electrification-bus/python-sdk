@@ -360,7 +360,7 @@ See [`examples/README.md`](examples/README.md) for example scripts demonstrating
 ## Requirements
 
 - Python 3.10+
-- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.4.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.4.0 provides `MqttClient.asyncio_driver()`, the loop-native alternative to paho's background thread; 0.3.0 ships the `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class rather than `Any`; 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; and, since 0.1.8, it carries the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
+- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.5.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.5.0 holds retained QoS 0 publishes issued before the link is up and flushes them on connect, rather than dropping them and warning about each: a root built with `mqtt_cfg=` connects asynchronously, so the SDK itself creates that window whenever a construction-time `state_transition()` publishes before CONNACK; 0.4.0 provides `MqttClient.asyncio_driver()`, the loop-native alternative to paho's background thread; 0.3.0 ships the `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class rather than `Any`; 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; and, since 0.1.8, it carries the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
 
 Optional extras:
 
