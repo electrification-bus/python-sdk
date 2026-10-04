@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge eBus/Homie devices to Home Assistant MQTT discovery (SDK-dn4).
+"""Bridge eBus/Homie devices to Home Assistant MQTT discovery.
 
 End-to-end demonstration and self-check for `ebus_sdk.ha.HaDiscoveryBridge`,
 against a REAL broker but WITHOUT needing a running Home Assistant. It:
