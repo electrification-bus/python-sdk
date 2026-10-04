@@ -13,5 +13,11 @@ def mock_paho():
         mock_instance.is_connected.return_value = True
         mock_instance.subscribe.return_value = (0, 1)  # MQTT_ERR_SUCCESS, msg_id
         mock_instance.publish.return_value = MagicMock(rc=0)  # MQTT_ERR_SUCCESS
+        # Deliver CONNACK when the network loop starts, as real paho does: from
+        # ebus-mqtt-client 0.5.1 a publish reaches paho only once its on_connect
+        # has flushed what was held while the link was down.
+        mock_instance.loop_start.side_effect = lambda: mock_instance.on_connect(
+            mock_instance, None, {"session present": 0}, 0
+        )
         mock_client_cls.return_value = mock_instance
         yield mock_instance
