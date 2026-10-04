@@ -4,6 +4,8 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-10-03
+
 ### Fixed
 
 - `homie.Device.as_dict()` no longer raises `TypeError: unhashable type: 'dict'` for a device with a node: it built each node entry as a set literal, `{node_id, node.as_dict()}`, instead of a dict entry ([#87](https://github.com/electrification-bus/python-sdk/issues/87)).
@@ -412,7 +414,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.23.1...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.24.0
 [0.23.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.1
 [0.23.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.0
 [0.22.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.22.0
