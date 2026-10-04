@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- `homie.Device.as_dict()` no longer raises `TypeError: unhashable type: 'dict'` for a device with a node: it built each node entry as a set literal, `{node_id, node.as_dict()}`, instead of a dict entry ([#87](https://github.com/electrification-bus/python-sdk/issues/87)).
+
 ### Changed
 
 - `ebus-mqtt-client` floor raised to 0.6.0. It holds every publish issued while the link is down and flushes it before the SDK's on-connect republish; 0.5.0 left QoS 1 and 2 publishes to paho, which replayed them after that republish and past mosquitto's 20-message receive quota, and mosquitto discarded the excess QoS 2 messages. A root built with `mqtt_cfg=` publishes during construction, before CONNACK, so `simple-device` and `simple-tree-device` ended with the root's retained `$state` on `init` instead of `ready` ([electrification-bus/ebus-mqtt-client#20](https://github.com/electrification-bus/ebus-mqtt-client/issues/20)).

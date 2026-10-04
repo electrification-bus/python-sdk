@@ -1687,7 +1687,7 @@ class Device:
     def as_dict(self) -> dict:
         nodes = {}
         for node_id, node in self.nodes().items():
-            nodes.update({node_id, node.as_dict()})
+            nodes[node_id] = node.as_dict()
         return {
             "id": self.id(),
             "name": self.name(),

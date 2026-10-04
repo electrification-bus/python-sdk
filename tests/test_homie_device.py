@@ -1144,6 +1144,15 @@ class TestNodeDescription:
         assert d["name"] == "Core"
         assert "temp" in d["properties"]
 
+    def test_device_as_dict_keys_nodes_by_id(self):
+        # GH #87: a set literal here raised TypeError for any device with a node.
+        dev = Device(id="d1", name="D", type="t", mqttc=_mock_mqtt_client())
+        dev.add_node(Node(id="core", name="Core", type="sensor"))
+        d = dev.as_dict()
+        assert d["id"] == "d1"
+        assert list(d["nodes"]) == ["core"]
+        assert d["nodes"]["core"]["id"] == "core"
+
 
 class TestNodeClearAllProperties:
     def test_clear_all_properties(self):
