@@ -14,7 +14,7 @@ Basic Homie device that publishes sensor data (temperature, humidity, air pressu
 
 ### simple-tree-device
 
-A parent/child device TREE over one MQTT connection: a root `distribution-enclosure` (`panel-1`) with circuit and BESS children and a MID grandchild, all sharing the root's single connection. It shows building the tree inside one `with root.state_transition():` (so the root publishes one INIT->READY for the whole tree, not one per child), a settable property on a child whose `/set` routes back over the shared connection, and the per-device topics each tree node publishes under. Reach for this over `simple-device` when you need to model a device that contains sub-devices. `--check` builds the tree, logs its structure, and exits (it works even with the broker down, since connect is asynchronous).
+A parent/child device TREE over one MQTT connection: a root `distribution-enclosure` (`panel-1`) with circuit and BESS children and a MID grandchild, all sharing the root's single connection. It shows building the tree inside one `with root.state_transition():` (so the root publishes one INIT->READY for the whole tree, not one per child), a settable property on a child whose `/set` routes back over the shared connection, and the per-device topics each tree node publishes under. Reach for this over `simple-device` when you need to model a device that contains sub-devices. `--check` builds the tree, logs the root and its direct children, and exits (it works even with the broker down, since connect is asynchronous).
 
 ```bash
 ./simple-tree-device --config /path/to/broker-cfg.json
@@ -23,7 +23,7 @@ A parent/child device TREE over one MQTT connection: a root `distribution-enclos
 
 ### utility-meter
 
-Publishes a single eBus utility-meter device (`energy.ebus.device.utility-meter`, per the Electrification Bus `data-models/utility-meter.md`, v0.3) with the data model's capabilities: the required `info` / `meter` / `status` plus the optional `grid` / `doe` / `price` / `demand` / `power-quality` a meter publishes when it has the signal. The `doe` and `price` capabilities are `json` properties (`doe/import-limit`/`export-limit`, `price/import-price`/`export-price`), each a JSON array of time-windowed objects that advertises its schema as a `$format` JSONSchema; enum properties advertise their allowed values via `$format`. A local HTTP endpoint stands in for the utility's out-of-band backhaul for runtime doe/price updates, validating each posted body against the property's `$format` before publish (install the `validation` extra to enable it: `pip install 'ebus-sdk[validation]'`).
+Publishes a single eBus utility-meter device (`energy.ebus.device.utility-meter`, per the Electrification Bus `devices/utility-meter.md`, written against v0.3 of that data model) with the data model's capabilities: the required `info` / `meter` / `status` plus the optional `grid` / `doe` / `price` / `demand` / `power-quality` a meter publishes when it has the signal. The `doe` and `price` capabilities are `json` properties (`doe/import-limit`/`export-limit`, `price/import-price`/`export-price`), each a JSON array of time-windowed objects that advertises its schema as a `$format` JSONSchema; enum properties advertise their allowed values via `$format`. A local HTTP endpoint stands in for the utility's out-of-band backhaul for runtime doe/price updates, validating each posted body against the property's `$format` before publish (install the `validation` extra to enable it: `pip install 'ebus-sdk[validation]'`).
 
 ```bash
 ./utility-meter --config ./utility-meter-cfg.example.json --broker-config /path/to/broker-cfg.json
@@ -105,14 +105,16 @@ Bridges eBus/Homie devices to Home Assistant MQTT discovery (the reverse of the 
 ./ha-discovery-bridge --keep-running  # leave it up for a real HA to consume
 ```
 
-No broker handy? A throwaway local one works: `mosquitto -c <(printf 'listener 1883 127.0.0.1\nallow_anonymous true\n')`, then run with no `--config`.
+No broker handy? A throwaway local one works: `printf 'listener 1883 127.0.0.1\nallow_anonymous true\n' > /tmp/mosquitto.conf && mosquitto -c /tmp/mosquitto.conf`, then run with no `--config`. (mosquitto 2.x refuses a process-substitution path such as `-c <(...)`.)
 
 ## Configuration
 
-All examples accept broker configuration via:
+`simple-device`, `simple-tree-device`, `simple-controller`, and `ha-discovery-bridge` accept broker configuration via:
 
 1. **Command line**: `--config /path/to/broker-cfg.json`
 2. **Environment variable**: `EBUS_BROKER_CFG=/path/to/broker-cfg.json`
+
+`utility-meter` takes the broker config as `-b` / `--broker-config` (its `--config` is the meter config), also defaulting to `EBUS_BROKER_CFG`. `simple-span-controller` builds its own config from the panel serial number, password, and mDNS.
 
 ### Broker Config Format
 

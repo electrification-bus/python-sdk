@@ -3,8 +3,9 @@
 utility-meter — eBus utility-meter publisher reference implementation.
 
 Publishes a single eBus utility-meter device
-(`energy.ebus.device.utility-meter`, per `data-models/utility-meter.md`
-in the Electrification Bus specification, v0.3) to an MQTT broker, exposing
+(`energy.ebus.device.utility-meter`, per `devices/utility-meter.md` in the
+Electrification Bus specification, written against v0.3 of that data model)
+to an MQTT broker, exposing
 the data model's capabilities: the required `info`, `meter`, and `status`,
 plus the optional `grid`, `doe`, `price`, `demand`, and `power-quality` a
 meter publishes when it has the signal. The `doe` and `price` json properties
@@ -38,7 +39,7 @@ Meter measurements (`meter/active-power`, etc.) are synthesised from a config
 file — this is a publisher reference, not a metrology device.
 
 Usage:
-    ./utility-meter --config /path/to/meter-cfg.json
+    ./utility-meter --config /path/to/meter-cfg.json --broker-config /path/to/broker-cfg.json
 
 See `utility-meter-cfg.example.json` for the config schema.
 """
@@ -70,7 +71,7 @@ DEFAULT_BROKER_CFG_ENV = "EBUS_BROKER_CFG"
 # eBus utility-meter device type per the data model.
 DEVICE_TYPE = "energy.ebus.device.utility-meter"
 
-# Capability node types (the eBus utility-meter data model, v0.3: three MUST
+# Capability node types (devices/utility-meter.md, v0.3: three MUST
 # capabilities plus five optional ones a meter publishes when it has the signal).
 CAPABILITY_INFO = "energy.ebus.capability.info"
 CAPABILITY_METER = "energy.ebus.capability.meter"
@@ -156,9 +157,10 @@ class UtilityMeter:
     Knows nothing about MQTT — the adapter below translates this state to
     Homie/eBus topics.
 
-    Values change via `set_doe_*` methods (driven by the HTTP DOE endpoint)
-    and via `tick()` (driven by a periodic thread that simulates meter
-    measurement updates). Subscribers register callbacks via
+    Values change via `set_doe_*` methods (driven by the HTTP DOE endpoint).
+    A periodic thread also calls `tick()`, which is an unimplemented stub, so
+    meter measurements stay at their configured values. Subscribers register
+    callbacks via
     `add_property_on_change_callback`.
     """
 
@@ -433,7 +435,8 @@ class UtilityMeterAdapter:
     Translates a UtilityMeter to a Homie 5 device on the eBus broker.
 
     Creates one root device of type `energy.ebus.device.utility-meter` with
-    four capability nodes (`info`, `meter`, `status`, `doe`). Each Homie
+    eight capability nodes (`info`, `meter`, `status`, `grid`, `doe`, `price`,
+    `demand`, `power-quality`). Each Homie
     property is mirrored from the corresponding UtilityMeter property via a
     callback.
     """
@@ -778,7 +781,7 @@ def main():
         "--tick-interval",
         type=float,
         default=5.0,
-        help="Synthetic-update interval seconds (default: 5.0).",
+        help="Interval in seconds for tick(), currently an unimplemented stub (default: 5.0).",
     )
     args = parser.parse_args()
 

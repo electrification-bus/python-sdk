@@ -124,7 +124,9 @@ def build_tree(mqtt_cfg: dict, logger: logging.Logger) -> homie.Device:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Example parent/child Homie device tree")
     parser.add_argument("-c", "--config", help="Path to broker config JSON (or set EBUS_BROKER_CFG env var)")
-    parser.add_argument("--check", action="store_true", help="Build the tree, log its structure, and exit")
+    parser.add_argument(
+        "--check", action="store_true", help="Build the tree, log the root and its direct children, and exit"
+    )
     args = parser.parse_args()
 
     config_file = args.config or os.environ.get("EBUS_BROKER_CFG")
