@@ -30,7 +30,15 @@ classifiers = [
 dependencies = [
     # MQTT transport lives in ebus-mqtt-client, which pins paho-mqtt; the SDK
     # does not import paho directly, so paho is a transitive dependency (not
-    # declared here). Floor 0.5.0: it holds retained QoS 0 publishes issued
+    # declared here). Floor 0.6.0: it holds every publish issued while the link
+    # is down (retained at any QoS, newest per topic) and flushes it before
+    # on_connect, where 0.5.0 left QoS 1 and 2 to paho. paho replayed those on
+    # CONNACK uncapped and after the SDK's on-connect refresh_tree, so an older
+    # value could overwrite the fresh one, and mosquitto discarded QoS 2 messages
+    # past its 20-message receive quota; the discard left simple-device's and
+    # simple-tree-device's root $state on init instead of ready
+    # (electrification-bus/ebus-mqtt-client#20). Earlier floors, still relied
+    # on: 0.5.0 holds retained QoS 0 publishes issued
     # before the link is up and flushes them on connect, and stops warning about
     # each one. That window is one the SDK creates by design, not an edge case: a
     # root built with mqtt_cfg= connects asynchronously, so a construction-time
@@ -50,7 +58,7 @@ dependencies = [
     # on_disconnect_callback the disconnect hook adopts (SDK-al5); 0.1.8 added the
     # connect_async construction the resilient-connect behavior relies on (older
     # clients raised ConnectionRefusedError on a down broker).
-    "ebus-mqtt-client>=0.5.0",
+    "ebus-mqtt-client>=0.6.0",
 ]
 
 [project.optional-dependencies]

@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- `ebus-mqtt-client` floor raised to 0.6.0. It holds every publish issued while the link is down and flushes it before the SDK's on-connect republish; 0.5.0 left QoS 1 and 2 publishes to paho, which replayed them after that republish and past mosquitto's 20-message receive quota, and mosquitto discarded the excess QoS 2 messages. A root built with `mqtt_cfg=` publishes during construction, before CONNACK, so `simple-device` and `simple-tree-device` ended with the root's retained `$state` on `init` instead of `ready` ([electrification-bus/ebus-mqtt-client#20](https://github.com/electrification-bus/ebus-mqtt-client/issues/20)).
+
 ## [0.23.1] — 2026-08-21
 
 ### Fixed
@@ -404,7 +408,7 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.23.1...HEAD
 [0.23.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.1
 [0.23.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.0
 [0.22.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.22.0
