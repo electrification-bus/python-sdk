@@ -19,7 +19,6 @@ from pprint import pformat
 
 
 class ExampleDevice:
-
     def __init__(self, logger: Optional[logging.Logger] = None):
         # Set up logger
         if logger is None:
@@ -29,9 +28,7 @@ class ExampleDevice:
             # Prevent duplicate handlers if multiple instances are created
             if not logger.handlers:
                 handler = logging.StreamHandler()
-                formatter = logging.Formatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                )
+                formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
                 handler.setFormatter(formatter)
                 logger.addHandler(handler)
         self._logger = logger
@@ -54,9 +51,7 @@ class ExampleDevice:
     def get_property(self, group: str, property_id: str) -> Property:
         return self._props.get(group, property_id)
 
-    def add_property_on_change_callback(
-        self, group: str, id: str, callback: Callable
-    ) -> uuid.UUID:
+    def add_property_on_change_callback(self, group: str, id: str, callback: Callable) -> uuid.UUID:
         """
         Adds a callback to the Property group.id, that will be called when the Property's value changes
         Returns a callback_id (a uuid1) that can be used subsequently to remove the callback
@@ -73,7 +68,6 @@ class ExampleDevice:
 
 
 class ExampleDeviceAdapter:
-
     def __init__(
         self,
         example_device: Any,
@@ -88,9 +82,7 @@ class ExampleDeviceAdapter:
             # Prevent duplicate handlers if multiple instances are created
             if not logger.handlers:
                 handler = logging.StreamHandler()
-                formatter = logging.Formatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                )
+                formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
                 handler.setFormatter(formatter)
                 logger.addHandler(handler)
         self._logger = logger
@@ -171,12 +163,8 @@ class ExampleDeviceAdapter:
         for homie_property_id, mapping_dict in properties.items():
             group = mapping_dict.get("group", "sensors")
             py_property_id = mapping_dict.get("py_property_id", None)
-            self._logger.debug(
-                f"reason=addHomieEnvironment,pyPropertyId={py_property_id}"
-            )
-            self._logger.info(
-                f"reason=addHomieEnvironmentNode,group={group},pyPropertyId={py_property_id}"
-            )
+            self._logger.debug(f"reason=addHomieEnvironment,pyPropertyId={py_property_id}")
+            self._logger.info(f"reason=addHomieEnvironmentNode,group={group},pyPropertyId={py_property_id}")
             property = self._example_device.get_property(group, py_property_id)
             property_type = property.type()
             homie_datatype_from_property = None
@@ -211,9 +199,7 @@ class ExampleDeviceAdapter:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Example Homie device that publishes sensor data"
-    )
+    parser = argparse.ArgumentParser(description="Example Homie device that publishes sensor data")
     parser.add_argument(
         "-c",
         "--config",
@@ -225,17 +211,13 @@ def main():
     config_file = args.config or os.environ.get("EBUS_BROKER_CFG")
     if not config_file:
         print("Error: No broker config file specified.")
-        print(
-            "Provide config via --config option or EBUS_BROKER_CFG environment variable."
-        )
+        print("Provide config via --config option or EBUS_BROKER_CFG environment variable.")
         print()
         print("Example config file format:")
         print("  {")
         print('    "host": "mqtt.example.com",')
         print('    "port": 1883,')
-        print(
-            '    "authentication": {"type": "USER_PASS", "username": "user", "password": "pass"}'
-        )
+        print('    "authentication": {"type": "USER_PASS", "username": "user", "password": "pass"}')
         print("  }")
         sys.exit(1)
 
@@ -254,9 +236,7 @@ def main():
 
     example_device = ExampleDevice(logger=example_device_logger)
     example_device_logger.info(f"\n{pformat(example_device.as_dict())}")
-    example_device_adapter = ExampleDeviceAdapter(
-        example_device, mqtt_cfg, logger=example_device_adapter_logger
-    )
+    example_device_adapter = ExampleDeviceAdapter(example_device, mqtt_cfg, logger=example_device_adapter_logger)
     example_device_adapter_logger.info(f"\n{pformat(example_device_adapter.as_dict())}")
     # Wait forever for event that will never come
     event = threading.Event()
