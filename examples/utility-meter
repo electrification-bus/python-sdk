@@ -706,48 +706,80 @@ def start_tick_thread(meter: UtilityMeter, interval_s: float) -> threading.Event
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 
-def _discover_broker(timeout: float, log: logging.Logger) -> Optional[tuple]:
-    """Discover an eBus broker over mDNS (`_secure-mqtt._tcp`).
+def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logger) -> Optional[Dict[str, Any]]:
+    """Discover an eBus broker over mDNS with ebus-service-discovery.
 
-    Returns (host, port) from the advertisement, preferring the spec `broker`
-    TXT record (the `<host>.local` name the broker's cert SAN covers) and
-    falling back to the SRV target. Returns None on timeout. Requires the
-    optional `mdns` extra (zeroconf).
+    Returns a copy of `mqtt_cfg` with the discovered broker's host, port and
+    `use_tls` (the host is the advertised `broker` TXT value, the name the
+    broker's certificate covers, else the SRV target), or None when no broker
+    is found within `timeout` seconds. A TLS config accepts only
+    `_secure-mqtt._tcp`. When the config names a `host`, a discovered broker
+    with that host is preferred among several. Requires the `mdns` extra.
     """
     try:
-        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+        from ebus_service_discovery import mdns
+        from ebus_service_discovery.ebus import RetrySchedule
     except ImportError:
         log.error("discovery needs the 'mdns' extra: pip install 'ebus-sdk[mdns]'")
         return None
 
-    service_type = "_secure-mqtt._tcp.local."
-    found = threading.Event()
-    result: Dict[str, Any] = {}
-
-    class _Listener(ServiceListener):
-        def add_service(self, zc, type_, name):
-            info = zc.get_service_info(type_, name, timeout=3000)
-            if info is None:
-                return
-            broker = info.properties.get(b"broker")
-            result["host"] = broker.decode() if broker else info.server.rstrip(".")
-            result["port"] = info.port or 8883
-            found.set()
-
-        def update_service(self, zc, type_, name):
-            self.add_service(zc, type_, name)
-
-        def remove_service(self, zc, type_, name):
-            pass
-
-    zc = Zeroconf()
-    ServiceBrowser(zc, service_type, _Listener())
+    mode = "discovery-with-fallback" if mqtt_cfg.get("host") else "discovery-only"
+    stop = threading.Event()
+    timer = threading.Timer(timeout, stop.set)
+    timer.daemon = True
+    timer.start()
     try:
-        if found.wait(timeout):
-            return result["host"], result["port"]
-        return None
+        endpoint = mdns.find_broker(
+            mode,
+            base_cfg=mqtt_cfg,
+            stop=stop,
+            # Browse back to back until `timeout`; the timer, not the
+            # library's attempt count, decides when to give up.
+            schedule=RetrySchedule(fast_attempts=sys.maxsize, fast_interval=0.0),
+            browse_timeout=min(3.0, timeout),
+        )
     finally:
-        zc.close()
+        timer.cancel()
+    if endpoint is None:
+        return None
+    return endpoint.mqtt_cfg(mqtt_cfg)
+
+
+def _identity_from_info(device_id: str, info: Dict[str, Any]):
+    """The `_ebus._tcp` / `_device-info._tcp` identity from the meter's `info` config."""
+    from ebus_service_discovery.ebus import Identity
+
+    return Identity(
+        device_ids=[device_id],
+        roles=["device"],
+        manufacturer=str(info.get("vendor-name") or "unknown"),
+        model=str(info.get("model") or "unknown"),
+        serial_number=str(info.get("serial-number") or device_id),
+        fw_version=str(info["firmware-version"]) if info.get("firmware-version") else None,
+        device_type=DEVICE_TYPE,
+    )
+
+
+def _start_advertiser(device_id: str, info: Dict[str, Any], log: logging.Logger):
+    """Advertise `_ebus._tcp` and `_device-info._tcp` (framework.md requirement 6).
+
+    Returns the running `mdns.Advertiser`, or None when the `mdns` extra is not
+    installed or advertising fails; the meter runs either way.
+    """
+    try:
+        from ebus_service_discovery import mdns
+    except ImportError:
+        log.warning("reason=advertiseSkipped,detail=mdns extra not installed (pip install 'ebus-sdk[mdns]')")
+        return None
+    try:
+        # Named for the device: on macOS the OS already advertises a
+        # `_device-info._tcp` instance under the host label, the default name.
+        advertiser = mdns.Advertiser(_identity_from_info(device_id, info), instance_name=device_id).start()
+    except Exception as exc:
+        log.warning("reason=advertiseFailed,error=%s", exc)
+        return None
+    log.info("reason=advertising,instance=%s,server=%s", advertiser.instance_name, advertiser.server)
+    return advertiser
 
 
 def main():
@@ -766,15 +798,22 @@ def main():
     parser.add_argument(
         "--discover",
         action="store_true",
-        help="Discover the broker over mDNS (_secure-mqtt._tcp) and use the "
-        "advertised host/port, overriding 'host'/'port' in the broker config. "
-        "The broker config still supplies the TLS material.",
+        help="Discover the broker over mDNS and use the advertised host/port, "
+        "overriding 'host'/'port' in the broker config. A TLS broker config "
+        "accepts only _secure-mqtt._tcp. The broker config still supplies the "
+        "TLS material and credentials.",
     )
     parser.add_argument(
         "--discover-timeout",
         type=float,
         default=8.0,
         help="Seconds to wait for mDNS broker discovery (default: 8.0).",
+    )
+    parser.add_argument(
+        "--no-advertise",
+        action="store_true",
+        help="Do not advertise _ebus._tcp / _device-info._tcp over mDNS "
+        "(advertised by default when the mdns extra is installed).",
     )
     parser.add_argument(
         "--doe-port",
@@ -812,9 +851,9 @@ def main():
     # eBus broker-discovery flow. The broker config still supplies the TLS
     # material; discovery only fills in where to connect.
     if args.discover:
-        endpoint = _discover_broker(args.discover_timeout, log)
-        if endpoint is not None:
-            mqtt_cfg["host"], mqtt_cfg["port"] = endpoint
+        discovered = _discover_broker(mqtt_cfg, args.discover_timeout, log)
+        if discovered is not None:
+            mqtt_cfg = discovered
             log.info(
                 "reason=brokerDiscovered,host=%s,port=%d",
                 mqtt_cfg["host"],
@@ -848,6 +887,7 @@ def main():
     )
     start_doe_endpoint(meter, args.doe_port)
     start_tick_thread(meter, args.tick_interval)
+    advertiser = None if args.no_advertise else _start_advertiser(device_id, meter_cfg.get("info", {}), log)
 
     log.info(
         "reason=utilityMeterReady,deviceId=%s,deviceType=%s",
@@ -860,6 +900,8 @@ def main():
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
+        if advertiser is not None:
+            advertiser.stop()
         adapter.stop()
         raise
 

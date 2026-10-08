@@ -335,6 +335,8 @@ src/ebus_sdk/
 
 MQTT transport lives in the separate [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) package; this SDK depends on it.
 
+mDNS broker discovery and `_ebus._tcp` / `_device-info._tcp` advertising live in the separate [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) package (`find_broker`, `Advertiser`); the examples use it through the `mdns` extra.
+
 ### homie.py
 
 Core Homie convention implementation:
@@ -405,7 +407,7 @@ See [`examples/README.md`](examples/README.md) for example scripts demonstrating
 
 Optional extras:
 
-- `mdns` (`zeroconf`) — mDNS broker discovery, used by the SPAN Panel controller example and by `utility-meter --discover`
+- `mdns` (`ebus-service-discovery[zeroconf]`): mDNS broker discovery and advertising, used by the SPAN Panel controller example, by `utility-meter --discover`, and by `utility-meter`'s `_ebus._tcp` / `_device-info._tcp` advertisement
 - `validation` (`jsonschema`) — `$format` JSONSchema validation for `json`-datatype properties; absent it, validation is gracefully skipped
 
 ## Releases

@@ -31,11 +31,13 @@ Publishes a single eBus utility-meter device (`energy.ebus.device.utility-meter`
 
 **Need a broker to run against?** [`broker-quickstart`](https://github.com/electrification-bus/broker-quickstart) brings up a local eBus broker on macOS with one command (`python -m laptop.run`), including the mDNS advertisement that `--discover` (below) resolves. Its `scripts/laptop-bench.sh` runs this simulator against that broker with `--discover`, end to end; see the [laptop quickstart](https://github.com/electrification-bus/broker-quickstart/blob/main/docs/laptop-quickstart.md).
 
-Add `--discover` to find the broker over mDNS (`_secure-mqtt._tcp`) instead of using the `host`/`port` in the broker config; the broker config still supplies the TLS material. Needs the `mdns` extra (`pip install 'ebus-sdk[mdns]'`):
+Add `--discover` to find the broker over mDNS, with [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery), instead of using the `host`/`port` in the broker config; the broker config still supplies the TLS material and credentials. A TLS broker config accepts only `_secure-mqtt._tcp`; a plain one accepts `_secure-mqtt._tcp` or `_mqtt._tcp`. When the config also names a `host`, a discovered broker with that host is preferred, and the config's `host` is the fallback after `--discover-timeout` seconds. Needs the `mdns` extra (`pip install 'ebus-sdk[mdns]'`):
 
 ```bash
 ./utility-meter --config ./utility-meter-cfg.example.json --broker-config /path/to/broker-cfg.json --discover
 ```
+
+With the `mdns` extra installed, the meter also advertises `_ebus._tcp` and `_device-info._tcp` (role `device`; manufacturer, model, serial number and firmware version from the config's `info`), as the eBus framework requires of every entity. `--no-advertise` turns this off. On a host with several network interfaces, see [electrification-bus/python-service-discovery#3](https://github.com/electrification-bus/python-service-discovery/issues/3).
 
 Set a DOE envelope at runtime. The body is a single envelope object or an array of them (the retained schedule); it is set atomically as one `json` value:
 
@@ -60,6 +62,8 @@ Discovers eBus devices and walks them as a TREE (roots then descendants), the cu
 ### simple-span-controller
 
 Connects to a live SPAN panel via mDNS + MQTTS and determines whether the home is islanded from the grid, watching the MID child's `grid` capability (`islanding-state` / `grid-state` / `grid-forming-entity`) plus the enclosure's `power-flows`. Targets the current parent/child data model (the legacy flat `core/dominant-power-source` is retired).
+
+Discovery accepts only the `_secure-mqtt._tcp` advertisement whose host is `span-<serial-number>.local`, so another broker on the network never receives this panel's credentials, and connects by host name rather than by IP address. If the panel is not heard within 5 s, it connects to `span-<serial-number>.local` directly.
 
 Requires the `mdns` extra:
 
