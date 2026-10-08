@@ -114,11 +114,13 @@ class _Seeder:
     def pub(self, topic, payload):
         self.infos.append(self.client.publish(topic, payload, qos=1, retain=True))
 
-    def device(self, device_id, properties, children=None, root=None):
+    def device(self, device_id, properties, children=None, root=None, targets=False):
         self.pub(f"{BASE}/{device_id}/$description", json.dumps(_description(device_id, properties, children, root)))
         for n in range(NODES_PER_DEVICE):
             for p in range(properties // NODES_PER_DEVICE):
                 self.pub(f"{BASE}/{device_id}/node-{n}/p{p:03d}", str(n * 1000 + p))
+                if targets:
+                    self.pub(f"{BASE}/{device_id}/node-{n}/p{p:03d}/$target", str(n * 1000 + p))
         self.pub(f"{BASE}/{device_id}/$state", "ready")
 
     def close(self):
@@ -130,14 +132,14 @@ class _Seeder:
             self.client.disconnect()
 
 
-def _seed_tree(port, properties, silent_children=0):
-    """A root declaring `silent_children` children that never publish, then CHILDREN real ones."""
+def _seed_tree(port, properties, silent_children=0, targets=False, children=CHILDREN):
+    """A root declaring `silent_children` children that never publish, then `children` real ones."""
     seeder = _Seeder(port)
     try:
-        children = [f"busy-child-{i:02d}" for i in range(CHILDREN)]
+        children = [f"busy-child-{i:02d}" for i in range(children)]
         silent = [f"silent-child-{i:02d}" for i in range(silent_children)]
         for child in children:
-            seeder.device(child, properties, root=ROOT_ID)
+            seeder.device(child, properties, root=ROOT_ID, targets=targets)
         seeder.device(ROOT_ID, 0, children=silent + children)
     finally:
         seeder.close()
@@ -223,5 +225,70 @@ def test_state_only_leftovers_do_not_stall_a_quiet_wildcard_bus(broker):
     try:
         ctrl.start_discovery()
         _await_discovery(ctrl, devices, 60, timeout=8.0)
+    finally:
+        ctrl.stop()
+
+
+def _targets(ctrl, device_id):
+    device = ctrl.get_device(device_id)
+    return 0 if device is None else sum(len(t) for t in device.property_targets.values())
+
+
+def test_retained_targets_of_a_busy_tree_all_arrive(broker):
+    """Every property also carries a retained $target, doubling each device's burst."""
+    children = _seed_tree(broker, 150, targets=True)
+    ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker}, root_device_id=ROOT_ID)
+    try:
+        ctrl.start_discovery()
+        _await_discovery(ctrl, children, 150)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and sum(_targets(ctrl, c) for c in children) < 150 * CHILDREN:
+            time.sleep(0.1)
+        assert sum(_targets(ctrl, c) for c in children) == 150 * CHILDREN
+    finally:
+        ctrl.stop()
+
+
+def test_devices_larger_than_the_broker_queue_are_discovered_on_a_quiet_tree(broker):
+    """Each child alone overflows the per-client queue, so it is subscribed node by node.
+
+    Nothing publishes after seeding and nobody calls check_stuck_children().
+    """
+    children = _seed_tree(broker, 1500, children=3)
+    ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker}, root_device_id=ROOT_ID)
+    try:
+        ctrl.start_discovery()
+        _await_discovery(ctrl, children, 1500, timeout=20.0)
+    finally:
+        ctrl.stop()
+
+
+def test_child_that_appears_after_giving_up_gets_its_values(broker):
+    """A declared child silent past the stuck-check retries, then published, gets its property values."""
+    seeder = _Seeder(broker)
+    try:
+        seeder.device(ROOT_ID, 0, children=["late-child"])
+    finally:
+        seeder.close()
+    ctrl = Controller(
+        mqtt_cfg={"host": "127.0.0.1", "port": broker},
+        root_device_id=ROOT_ID,
+        stuck_device_timeout=0.2,
+        max_resubscribe_attempts=1,
+    )
+    try:
+        ctrl.start_discovery()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (
+            "late-child" not in ctrl.devices or "late-child" in ctrl._awaiting_attributes
+        ):
+            time.sleep(0.05)
+        assert "late-child" not in ctrl._awaiting_attributes  # given up
+        seeder = _Seeder(broker)
+        try:
+            seeder.device("late-child", 6, root=ROOT_ID)
+        finally:
+            seeder.close()
+        _await_discovery(ctrl, ["late-child"], 6, timeout=5.0)
     finally:
         ctrl.stop()

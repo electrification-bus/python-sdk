@@ -111,6 +111,8 @@ controller.set_on_tree_ready_callback(lambda root: snapshot(root.device_id))
 
 `is_tree_complete(root_id)` walks the declared tree and returns whether every device named transitively under it has published its own `$description`. It is safe to call at any time, as often as you like, and it will **flip back to False** when a device declares a new child. That is not a defect; it is the open child set showing through.
 
+Described means `$description`, not values. With the `Controller`'s default subscription pacing, each descendant's retained property values arrive after its `$description`, so on the tree-ready edge most of them may not have arrived yet. Read values from `on_property_changed`, or wait for the properties you need.
+
 `set_on_tree_ready_callback()` fires on the incomplete-to-complete edge and **re-arms**: a root that grows a new child fires again once that child describes itself. A tree commissioned in stages produces one call per settled shape rather than one call ever.
 
 Read that re-arming as a warning. If you take the first call as a barrier and stop listening, you have rebuilt the one-shot barrier from failure mode 1 out of the very API meant to prevent it. Handle every call.
