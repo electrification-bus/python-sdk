@@ -200,7 +200,10 @@ class TestDeletedDeviceStaysDeleted:
         root.stop()
 
         assert not [t for t, _ in _publishes(client) if t.endswith("/$state")]
-        client.publish_and_flush.assert_not_called()
+        # The only flushed publish re-clears the root's $state, so delete()'s queued
+        # clears reach the broker before the disconnect.
+        client.publish_and_flush.assert_called_once()
+        assert client.publish_and_flush.call_args.args[:2] == (f"{BASE}/root/$state", "")
         client.stop.assert_called_once()
 
     def test_delete_then_silent_stop_disconnects_cleanly(self):

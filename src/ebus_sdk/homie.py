@@ -2390,6 +2390,12 @@ class Device:
         owned = root._owns_client and root._owned_client is not None
         if root._deleted:
             logger.info(f"reason=deviceStopDeletedTreeSilent,id={root._id}")
+            if owned and mqttc.is_connected():
+                # Nothing to announce, but delete()'s retained clears may still be in
+                # flight. Re-clearing the root's $state (a no-op deletion) is flushed,
+                # and with it everything queued before it, ahead of the disconnect.
+                state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
+                root._owned_client.publish_and_flush(state_topic, "", qos=root._qos, retain=True, timeout=flush_timeout)
         elif not announce:
             logger.info(f"reason=deviceStopSilent,id={root._id}")
             if owned:
