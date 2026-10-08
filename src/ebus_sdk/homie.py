@@ -3702,6 +3702,7 @@ class Controller:
         subscription_batch_values: Optional[int] = CONTROLLER_SUBSCRIPTION_BATCH_VALUES,
         stuck_device_timeout: Optional[float] = CONTROLLER_STUCK_DEVICE_TIMEOUT,
         max_resubscribe_attempts: int = CONTROLLER_MAX_RESUBSCRIBE_ATTEMPTS,
+        stuck_check_thread: Optional[bool] = None,
     ):
         """
         Initialize a Homie Controller
@@ -3756,13 +3757,20 @@ class Controller:
                 its $state and $description filters are unsubscribed and
                 resubscribed so the broker resends them, or it gives up its slot
                 and waits for another. Message handling runs this check at most
-                once a second, and so does a timer thread for a client the SDK
-                builds; see check_stuck_children(). None disables the automatic
-                check.
+                once a second, and so does a timer thread when
+                ``stuck_check_thread`` allows it; see check_stuck_children().
+                None disables the automatic check and the thread.
             max_resubscribe_attempts: Retries per stuck device before it is
                 logged as unrecoverable and no longer checked. 0 only logs. A
                 slot holder whose retry received no more than the attempt
                 before it is not retried again.
+            stuck_check_thread: Whether start_discovery() starts the daemon
+                thread "ebus-controller-stuck-check" that runs the stuck check
+                on a quiet connection. None (default) starts it only for a
+                client the SDK builds. False never starts it: the caller drives
+                check_stuck_children(), and message handling still runs the
+                check. True starts it for an injected ``mqttc`` too. stop()
+                ends the thread.
         """
         if device_id is not None and root_device_id is not None:
             raise ValueError(
@@ -3810,6 +3818,7 @@ class Controller:
         self._subscription_batch_values = subscription_batch_values
         self._stuck_device_timeout = stuck_device_timeout
         self._max_resubscribe_attempts = max_resubscribe_attempts
+        self._stuck_check_thread = mqttc is None if stuck_check_thread is None else stuck_check_thread
         self._pacing_lock = threading.RLock()
         # Stage one, {device_id: _SubscriptionWatch}: awaiting $state and $description.
         self._awaiting_attributes: dict = {}
@@ -3822,7 +3831,7 @@ class Controller:
         # {device_id: _ALL_NODES or set of node ids}: whose property filters are subscribed.
         self._property_coverage: dict = {}
         self._last_stuck_check = time.monotonic()
-        # Drives the stuck check for a client the SDK owns, so a quiet connection heals.
+        # Drives the stuck check when _stuck_check_thread is set, so a quiet connection heals.
         self._stuck_timer: Optional[threading.Thread] = None
         self._stuck_timer_stop = threading.Event()
 
@@ -4047,12 +4056,12 @@ class Controller:
         self._start_stuck_timer()
 
     def _start_stuck_timer(self) -> None:
-        """Run the stuck check from a timer thread when the SDK owns the client.
+        """Run the stuck check from a timer thread when ``stuck_check_thread`` allows it.
 
-        An injected client's caller owns its event loop and threads, so it calls
-        check_stuck_children() itself.
+        By default an injected client's caller owns its event loop and threads, so it
+        calls check_stuck_children() itself.
         """
-        if not self._owns_client or self._stuck_device_timeout is None:
+        if not self._stuck_check_thread or self._stuck_device_timeout is None:
             return
         if self._stuck_timer is not None and self._stuck_timer.is_alive():
             return
@@ -4329,9 +4338,10 @@ class Controller:
 
         Message handling calls this at most once a second when
         ``stuck_device_timeout`` is set, and so does a timer thread when the
-        SDK built the client. With an injected client on a connection that goes
-        quiet, healing waits for the next message unless you call it from your
-        own timer or event loop. It is safe to call from any thread.
+        SDK built the client or ``stuck_check_thread=True`` was passed. With an
+        injected client on a connection that goes quiet and no such thread,
+        healing waits for the next message unless you call it from your own
+        timer or event loop. It is safe to call from any thread.
 
         Returns the ids of the devices resubscribed or requeued by this call.
         """
@@ -5069,6 +5079,9 @@ class Controller:
             self._description_markers.clear()
             self._property_coverage.clear()
         self._stuck_timer_stop.set()
+        timer = self._stuck_timer
+        if timer is not None and timer is not threading.current_thread():
+            timer.join(timeout=2.0)
         self._stuck_timer = None
         # Clear callback references to break reference cycles
         self._on_device_discovered = None

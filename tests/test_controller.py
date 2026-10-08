@@ -1,6 +1,7 @@
 """Tests for ebus_sdk.homie.Controller and DiscoveredDevice."""
 
 import json
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -356,7 +357,7 @@ class TestControllerEffectiveState:
 # ── Controller ───────────────────────────────────────────────────────────
 
 
-def _make_controller(mock_paho, device_id=None, auto_start=False, root_device_id=None):
+def _make_controller(mock_paho, device_id=None, auto_start=False, root_device_id=None, **kwargs):
     """Helper to create a Controller with mocked MQTT."""
     with patch("ebus_sdk.homie.MqttClient.from_config") as mock_from_config:
         mock_client = MagicMock()
@@ -368,6 +369,7 @@ def _make_controller(mock_paho, device_id=None, auto_start=False, root_device_id
             auto_start=auto_start,
             device_id=device_id,
             root_device_id=root_device_id,
+            **kwargs,
         )
         return ctrl, mock_client
 
@@ -2270,6 +2272,49 @@ class TestStuckDeviceHealing:
         ctrl, _ = _make_paced_controller()
         ctrl.start_discovery()
         assert ctrl._stuck_timer is None
+
+    @staticmethod
+    def _stuck_threads():
+        return {t for t in threading.enumerate() if t.name == "ebus-controller-stuck-check"}
+
+    def _assert_thread(self, ctrl, expected):
+        """Other tests' controllers may leave their own threads behind, so count only this one's."""
+        before = self._stuck_threads()
+        try:
+            ctrl.start_discovery()
+            started = self._stuck_threads() - before
+            assert len(started) == (1 if expected else 0)
+        finally:
+            ctrl.stop()
+        assert not any(t.is_alive() for t in started)
+
+    def test_stuck_check_thread_default_owned_client(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1")
+        self._assert_thread(ctrl, True)
+
+    def test_stuck_check_thread_default_injected_client(self):
+        ctrl, _ = _make_paced_controller()
+        self._assert_thread(ctrl, False)
+
+    def test_stuck_check_thread_false_owned_client(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, root_device_id="panel-1", stuck_check_thread=False)
+        self._assert_thread(ctrl, False)
+
+    def test_stuck_check_thread_true_injected_client(self):
+        ctrl, _ = _make_paced_controller(stuck_check_thread=True)
+        self._assert_thread(ctrl, True)
+
+    def test_stuck_check_thread_true_needs_a_timeout(self):
+        ctrl, _ = _make_paced_controller(stuck_check_thread=True, stuck_device_timeout=None)
+        self._assert_thread(ctrl, False)
+
+    def test_stuck_check_thread_false_keeps_the_message_check(self):
+        ctrl, _ = _make_paced_controller(subscription_batch_size=1, stuck_check_thread=False)
+        _announce_root(ctrl, ["a"])
+        ctrl._last_stuck_check = time.monotonic() - 60
+        with patch.object(ctrl, "check_stuck_children") as check:
+            ctrl._on_property_message("panel-1", _topic("panel-1", "n/p"), b"1")
+        check.assert_called_once()
 
     def test_stuck_root_is_healed(self):
         ctrl, client = _make_paced_controller()
