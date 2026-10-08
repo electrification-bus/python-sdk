@@ -2403,6 +2403,23 @@ class TestRemovedTreeDeviceReturns:
         assert not any(t.startswith(_topic("kid", "")) and t.endswith(("/+", "/$target")) for t in live)
         assert {_topic("kid", "$state"), _topic("kid", "$description")} <= live
 
+    def test_root_that_clears_state_keeps_property_filters_across_resync(self):
+        ctrl, client = _make_paced_controller()
+        _announce_root(ctrl, ["kid"])
+        _deliver(ctrl, "kid")
+        root_props = {_topic("panel-1", "+/+"), _topic("panel-1", "+/+/$target")}
+        assert root_props <= _final_subscriptions(client)
+
+        _push_state(ctrl, "panel-1", "")
+        assert root_props <= _final_subscriptions(client)
+
+        ctrl.resync()
+        _push_state(ctrl, "panel-1", "ready")
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["kid"]})
+        assert root_props <= _final_subscriptions(client)
+        ctrl.check_stuck_children(timeout=0)
+        assert root_props <= _final_subscriptions(client)
+
 
 class TestReconnectPacing:
     """An owned client drops device filters while down so the reconnect replay is paced (GH #97)."""

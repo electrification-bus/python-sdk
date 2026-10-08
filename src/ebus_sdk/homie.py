@@ -4453,9 +4453,10 @@ class Controller:
         if not payload_str or len(payload_str) == 0:
             logger.info(f"reason=deviceRemoved,deviceID={device_id}")
             property_filters = self._forget_subscription(device_id)
-            if self.is_tree_rooted and device_id in self.devices:
+            if self.is_tree_rooted and device_id in self.devices and device_id != self.root_device_id:
                 # Its $state and $description filters stay, so a return is heard; the
-                # property filters are paced again when it comes back.
+                # property filters are paced again when it comes back. The root keeps
+                # its property filters: resync() records them as subscribed.
                 self._unsubscribe_filters(device_id, property_filters)
             if device_id in self.devices:
                 removed_device = self.devices[device_id]
