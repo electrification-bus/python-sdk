@@ -2301,3 +2301,135 @@ class TestStuckDeviceHealing:
 
         assert "x" not in ctrl.devices
         assert not {t for t in _final_subscriptions(client) if "/x/" in t}
+
+
+class TestRemovedTreeDeviceReturns:
+    """A tree device that clears its $state and comes back is tracked again."""
+
+    def test_child_that_returns_directly_is_rediscovered(self):
+        ctrl, client = _make_paced_controller()
+        _announce_root(ctrl, ["kid"])
+        _deliver(ctrl, "kid")
+        client.reset_mock()
+
+        _push_state(ctrl, "kid", "")
+        assert "kid" not in ctrl.devices
+        assert {c[0][0] for c in client.unsubscribe.call_args_list} == {
+            _topic("kid", "+/+"),
+            _topic("kid", "+/+/$target"),
+        }
+
+        _push_state(ctrl, "kid", "ready")
+        assert ctrl.devices["kid"].state == "ready"
+        _push_description(ctrl, "kid", _child_desc("kid"))
+        assert _filters_for("kid") <= _final_subscriptions(client) | _attribute_filters_for("kid")
+        assert _property_subscribed(client) == ["kid"]
+
+    def test_child_detached_then_readded_is_rediscovered(self):
+        ctrl, client = _make_paced_controller()
+        _announce_root(ctrl, ["kid"])
+        _deliver(ctrl, "kid")
+        _push_state(ctrl, "kid", "")
+
+        _push_state(ctrl, "panel-1", "init")
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": []})
+        _push_state(ctrl, "panel-1", "ready")
+        assert ctrl._subscribed_children.get("panel-1") == set()
+        assert not ({_topic("kid", "$state"), _topic("kid", "$description")} & _final_subscriptions(client))
+
+        client.reset_mock()
+        _push_state(ctrl, "panel-1", "init")
+        _push_description(ctrl, "panel-1", {"homie": "5.0", "children": ["kid"]})
+        _push_state(ctrl, "panel-1", "ready")
+        assert "kid" in ctrl.devices
+        _deliver_attributes(ctrl, "kid")
+        assert _final_subscriptions(client) == _filters_for("kid") | {_topic("kid", "$description")}
+
+    def test_removed_node_chunked_child_drops_its_node_filters(self):
+        ctrl, client = _make_paced_controller(subscription_batch_values=4)
+        _announce_root(ctrl, ["kid"])
+        desc = {"homie": "5.0", "nodes": {n: {"properties": {"p0": {}, "p1": {}}} for n in ("a", "b")}}
+        _push_state(ctrl, "kid", "ready")
+        _push_description(ctrl, "kid", desc)
+        assert _topic("kid", "a/+") in _final_subscriptions(client)
+
+        _push_state(ctrl, "kid", "")
+        live = _final_subscriptions(client)
+        assert not any(t.startswith(_topic("kid", "")) and t.endswith(("/+", "/$target")) for t in live)
+        assert {_topic("kid", "$state"), _topic("kid", "$description")} <= live
+
+
+class TestReconnectPacing:
+    """An owned client drops device filters while down so the reconnect replay is paced (GH #97)."""
+
+    DESC = {"homie": "5.0", "nodes": {"n": {"properties": {"p": {}}}}}
+
+    def _wildcard(self, mock_paho):
+        ctrl, client = _make_controller(mock_paho)
+        client.is_running = True
+        ctrl.start_discovery()
+        for d in ("d0", "d1"):
+            _push_state(ctrl, d, "ready")
+            _push_description(ctrl, d, self.DESC)
+            ctrl._on_property_message(d, _topic(d, "n/p"), b"1")
+            _push_description(ctrl, d, self.DESC)  # marker
+        return ctrl, client
+
+    def test_wildcard_disconnect_drops_device_filters(self, mock_paho):
+        ctrl, client = self._wildcard(mock_paho)
+        client.reset_mock()
+        ctrl._handle_disconnect(7)
+        dropped = {c[0][0] for c in client.unsubscribe.call_args_list}
+        for d in ("d0", "d1"):
+            assert {_topic(d, "$description"), _topic(d, "+/+"), _topic(d, "+/+/$target")} <= dropped
+        assert not any(t.endswith("/+/$state") for t in dropped)
+        assert ctrl._property_coverage == {} and ctrl._watches == {}
+        ctrl.stop()
+
+    def test_wildcard_resync_repaces_from_the_description(self, mock_paho):
+        ctrl, client = self._wildcard(mock_paho)
+        ctrl._handle_disconnect(7)
+        client.reset_mock()
+        ctrl.resync()
+        assert [c[0][0] for c in client.subscribe.call_args_list] == [
+            _topic("d0", "$description"),
+            _topic("d1", "$description"),
+        ]
+        # A replayed $state with a stale description on record does not skip the fresh one.
+        _push_state(ctrl, "d0", "ready")
+        assert _property_subscribed(client) == []
+        assert ctrl.check_stuck_children(timeout=0) == ["d0", "d1"]
+        _push_description(ctrl, "d0", self.DESC, retained=True)
+        assert _property_subscribed(client) == ["d0"]
+        assert "d0" in ctrl._description_markers
+        ctrl.stop()
+
+    def test_tree_disconnect_keeps_only_the_root_filters(self, mock_paho):
+        ctrl, client = _make_controller(mock_paho, root_device_id="panel-1")
+        client.is_running = True
+        _announce_root(ctrl, ["a"])
+        _deliver(ctrl, "a")
+        client.reset_mock()
+        ctrl._handle_disconnect(7)
+        dropped = {c[0][0] for c in client.unsubscribe.call_args_list}
+        assert _filters_for("a") <= dropped
+        assert not any("/panel-1/" in t for t in dropped)
+        ctrl.stop()
+
+    def test_no_drop_when_stopping_or_unpaced(self, mock_paho):
+        ctrl, client = self._wildcard(mock_paho)
+        client.is_running = False
+        client.reset_mock()
+        ctrl._handle_disconnect(0)
+        client.unsubscribe.assert_not_called()
+        ctrl.stop()
+
+    def test_injected_wildcard_resync_leaves_subscribed_devices_alone(self):
+        client = MagicMock()
+        ctrl = Controller(mqttc=client, subscription_batch_size=8)
+        ctrl.start_discovery()
+        _push_state(ctrl, "d0", "ready")
+        _push_description(ctrl, "d0", self.DESC)
+        client.reset_mock()
+        ctrl.resync()
+        client.subscribe.assert_not_called()

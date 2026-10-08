@@ -292,3 +292,94 @@ def test_child_that_appears_after_giving_up_gets_its_values(broker):
         _await_discovery(ctrl, ["late-child"], 6, timeout=5.0)
     finally:
         ctrl.stop()
+
+
+class _RestartableBroker:
+    """A persistent mosquitto that can be stopped and restarted on the same port."""
+
+    def __init__(self, tmp_path):
+        self.dir = tmp_path
+        self.port = _free_port()
+        self.proc = None
+
+    def start(self, port=None):
+        port = port or self.port
+        conf = self.dir / "mosquitto.conf"
+        conf.write_text(
+            f"listener {port} 127.0.0.1\nallow_anonymous true\n"
+            f"persistence true\npersistence_location {self.dir}/\npersistence_file mosquitto.db\n"
+        )
+        self.proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _wait_for_port(port, self.proc)
+
+    def stop(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            self.proc = None
+
+
+def _new_value(n, p):
+    return str(n * 1000 + p + 7)
+
+
+@pytest.mark.parametrize("mode", ["wildcard", "tree"])
+def test_values_changed_during_an_outage_arrive_after_reconnect(tmp_path, mode):
+    """The reconnect replays the retained store paced, so none of it is dropped.
+
+    Every value changes while the Controller is disconnected (on the same broker store,
+    served on another port), then the broker returns on the original port.
+    """
+    properties = 150
+    broker = _RestartableBroker(tmp_path)
+    broker.start()
+    ctrl = None
+    try:
+        if mode == "tree":
+            devices = _seed_tree(broker.port, properties)
+            ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker.port}, root_device_id=ROOT_ID)
+        else:
+            devices = _seed_bus(broker.port, properties)
+            ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker.port})
+        ctrl.start_discovery()
+        _await_discovery(ctrl, devices, properties)
+
+        broker.stop()
+        offline_port = _free_port()
+        broker.start(offline_port)
+        seeder = _Seeder(offline_port)
+        try:
+            for device in devices:
+                for n in range(NODES_PER_DEVICE):
+                    for p in range(properties // NODES_PER_DEVICE):
+                        seeder.pub(f"{BASE}/{device}/node-{n}/p{p:03d}", _new_value(n, p))
+        finally:
+            seeder.close()
+        broker.stop()
+        broker.start()
+
+        def fresh(device_id):
+            device = ctrl.get_device(device_id)
+            return device is not None and all(
+                device.get_property(f"node-{n}", f"p{p:03d}") == _new_value(n, p)
+                for n in range(NODES_PER_DEVICE)
+                for p in range(properties // NODES_PER_DEVICE)
+            )
+
+        # Well inside the 10 s stuck timeout: pacing must settle without a requeue.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and not (
+            all(fresh(d) for d in devices) and not ctrl._watches and not ctrl._pending_subscriptions
+        ):
+            time.sleep(0.1)
+        stale = [d for d in devices if not fresh(d)]
+        assert stale == []
+        assert ctrl._watches == {} and ctrl._pending_subscriptions == {}
+    finally:
+        if ctrl is not None:
+            ctrl.stop()
+        broker.stop()
