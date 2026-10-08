@@ -4,6 +4,19 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com/electrification-bus/python-sdk/issues/95), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)). Line numbers refer to [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md).
+
+### Changed
+
+- `Device.stop()` publishes `$state=disconnected` for every device in the tree, descendants first and the root last, before its clean disconnect. Only the root announced it before, so each child's retained `$state` stayed `ready` after a clean shutdown (convention.md:280-281; the cascade at :262-267 covers only `lost`).
+- `Device.stop(announce=False)` no longer disconnects cleanly. On an SDK-owned client it ends the connection without an MQTT DISCONNECT, so the broker publishes the Last Will. A clean disconnect must be preceded by `disconnected` (:281), and `lost` is the state of a bad disconnect (:284). After `declare_lost()` the will re-asserts the same retained `lost`; unpaired, it replaces the stale `ready` the clean disconnect used to leave.
+- `child.delete()` updates the parent first (`init`, `$description` without the child, `ready`) and only then clears the child's topics, starting with `$state` (:635-641). The order was reversed.
+- `Device.will()` carries `qos` (the tree's) and `retain: True`, so the Last Will is no longer sent at QoS 0 while every other `$state` uses the tree QoS (:45, :689-691).
+
+### Fixed
+
+- `delete()` followed by `stop()` re-created the deleted device as a bare `$state=disconnected` with no `$description` (:272, :288). After `delete()` the root's `stop()` announces nothing and disconnects cleanly in either mode, and a reconnect's `refresh_tree()` republishes nothing.
+
 ## [0.24.0] — 2026-10-03
 
 ### Fixed

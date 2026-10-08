@@ -38,11 +38,14 @@ This is the initial version, there are things to add in the future (as needed):
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import socket
+import threading
 import time
 import uuid
 from enum import Enum
@@ -1467,6 +1470,41 @@ def _dispatch_disconnect(callback: Optional[Callable[[bool], None]], rc, source:
         logger.exception(f"reason=onDisconnectCallbackException,source={source}")
 
 
+def _drop_connection_without_disconnect(client: Any, *, timeout: float) -> None:
+    """End an owned client's connection WITHOUT an MQTT DISCONNECT packet.
+
+    The broker then treats the connection as badly disconnected and publishes the
+    Last Will. ``Device.stop(announce=False)`` uses this so a teardown that announced
+    nothing is a bad disconnect (convention.md:281, :284) rather than a clean one.
+
+    ebus-mqtt-client has no unclean-stop API, so this stops the paho network loop
+    (which sends nothing) and shuts the socket down underneath it. The client's own
+    ``stop()`` runs afterwards to release its resources; its DISCONNECT then has no
+    live connection to reach. Bounded by ``timeout`` like ``MqttClient.stop()``.
+    """
+    paho = getattr(client, "mqttc", None)
+    if paho is None or not callable(getattr(paho, "socket", None)):
+        logger.warning("reason=deviceDropConnectionUnsupported,hint=the will may not fire")
+        return
+
+    def _drop() -> None:
+        with contextlib.suppress(Exception):
+            paho.loop_stop()
+        sock = paho.socket()
+        if sock is None:
+            return
+        with contextlib.suppress(Exception):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            sock.close()
+
+    worker = threading.Thread(target=_drop, name="ebus-sdk-drop-connection", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        logger.warning(f"reason=deviceDropConnectionTimeout,timeout={timeout}")
+
+
 class Device:
     """
     Object representing a Homie MQTT Device
@@ -1660,6 +1698,9 @@ class Device:
         # entry/exit publishes INIT/READY). Init→ready transitions force every controller
         # in the wild to resync, so emitting only the minimum is a correctness concern.
         self._transition_depth = 0
+        # Set by delete(): the device no longer exists on the broker, so nothing may
+        # republish its $state (stop(), a reconnect's refresh_tree(), the will).
+        self._deleted = False
         # SDK-n83: hash of the last $description we actually published, with the
         # always-fresh `version` timestamp removed. publish_description() uses it
         # to skip a republish whose content has not changed (saves the ~KB
@@ -1862,70 +1903,108 @@ class Device:
     def stop(self, *, announce: bool = True, flush_timeout: float = 1.0, stop_timeout: float = 2.0) -> None:
         """Gracefully and promptly tear down this device tree's MQTT connection.
 
-        Publishes a final ``$state=disconnected`` for the root (best-effort) then
-        stops the root's MQTT client. This is a TREE-level teardown: children
-        share the root's connection, so a call on any device stops the whole
-        tree; per the Homie 5 effective-state rule, the root going
-        ``disconnected`` covers every descendant.
+        Publishes a final ``$state=disconnected`` for EVERY device in the tree
+        (best-effort), descendants first and the root last, then stops the root's
+        MQTT client with a clean disconnect. Homie 5 requires a device to send
+        ``disconnected`` before it cleanly disconnects (convention.md:280-281), and
+        children share the root's connection, so each of them disconnects too; the
+        root-to-child cascade (convention.md:262-267) covers only ``lost``. This is
+        a TREE-level teardown: a call on any device stops the whole tree.
 
         BOUNDED end to end (at most ~``flush_timeout`` + ``stop_timeout``): if the
-        broker is unreachable the disconnected publish is skipped and ``stop()``
+        broker is unreachable the disconnected publishes are skipped and ``stop()``
         still returns promptly, so a shutting-down process never stalls on a dead
-        broker. Because ``MqttClient.stop()`` performs a clean disconnect (which
-        suppresses the LWT), publishing ``$state=disconnected`` first is what lets
-        consumers see a clean shutdown rather than a stale ``ready`` or a
-        badly-disconnected ``lost``. After ``stop()`` this device tree should not
-        be reused.
+        broker. The root's publish is the one flushed; it is sent last, so the
+        children's publishes precede it on the wire. Because ``MqttClient.stop()``
+        performs a clean disconnect (which suppresses the LWT), publishing
+        ``disconnected`` first is what lets consumers see a clean shutdown rather
+        than a stale ``ready``. After ``stop()`` this device tree should not be
+        reused.
 
         For a bring-your-own-transport root (``mqttc=``) the SDK does not own the
-        client: ``stop()`` publishes the final ``$state=disconnected`` as a plain
-        retained message and returns immediately, without flushing and without
-        closing the client, so it never blocks the caller's loop. The caller
-        stops and disconnects its own client. ``flush_timeout``/``stop_timeout``
-        apply to the owned path only.
+        client: ``stop()`` publishes the same ``$state=disconnected`` messages as
+        plain retained messages and returns immediately, without flushing and
+        without closing the client, so it never blocks the caller's loop. The
+        caller stops and disconnects its own client. ``flush_timeout`` and
+        ``stop_timeout`` apply to the owned path only.
 
-        ``announce=False`` tears down without publishing anything, leaving the
-        retained ``$state`` exactly as it stands. Pair it with ``declare_lost()``
-        for a producer that is dying rather than shutting down: that publishes
-        ``lost`` first, and the default ``announce=True`` would then overwrite it
-        with ``disconnected``. Unpaired it leaves whatever was published last,
-        typically a stale ``ready``, and nothing will correct that: the clean
-        disconnect on the owned path suppresses the LWT (see above). The teardown
-        itself stays bounded and clean in both modes; only the announcement differs.
+        ``announce=False`` publishes nothing and ends the connection WITHOUT a
+        clean MQTT DISCONNECT, so the broker delivers the Last Will (the root's
+        ``$state=lost``). Homie 5 forbids a clean disconnect without a preceding
+        ``disconnected`` (convention.md:281) and defines ``lost`` as a bad
+        disconnect (convention.md:284), so a silent teardown is a bad disconnect.
+        Pair it with ``declare_lost()`` for a producer that is dying rather than
+        shutting down: that publishes ``lost`` while the link is up, and the will
+        then re-asserts the same retained payload. On a bring-your-own transport
+        the SDK closes nothing; the caller must drop its connection without a clean
+        DISCONNECT for the same guarantee.
+
+        After ``delete()`` on the root, ``stop()`` announces nothing in either mode
+        and always disconnects cleanly: the device no longer exists
+        (convention.md:288), and a ``disconnected`` or a will-driven ``lost`` would
+        re-create it as a bare ``$state`` with no ``$description``.
         """
         root = self.root()
         mqttc = root.mqttc
         if mqttc is None:
             _log_missing_client(f"reason=deviceStopNoMqttClient,id={self._id}", by_design=self._transport_free())
             return
-        # Best-effort graceful $state=disconnected. publish_and_flush is bounded
-        # and returns False (never blocks/raises) when the broker is unreachable,
-        # so this can't stall shutdown. Note the state move lives inside this branch,
-        # so announce=False cannot overwrite a $state a caller just declared.
-        if not announce:
+        owned = root._owns_client and root._owned_client is not None
+        if root._deleted:
+            logger.info(f"reason=deviceStopDeletedTreeSilent,id={root._id}")
+        elif not announce:
             logger.info(f"reason=deviceStopSilent,id={root._id}")
+            if owned:
+                # No disconnected was sent, so the disconnect must not be clean: drop
+                # the connection and let the broker publish the will.
+                _drop_connection_without_disconnect(root._owned_client, timeout=stop_timeout)
         elif mqttc.is_connected():
-            root._state = DeviceState.DISCONNECTED
-            state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
-            if root._owns_client and root._owned_client is not None:
-                flushed = root._owned_client.publish_and_flush(
-                    state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
-                )
-                logger.info(f"reason=deviceStopDisconnectedPublished,id={root._id},flushed={flushed}")
-            else:
-                # Bring-your-own-transport: the caller owns the loop and teardown.
-                # Publish the final state as a plain retained message (the caller's
-                # loop delivers it) and return without flushing or closing — both
-                # publish_and_flush and stop() are owned-only, off the injected
-                # transport surface, so this never blocks the caller's thread.
-                mqttc.publish(state_topic, DeviceState.DISCONNECTED.value, retain=True, qos=root._qos)
-                logger.info(f"reason=deviceStopDisconnectedPublishedInjected,id={root._id}")
+            # Best-effort graceful $state=disconnected for the whole tree. The state
+            # moves live inside this branch, so announce=False cannot overwrite a
+            # $state a caller just declared.
+            for device in root._tree_post_order():
+                device._state = DeviceState.DISCONNECTED
+                state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device._id}/$state"
+                if device is root and owned:
+                    # publish_and_flush is bounded and returns False (never blocks or
+                    # raises) when the broker is unreachable, so this cannot stall
+                    # shutdown.
+                    flushed = root._owned_client.publish_and_flush(
+                        state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
+                    )
+                    logger.info(f"reason=deviceStopDisconnectedPublished,id={root._id},flushed={flushed}")
+                    continue
+                # A descendant, or any device on an injected transport: a plain
+                # retained publish. publish_and_flush is owned-only and off the
+                # injected transport surface, so this never blocks the caller's thread.
+                try:
+                    mqttc.publish(state_topic, DeviceState.DISCONNECTED.value, retain=True, qos=root._qos)
+                except Exception as e:
+                    logger.warning(f"reason=deviceStopDisconnectedPublishFailed,id={device._id},e={e}")
+                    continue
+                if device is root:
+                    logger.info(f"reason=deviceStopDisconnectedPublishedInjected,id={root._id}")
         else:
             logger.info(f"reason=deviceStopBrokerUnreachable,id={root._id}")
-        if root._owns_client and root._owned_client is not None:
+        if owned:
             root._owned_client.stop(timeout=stop_timeout)
         root.mqttc = None
         root._owned_client = None
+
+    def _tree_post_order(self) -> List["Device"]:
+        """This device and every descendant, each device after all of its descendants."""
+        ordered: List[Device] = []
+        for child in list(self._children):
+            ordered.extend(child._tree_post_order())
+        ordered.append(self)
+        return ordered
+
+    def _tree_pre_order(self) -> List["Device"]:
+        """This device and every descendant, each device before any of its descendants."""
+        ordered: List[Device] = [self]
+        for child in list(self._children):
+            ordered.extend(child._tree_pre_order())
+        return ordered
 
     def declare_lost(self, *, flush_timeout: float = 1.0) -> bool:
         """Declare this device tree dead: move the ROOT to ``$state=lost`` and publish it.
@@ -2197,55 +2276,51 @@ class Device:
 
     def delete(self) -> None:
         """
-        Remove this device from the tree (Homie remove-child protocol).
+        Remove this device, and every descendant, from the broker (Homie removal).
 
-        On a child: clears the child's retained MQTT data (state, description,
-        all property values), detaches from parent, then triggers the parent
-        to republish its $description (without this child in `children`).
-        Parent's INIT→READY flap is suppressed if the parent is already mid
-        state_transition (S3: batched remove inside `with parent.state_transition()`).
+        On a child, in the order convention.md:635-641 gives: the parent is updated
+        first (``init``, ``$description`` without this child in ``children``,
+        ``ready``), then this device's topics are cleared starting with its
+        ``$state``. The parent's update is deferred, as for any structural change,
+        when the parent is already inside a ``state_transition()``.
 
-        On a root: clears all retained data for this device. (Does not stop
-        the MQTT client — that's the caller's responsibility, after which the
-        LWT publish covers the whole tree.) Note this REMOVES the device: an absent
-        retained ``$state`` is the Homie removal signal, so do not follow it with
-        ``declare_lost()``, which would resurrect the device on the broker as a bare
-        ``$state=lost`` with no ``$description``. (The root's will is a separate
-        matter: it is armed on the connection, not on the device, so it still fires
-        if the process then dies uncleanly.) To retire a tree as dead but still
-        present, use ``declare_lost()`` plus ``stop(announce=False)`` instead.
+        The removed subtree is cleared leaves first, and each device's ``$state``
+        is cleared before its other topics: values, alerts and ``$description``
+        (convention.md:287-289). No device in the subtree publishes an
+        ``init``/``ready`` flap on its way out.
 
-        While delete() is running, this device acts as if it were mid
-        state_transition so descendants' delete()-triggered parent-flap
-        notifications collapse into nothing — a recursive teardown shouldn't
-        publish gratuitous INIT/READY on dying devices.
+        On a root: clears all retained data for the tree. It does not stop the MQTT
+        client; ``stop()`` afterwards disconnects cleanly and announces nothing,
+        and a reconnect republishes nothing, since an absent retained ``$state`` is
+        the removal signal and any later ``$state`` would re-create the device with
+        no ``$description``. The will is armed on the connection, so it still fires
+        if the process dies uncleanly before ``stop()``. Do not follow this with
+        ``declare_lost()``; to retire a tree as dead but still present, use
+        ``declare_lost()`` plus ``stop(announce=False)`` instead.
 
         After delete(), this Device object should not be used further.
         """
         logger.info(f"reason=deviceDelete,deviceId={self._id},isRoot={self._parent is None}")
-        # Bump transition depth so structural-change notifications from descendants
-        # we're about to tear down get suppressed — they'd be calling
-        # _notify_structural_change on a corpse.
-        self._transition_depth += 1
-        try:
-            # Recursively delete children first so the broker sees a leaves-first cleanup.
-            for child in list(self._children):
-                child.delete()
-            # Clear $state FIRST, per the Homie 5 removal order (convention: clear
-            # the retained $state and "the device will cease to exist", then clear
-            # its other retained topics). delete_all_from_mqtt only handles property
-            # values and $description, so $state is cleared here separately.
-            base_topic = f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
-            self.clear_retained_topic(f"{base_topic}/$state")
-            self.delete_all_from_mqtt()
-        finally:
-            self._transition_depth -= 1
-        if self._parent is not None:
-            parent = self._parent
+        subtree = self._tree_pre_order()
+        for device in subtree:
+            device._deleted = True
+        parent = self._parent
+        if parent is not None:
+            # Step 1: the parent drops this child from `children` and re-announces.
+            # The child keeps its _parent link until its topics are cleared: the
+            # topic domain and the MQTT client are both resolved through the root.
             parent._children.remove(self)
-            self._parent = None
-            # Only fires if parent isn't itself mid-delete or mid state_transition.
             parent._notify_structural_change()
+        # Step 2: clear the subtree leaves first, so no device is seen whose parent
+        # is already gone. Each device's $state goes before its other topics, so it
+        # ceases to exist first (convention.md:287-289).
+        for device in reversed(subtree):
+            base_topic = f"{device.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device._id}"
+            device.clear_retained_topic(f"{base_topic}/$state")
+            device.delete_all_from_mqtt()
+        for device in subtree:
+            device._children = []
+        self._parent = None
 
     def clear_retained_topic(self, topic_path: str) -> bool:
         """
@@ -2368,6 +2443,10 @@ class Device:
         re-raised; callers wanting to detect it should watch for
         ``reason=deviceRefreshTreeChildFailed`` in the log.
         """
+        if self._deleted:
+            # delete() removed this device; republishing would re-create it.
+            logger.info(f"reason=deviceRefreshTreeDeletedSkipped,deviceId={self._id}")
+            return
         logger.info(
             f"reason=deviceRefreshTree,deviceId={self._id},"
             f"nodeCount={len(self._nodes)},childCount={len(self._children)}"
@@ -2579,11 +2658,18 @@ class Device:
         ``declare_lost()`` publishes this same topic and payload explicitly, for a
         producer that knows it is dying: the will fires only on an unclean
         disconnect, and the clean disconnect ``stop()`` performs suppresses it.
+
+        ``qos`` and ``retain`` are the tree's: every other ``$state`` publish is
+        retained at the tree QoS (convention.md:45-47), and a will on the same topic
+        at a lower QoS would break the ordering a single QoS level guarantees
+        (convention.md:689-691).
         """
         root = self.root()
         return {
             "topic": f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state",
             "payload": DeviceState.LOST.value,
+            "qos": root._qos,
+            "retain": True,
         }
 
     def connect_broker(self) -> None:

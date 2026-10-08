@@ -67,12 +67,12 @@ Inject the client before it connects, then wire the two Homie-correctness pieces
 client = my_host_mqtt_client()                 # created, not yet connected
 device = Device('panel-1', type='...', mqttc=client)
 
-client.set_will(**device.will())               # LWT ($state=lost); must precede connect
+client.set_will(**device.will())               # LWT ($state=lost, tree QoS, retained); must precede connect
 client.on_connect(device.refresh_tree)         # re-announce the retained tree on every (re)connect
 client.connect()                               # host connects on its own loop
 ```
 
-`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` through the client and returns immediately, without flushing or closing it; `device.stop(announce=False)` publishes nothing and leaves the retained `$state` as it stands, for a caller that published its own final state first (see `declare_lost()` below). `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
+`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` for every device in the tree through the client and returns immediately, without flushing or closing it; `device.stop(announce=False)` publishes nothing, for a caller that published its own final state first (see `declare_lost()` below), and that caller then drops the connection without a clean DISCONNECT so the will fires. `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
 
 For the inbound direction, if the tree has settable properties whose callbacks are async coroutines, pass `Device(async_loop=<your event loop>)`: inbound `/set` arrives on the transport's network thread, and this schedules the callback onto your loop (set once for the whole tree, not per property). A synchronous callback runs inline and needs no loop.
 
@@ -105,7 +105,7 @@ A device has three ways to stop, and they mean different things to a consumer re
 
 | Teardown | `$state` left retained | How |
 | --- | --- | --- |
-| Graceful shutdown | `disconnected` | `device.stop()` |
+| Graceful shutdown | `disconnected` on every device in the tree | `device.stop()` |
 | Ungraceful death (crash, power loss) | `lost` | the Last Will, which fires only on an *unclean* disconnect |
 | Deliberate death | `lost` | `device.declare_lost()` |
 
@@ -113,14 +113,14 @@ The third is for a producer that knows it is failing: a fatal error handler, a s
 
 ```python
 device.declare_lost()          # root's $state=lost, published and (owned path) flushed
-device.stop(announce=False)    # tear down without overwriting it with `disconnected`
+device.stop(announce=False)    # drop the connection without a clean DISCONNECT; the will re-asserts `lost`
 ```
 
 `declare_lost()` is **tree-level**, like `will()` and `stop()`: it publishes the *root's* `$state`, which per the Homie 5 effective-state rule makes every descendant lost too, and it publishes exactly the topic and payload `will()` describes so the two paths cannot drift. To mark one device lost (a proxy whose single upstream vanished), use `set_state(DeviceState.LOST)` on that device instead.
 
 It moves the state and publishes it together, and the move is unconditional: publishing a state the `Device` does not hold is how a later `refresh_tree()` silently republishes `ready` over it. It returns whether `$state` actually moved, the same convention as `set_state`: on an injected transport, a `True` from a connected tree is your cue to drain, and `False` means the root was already lost. It is not a delivery signal and cannot be one there. Publishing is skipped entirely when the broker is unreachable (the state still moves, and the next connect republishes it), so `True` does not by itself prove anything was queued. It does not stop the client.
 
-`stop(announce=False)` unpaired leaves whatever was published last, typically a stale `ready`, and nothing will correct it: the clean disconnect `stop()` performs suppresses the LWT. Neither call substitutes for the will, because a crashed process calls nothing.
+`stop()` publishes `disconnected` for every device in the tree, descendants first and the root last, before its clean disconnect: Homie 5 requires each device to send `disconnected` before cleanly disconnecting, and the root-to-child cascade covers only `lost`. `stop(announce=False)` publishes nothing, so it does not disconnect cleanly either: on an SDK-owned client it ends the connection without an MQTT DISCONNECT and the broker publishes the Last Will (`lost`). Paired with `declare_lost()` that re-asserts the same retained payload; unpaired, the will replaces the stale `ready` the clean disconnect used to leave behind. On an injected client the SDK closes nothing, so drop your connection without a clean DISCONNECT to get the same result. After `delete()` on the root, `stop()` announces nothing in either mode and disconnects cleanly, since any later `$state` would re-create the deleted device. Neither call substitutes for the will, because a crashed process calls nothing.
 
 #### Clearing a value vs. an empty-string value
 
