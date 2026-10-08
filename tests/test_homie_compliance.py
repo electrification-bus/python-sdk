@@ -3,6 +3,8 @@
 Line numbers in docstrings refer to homieiot/convention@7edc221 convention.md.
 """
 
+import datetime
+import enum
 import json
 import logging
 import socket
@@ -428,3 +430,213 @@ class TestDescriptionCacheInvalidation:
         root.publish_description()
 
         assert len(_descriptions(client, "root")) == 1
+
+
+# ── C. Property values ───────────────────────────────────────────────────
+
+
+def _wired(datatype, value=None, **kwargs):
+    """A property on a node on a READY root with a mock client."""
+    root, client = _make_root()
+    node = root.new_node("n")
+    root.add_node(node)
+    prop = Property(id="p", datatype=datatype, **kwargs)
+    node.add_property(prop)
+    client.publish.reset_mock()
+    return prop, client, root
+
+
+def _value_publishes(client):
+    return [c for c in client.publish.call_args_list if c.args[0] == f"{BASE}/root/n/p"]
+
+
+def _published(datatype, value, **kwargs):
+    """The payload set_value(value) puts on the wire, or None if it publishes nothing."""
+    prop, client, _ = _wired(datatype, **kwargs)
+    ok = prop.set_value(value)
+    calls = _value_publishes(client)
+    assert ok == bool(calls)
+    return calls[-1].args[1] if calls else None
+
+
+class TestOutboundNumbers:
+    """:85-101: integer and float payload grammar."""
+
+    def test_non_finite_floats_are_refused(self):
+        for value in (float("nan"), float("inf"), float("-inf"), "1e999"):
+            assert _published(PropertyDatatype.FLOAT, value) is None
+
+    def test_float_exponent_has_no_plus(self):
+        """:97: only digits, `-`, `e`/`E` and `.`."""
+        assert _published(PropertyDatatype.FLOAT, 1e20) == "1e20"
+        assert _published(PropertyDatatype.FLOAT, 1.5e-7) == "1.5e-07"
+        assert _published(PropertyDatatype.FLOAT, "1e+5") is None
+
+    def test_floats_and_ints_on_a_float_property(self):
+        assert _published(PropertyDatatype.FLOAT, 21.5) == "21.5"
+        assert _published(PropertyDatatype.FLOAT, 5) == "5"
+        assert _published(PropertyDatatype.FLOAT, "-3.25") == "-3.25"
+
+    def test_booleans_are_refused_on_numeric_properties(self):
+        assert _published(PropertyDatatype.FLOAT, True) is None
+        assert _published(PropertyDatatype.INTEGER, False) is None
+
+    def test_integers_must_be_whole_and_64_bit(self):
+        """:87-90."""
+        assert _published(PropertyDatatype.INTEGER, 5.0) == "5"
+        assert _published(PropertyDatatype.INTEGER, 5.5) is None
+        assert _published(PropertyDatatype.INTEGER, 2**63 - 1) == str(2**63 - 1)
+        assert _published(PropertyDatatype.INTEGER, 2**63) is None
+        assert _published(PropertyDatatype.INTEGER, -(2**63) - 1) is None
+        assert _published(PropertyDatatype.INTEGER, "-") is None
+        assert _published(PropertyDatatype.INTEGER, "12") == "12"
+
+    def test_a_refused_value_leaves_the_last_good_one_on_the_broker(self):
+        prop, client, _ = _wired(PropertyDatatype.FLOAT)
+        prop.set_value(1.0)
+        client.publish.reset_mock()
+        assert prop.set_value(float("nan")) is False
+        assert client.publish.call_args_list == []
+        assert prop.get_last_published_value() == "1.0"
+
+
+class TestOutboundEnumAndEmptyStrings:
+    def test_enum_values_must_be_in_the_format(self):
+        """:111."""
+
+        class Mode(str, enum.Enum):
+            AUTO = "auto"
+
+        assert _published(PropertyDatatype.ENUM, "auto", format="auto,off") == "auto"
+        assert _published(PropertyDatatype.ENUM, Mode.AUTO, format="auto,off") == "auto"
+        assert _published(PropertyDatatype.ENUM, "Auto", format="auto,off") is None
+
+    def test_empty_string_is_0x00_only_for_string(self):
+        """:65-67: the empty string is valid only for string properties."""
+        assert _published(PropertyDatatype.STRING, "") == "\x00"
+        assert _published(PropertyDatatype.ENUM, "", format="a,b") is None
+        assert _published(PropertyDatatype.INTEGER, "") is None
+        assert _published(PropertyDatatype.JSON, "") is None
+        assert _published(PropertyDatatype.DATETIME, "") is None
+
+
+class TestOutboundEncoders:
+    def test_datetime_is_iso_8601(self):
+        """:132."""
+        stamp = datetime.datetime(2026, 10, 8, 12, 0, tzinfo=datetime.timezone.utc)
+        assert _published(PropertyDatatype.DATETIME, stamp) == "2026-10-08T12:00:00+00:00"
+        assert _published(PropertyDatatype.DATETIME, datetime.date(2026, 10, 8)) == "2026-10-08"
+
+    def test_duration_is_ptxhxmxs(self):
+        """:137-144."""
+        timedelta = datetime.timedelta
+        assert _published(PropertyDatatype.DURATION, timedelta(hours=12, minutes=5, seconds=46)) == "PT12H5M46S"
+        assert _published(PropertyDatatype.DURATION, timedelta(minutes=5)) == "PT5M"
+        assert _published(PropertyDatatype.DURATION, timedelta(0)) == "PT0S"
+        assert _published(PropertyDatatype.DURATION, timedelta(days=2)) == "PT48H"
+        assert _published(PropertyDatatype.DURATION, timedelta(seconds=1.5)) == "PT1.5S"
+        assert _published(PropertyDatatype.DURATION, timedelta(seconds=-1)) is None
+        assert _published(PropertyDatatype.DURATION, "PT5M") == "PT5M"
+        assert _published(PropertyDatatype.DURATION, "PT") is None
+        assert _published(PropertyDatatype.DURATION, "5 minutes") is None
+
+    def test_color_tuple_uses_the_preferred_format(self):
+        """:118-123 and :393."""
+        assert _published(PropertyDatatype.COLOR, (255, 0, 0), format="rgb,hsv") == "rgb,255,0,0"
+        assert _published(PropertyDatatype.COLOR, (300, 50, 75.5), format="hsv") == "hsv,300,50,75.5"
+        assert _published(PropertyDatatype.COLOR, (0.25, 0.34), format="xyz") == "xyz,0.25,0.34"
+
+    def test_color_payloads_are_checked(self):
+        assert _published(PropertyDatatype.COLOR, "hsv,300,50,75", format="rgb,hsv") == "hsv,300,50,75"
+        assert _published(PropertyDatatype.COLOR, "rgb,256,0,0", format="rgb") is None
+        assert _published(PropertyDatatype.COLOR, "rgb, 1,2,3", format="rgb") is None
+        assert _published(PropertyDatatype.COLOR, "xyz,0.2,0.3", format="rgb") is None
+        assert _published(PropertyDatatype.COLOR, (1, 2), format="rgb") is None
+
+    def test_json_must_be_an_array_or_object_without_nan(self):
+        """:150."""
+        assert _published(PropertyDatatype.JSON, {"a": 1}) == '{"a": 1}'
+        assert _published(PropertyDatatype.JSON, [1, 2]) == "[1, 2]"
+        assert _published(PropertyDatatype.JSON, '{"a":1}') == '{"a":1}'
+        assert _published(PropertyDatatype.JSON, "hello") is None
+        assert _published(PropertyDatatype.JSON, 5) is None
+        assert _published(PropertyDatatype.JSON, '"text"') is None
+        assert _published(PropertyDatatype.JSON, {"a": float("nan")}) is None
+        assert _published(PropertyDatatype.JSON, '{"a": NaN}') is None
+
+
+class TestEventProperties:
+    """:50 and :695: non-retained properties publish at QoS 0 and are never replayed."""
+
+    def test_an_event_publishes_non_retained_at_qos_0(self):
+        prop, client, _ = _wired(PropertyDatatype.STRING, retained=False)
+        prop.set_value("pressed")
+        (published,) = _value_publishes(client)
+        assert published.kwargs == {"retain": False, "qos": 0}
+
+    def test_a_reconnect_does_not_replay_the_last_event(self):
+        prop, client, root = _wired(PropertyDatatype.STRING, retained=False)
+        prop.set_value("pressed")
+        client.publish.reset_mock()
+        root.on_connect()
+        assert _value_publishes(client) == []
+
+    def test_adding_a_valued_event_property_publishes_no_event(self):
+        root, client = _make_root()
+        node = root.new_node("n")
+        root.add_node(node)
+        client.publish.reset_mock()
+        node.add_property(Property(id="p", value="x", datatype=PropertyDatatype.STRING, retained=False))
+        assert _value_publishes(client) == []
+
+    def test_clearing_an_event_publishes_nothing(self):
+        prop, client, root = _wired(PropertyDatatype.STRING, retained=False)
+        prop.set_value("pressed")
+        client.publish.reset_mock()
+        prop.set_value(None)
+        root.delete_node("n")
+        assert _value_publishes(client) == []
+
+
+class TestAlerts:
+    """:512-527 and :289."""
+
+    def test_publish_alert_uses_the_alert_id_level(self):
+        root, client = _make_root()
+        client.publish.reset_mock()
+        assert root.publish_alert("battery", "Battery is low, at 8%") is True
+        (published,) = client.publish.call_args_list
+        assert published.args == (f"{BASE}/root/$alert/battery", "Battery is low, at 8%")
+        assert published.kwargs["retain"] is True
+
+    def test_clear_alert_deletes_the_topic(self):
+        root, client = _make_root()
+        root.publish_alert("battery", "low")
+        client.publish.reset_mock()
+        assert root.clear_alert("battery") is True
+        assert _publishes(client) == [(f"{BASE}/root/$alert/battery", "")]
+        assert root.alerts() == {}
+
+    def test_delete_clears_raised_alerts(self):
+        root, client = _make_root()
+        child = Device(id="child", parent=root)
+        child.publish_alert("childlost", "gone")
+        client.publish.reset_mock()
+        child.delete()
+        assert (f"{BASE}/child/$alert/childlost", "") in _publishes(client)
+
+    def test_a_reconnect_republishes_raised_alerts(self):
+        root, client = _make_root()
+        root.publish_alert("battery", "low")
+        client.publish.reset_mock()
+        root.on_connect()
+        assert (f"{BASE}/root/$alert/battery", "low") in _publishes(client)
+
+    def test_bare_alert_and_bad_input_publish_nothing(self):
+        root, client = _make_root()
+        client.publish.reset_mock()
+        root.publish("$alert", "no id")
+        assert root.publish_alert("a/b", "x") is False
+        assert root.publish_alert("", "x") is False
+        assert root.publish_alert("battery", "") is False
+        assert client.publish.call_args_list == []

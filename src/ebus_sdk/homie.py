@@ -28,7 +28,7 @@ This is the initial version, there are things to add in the future (as needed):
         homie / 5 / [device ID] / [node ID] / [property ID]; reported property values (for string types)
         homie / 5 / [device ID] / [node ID] / [property ID] / set; the topic to set properties (of string types)
         homie / 5 / [device ID] / [node ID] / [property ID] / $target; the target property value (for string types)
-    The SDK encodes "" as 0x00 on publish (Property.publish_value, Controller.set_property) and decodes
+    The SDK encodes "" as 0x00 on publish of a string value (Property.publish_value, Controller.set_property) and decodes
     0x00 back to "" on receive (Controller._on_property_message / _on_target_message, Property._settable_callback).
     This convention specifies no way to represent an actual value of a 1-character string with a single byte 0.
     If a device needs this, then it should provide an escape mechanism on the application level.
@@ -39,9 +39,12 @@ This is the initial version, there are things to add in the future (as needed):
 
 import asyncio
 import contextlib
+import datetime
 import hashlib
 import json
 import logging
+import math
+import numbers
 import os
 import re
 import socket
@@ -375,6 +378,214 @@ class PropertyDatatype(StrEnum):
     DATETIME = "datetime"
     DURATION = "duration"
     JSON = "json"
+
+
+# ── Payload encoding and validation (convention.md:74-150) ──────────────────
+#
+# Each encoder takes a Python value and returns ``(payload, None)`` for a valid
+# wire payload, or ``(None, problem)`` when the datatype cannot represent the
+# value. The device refuses to publish a refused value; the /set path uses the
+# same grammar to reject a command.
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_INTEGER_PAYLOAD = re.compile(r"-?\d+")
+_FLOAT_PAYLOAD = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE]-?\d+)?")
+_DURATION_PAYLOAD = re.compile(r"PT(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?")
+_COLOR_RANGES = {"rgb": (255.0, 255.0, 255.0), "hsv": (360.0, 100.0, 100.0), "xyz": (1.0, 1.0)}
+
+
+def _reject_json_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _format_float(number: float) -> Optional[str]:
+    """A finite float in the convention's grammar: no `+` in the exponent (:97)."""
+    if not math.isfinite(number):
+        return None
+    return repr(float(number)).replace("e+", "e")
+
+
+def _encode_integer(value: Any) -> tuple:
+    if isinstance(value, bool):
+        return None, "booleanOnNumeric"
+    if isinstance(value, str):
+        if not _INTEGER_PAYLOAD.fullmatch(value):
+            return None, "integerGrammar"
+        number = int(value)
+    elif isinstance(value, numbers.Integral):
+        number = int(value)
+    elif isinstance(value, numbers.Real):
+        if not math.isfinite(value) or not float(value).is_integer():
+            return None, "integerNotWhole"
+        number = int(value)
+    else:
+        return None, "integerType"
+    if not _INT64_MIN <= number <= _INT64_MAX:
+        return None, "integerOutOf64Bit"
+    return (value if isinstance(value, str) else str(number)), None
+
+
+def _encode_float(value: Any) -> tuple:
+    if isinstance(value, bool):
+        return None, "booleanOnNumeric"
+    if isinstance(value, str):
+        if not _FLOAT_PAYLOAD.fullmatch(value) or not math.isfinite(float(value)):
+            return None, "floatGrammar"
+        return value, None
+    if isinstance(value, numbers.Integral):
+        return str(int(value)), None
+    if isinstance(value, numbers.Real):
+        payload = _format_float(float(value))
+        return (payload, None) if payload is not None else (None, "floatNotFinite")
+    return None, "floatType"
+
+
+def _encode_boolean(value: Any) -> tuple:
+    if not isinstance(value, bool):
+        return None, "booleanType"
+    return ("true" if value else "false"), None
+
+
+def _enum_values(format_: Any) -> Optional[list]:
+    return format_.split(",") if isinstance(format_, str) and format_ else None
+
+
+def _encode_enum(value: Any, format_: Any) -> tuple:
+    payload = str(value.value) if isinstance(value, Enum) else str(value)
+    if payload == "":
+        return None, "enumEmpty"
+    allowed = _enum_values(format_)
+    if allowed is not None and payload not in allowed:
+        return None, "enumNotInFormat"
+    return payload, None
+
+
+def _check_color_payload(payload: str, format_: Any) -> Optional[str]:
+    parts = payload.split(",")
+    kind = parts[0]
+    ranges = _COLOR_RANGES.get(kind)
+    if ranges is None:
+        return "colorType"
+    allowed = _enum_values(format_)
+    if allowed is not None and kind not in allowed:
+        return "colorTypeNotInFormat"
+    if len(parts) != len(ranges) + 1:
+        return "colorComponentCount"
+    for text, upper in zip(parts[1:], ranges):
+        if not _FLOAT_PAYLOAD.fullmatch(text):
+            return "colorComponentGrammar"
+        if not 0.0 <= float(text) <= upper:
+            return "colorComponentRange"
+    return None
+
+
+def _encode_color(value: Any, format_: Any) -> tuple:
+    if isinstance(value, str):
+        problem = _check_color_payload(value, format_)
+        return (None, problem) if problem else (value, None)
+    if isinstance(value, (tuple, list)):
+        # Components alone: encode them in the property's preferred (first) color
+        # format (convention.md:393).
+        allowed = _enum_values(format_)
+        if not allowed:
+            return None, "colorFormatMissing"
+        components = []
+        for component in value:
+            text, problem = _encode_float(component)
+            if problem:
+                return None, "colorComponentGrammar"
+            components.append(text)
+        payload = ",".join([allowed[0], *components])
+        problem = _check_color_payload(payload, format_)
+        return (None, problem) if problem else (payload, None)
+    return None, "colorType"
+
+
+def _encode_datetime(value: Any) -> tuple:
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        # ISO 8601 extended form, `T` separator (convention.md:132).
+        return value.isoformat(), None
+    if isinstance(value, str) and value:
+        return value, None
+    return None, "datetimeType"
+
+
+def _encode_duration(value: Any) -> tuple:
+    if isinstance(value, datetime.timedelta):
+        if value < datetime.timedelta(0):
+            return None, "durationNegative"
+        # PTxHxMxS (convention.md:137-144): days fold into hours, which the
+        # format has no larger unit than.
+        hours, rest = divmod(value.days * 86400 + value.seconds, 3600)
+        minutes, seconds = divmod(rest, 60)
+        payload = "PT"
+        if hours:
+            payload += f"{hours}H"
+        if minutes:
+            payload += f"{minutes}M"
+        if value.microseconds:
+            payload += f"{seconds}.{value.microseconds:06d}".rstrip("0") + "S"
+        elif seconds or payload == "PT":
+            payload += f"{seconds}S"
+        return payload, None
+    if isinstance(value, str):
+        if value == "PT" or not _DURATION_PAYLOAD.fullmatch(value):
+            return None, "durationGrammar"
+        return value, None
+    return None, "durationType"
+
+
+def _decode_json_container(text: str) -> tuple:
+    """Parse a json payload: an array or object, never NaN/Infinity (convention.md:150)."""
+    try:
+        decoded = json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError):
+        return None, "jsonInvalid"
+    if not isinstance(decoded, (list, dict)):
+        return None, "jsonNotArrayOrObject"
+    return decoded, None
+
+
+def _encode_json(value: Any) -> tuple:
+    if isinstance(value, str):
+        _, problem = _decode_json_container(value)
+        # A valid JSON string passes through unchanged rather than re-encoded.
+        return (None, problem) if problem else (value, None)
+    if not isinstance(value, (list, tuple, dict)):
+        return None, "jsonNotArrayOrObject"
+    try:
+        return json.dumps(value, allow_nan=False), None
+    except (TypeError, ValueError):
+        return None, "jsonInvalid"
+
+
+def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tuple:
+    """Encode ``value`` as a Homie 5 payload for ``datatype``.
+
+    Returns ``(payload, None)``, or ``(None, problem)`` when ``datatype`` cannot
+    represent ``value`` (convention.md:78). ``problem`` is a short camelCase reason.
+    The payload is the value's text; the ``0x00`` empty-string encoding is applied
+    by the publisher, and only for ``string`` (convention.md:65-67).
+    """
+    if datatype == PropertyDatatype.INTEGER:
+        return _encode_integer(value)
+    if datatype == PropertyDatatype.FLOAT:
+        return _encode_float(value)
+    if datatype == PropertyDatatype.BOOLEAN:
+        return _encode_boolean(value)
+    if datatype == PropertyDatatype.ENUM:
+        return _encode_enum(value, format_)
+    if datatype == PropertyDatatype.COLOR:
+        return _encode_color(value, format_)
+    if datatype == PropertyDatatype.DATETIME:
+        return _encode_datetime(value)
+    if datatype == PropertyDatatype.DURATION:
+        return _encode_duration(value)
+    if datatype == PropertyDatatype.JSON:
+        return _encode_json(value)
+    # string, and a missing or unknown datatype (already warned about).
+    return (str(value.value) if isinstance(value, Enum) else str(value)), None
 
 
 def sanitize_homie_id(value: Optional[str]) -> str:
@@ -779,39 +990,29 @@ class Property:
 
     def coerced_value(self) -> Optional[str]:
         """
-        Returns the property's value (potentially rounded), as a string.
-        Returns None if the value is invalid or cannot be coerced.
+        Returns the property's value (potentially rounded) as its Homie 5 payload
+        text, or None if the value is None or the datatype cannot represent it
+        (convention.md:78-150). A refusal is logged at warning.
+
+        datetime/date values encode as ISO 8601, timedelta as ``PTxHxMxS``, a
+        color tuple as the first ``$format`` color type plus its components, and a
+        json value must be an array or object (a JSON string of one passes through
+        unchanged). The ``0x00`` empty-string encoding is not applied here.
         """
+        payload, problem = self._encode()
+        if problem is not None:
+            logger.warning(
+                f"reason=propertyValueRefused,propertyId={self._id},datatype={self._datatype},"
+                f"problem={problem},value={self._value!r}"
+            )
+        return payload
+
+    def _encode(self) -> tuple:
+        """``(payload, problem)`` for the current value; both None for a None value."""
         property_value = self.value()
         if property_value is None:
-            return None
-
-        # A json-datatype property's wire payload MUST be serialized JSON text
-        # (Homie 5 §JSON), the same serialization used for $description. Mirror
-        # the inbound /set path (json.loads); do NOT fall through to str(), which
-        # emits Python repr (single quotes) and is invalid JSON. An already-valid
-        # JSON string is passed through unchanged so we don't double-encode it.
-        if self.is_json_datatype():
-            if isinstance(property_value, str):
-                return property_value
-            try:
-                return json.dumps(property_value)
-            except (TypeError, ValueError) as e:
-                logger.warning(f"reason=coercedValueInvalidJson,propertyId={self._id},value={property_value},error={e}")
-                return None
-
-        property_type = self.datatype()
-        if property_type == PropertyDatatype.BOOLEAN:
-            if not isinstance(property_value, bool):
-                logger.warning(f"reason=coercedValueInvalidBoolean,propertyId={self._id},value={property_value}")
-                return None
-            return str(property_value).lower()
-
-        # For enum values, use .value to get the underlying value
-        if isinstance(property_value, Enum):
-            return str(property_value.value)
-
-        return str(property_value)
+            return None, None
+        return _encode_property_value(property_value, self._datatype, self._format)
 
     def id(self) -> str:
         """
@@ -977,12 +1178,14 @@ class Property:
             try:
                 value = self.coerced_value()
                 if value is None:
-                    logger.warning(
-                        f"reason=propertyPublishValueCoercionFailed,propertyID={self._id},rawValue={self._value}"
-                    )
+                    # Refused (logged by coerced_value): publish nothing rather than a
+                    # payload the datatype does not allow (convention.md:78).
                     return False
                 # Encode an empty-string value as a single 0x00 byte so the broker
-                # does not mistake it for a zero-length "clear retained" payload.
+                # does not mistake it for a zero-length "clear retained" payload. Only
+                # for string (convention.md:65-67); another datatype never encodes to
+                # "" because its encoder refuses an empty value. A missing datatype was
+                # warned about at construction and keeps the string behavior.
                 payload = encode_empty_string(value)
                 # GH #50: skip a republish whose final wire payload is byte-identical to
                 # the one already sitting on this topic. Compared AFTER coercion and
@@ -993,13 +1196,14 @@ class Property:
                 # RETAINED only. The broker stores nothing for an event property, so an
                 # identical consecutive payload there is a second real event and dropping
                 # it would lose information rather than save a redundant write.
-                # Truthiness rather than `is True`: retained is Optional[bool] and may be
-                # None, which the publish call below already treats as non-retained.
                 if not force and self.retained() and self._ever_published and self._last_published == (topic, payload):
                     logger.debug(f"reason=propertyPublishValueUnchanged,propertyID={self._id},topic={topic}")
                     return True
                 logger.debug(f"reason=propertyPublishValue,value={value},topic={topic},retained={self.retained()}")
-                mqttc.publish(topic, payload, retain=self.retained(), qos=self._qos)
+                # A non-retained (event) property publishes non-retained at QoS 0
+                # (convention.md:50, :695): an event arrives now or not at all.
+                qos = self._qos if self.retained() else 0
+                mqttc.publish(topic, payload, retain=self.retained(), qos=qos)
                 self._ever_published = True  # FIX: Mark as published
                 # Memoize only after publish() returns, inside the try: a transport that
                 # raises must not leave a memo claiming the broker holds a payload it
@@ -1041,6 +1245,13 @@ class Property:
             # This prevents creating phantom topics during cleanup
             if not self._ever_published:
                 logger.info(f"reason=propertySkipClearNeverPublished,propertyID={self._id}")
+                return True
+            if not self.retained():
+                # The broker stores nothing for an event property, so there is nothing
+                # to retract; a retained empty message on an event topic would deliver
+                # a zero-length "event" to every live subscriber instead.
+                self._ever_published = False
+                self._last_published = None
                 return True
 
             mqttc = self.get_mqtt_client()
@@ -1370,7 +1581,9 @@ class Node:
             # actually covers is the property whose retained topic was deleted behind its
             # back -- clear_retained_topic(), or an operator wiping the broker -- where
             # the memo still claims the broker holds this payload and it does not.
-            property.publish_value(force=True)
+            # An event property is not replayed by a structural change (:695).
+            if property.retained():
+                property.publish_value(force=True)
         return property
 
     def add_property_from_dict(self, property_dict: dict) -> Property:
@@ -1480,6 +1693,11 @@ class Node:
         logger.debug(f"reason=nodePublish,nodeId={node_id},propertyCount={property_count}")
         # Use list() to create a shallow copy, preventing crash if dict changes during iteration
         for property_id, property in list(self._properties.items()):
+            if not property.retained():
+                # A republish walk restores the broker's retained store. An event
+                # property has nothing there, and replaying its last event would
+                # report it again (convention.md:695).
+                continue
             logger.debug(f"reason=nodePublishProperty,nodeId={node_id},propertyId={property_id}")
             # Best-effort per property. Property.publish_value() reaches the MQTT
             # client directly and does not wrap it, so an injected transport that
@@ -1786,6 +2004,9 @@ class Device:
         # Set by delete(): the device no longer exists on the broker, so nothing may
         # republish its $state (stop(), a reconnect's refresh_tree(), the will).
         self._deleted = False
+        # Alerts this device has raised and not cleared: alert id -> message.
+        # Tracked so a reconnect republishes them and delete() clears them.
+        self._alerts: dict = {}
         # SDK-n83: hash of the last $description we actually published, with
         # `version` removed. publish_description() uses it
         # to skip a republish whose content has not changed (saves the ~KB
@@ -2304,7 +2525,7 @@ class Device:
 
     def delete_all_from_mqtt(self) -> None:
         """
-        Clear this device's retained property values and $description from the broker.
+        Clear this device's retained property values, alerts and $description from the broker.
 
         A low-level data-cleanup helper: it clears every published property value and
         the $description topic, but deliberately does NOT touch $state, so on its own it
@@ -2342,7 +2563,10 @@ class Device:
                     elif hasattr(prop, "_ever_published") and prop._ever_published:
                         was_published = True
 
-                    if was_published:
+                    if was_published and not prop.retained():
+                        # Nothing retained to clear on an event topic (see clear_value).
+                        prop.invalidate_publish_cache()
+                    elif was_published:
                         prop_topic = f"{base_topic}/{node_id}/{prop_id}"
                         try:
                             mqttc.publish(prop_topic, "", retain=True, qos=self._qos)
@@ -2366,7 +2590,12 @@ class Device:
         except Exception as e:
             logger.warning(f"reason=deviceClearDescriptionFailed,deviceId={self._id},error={e}")
 
-        # Step 3: Clear internal tracking (no publishing happens here)
+        # Step 3: Clear raised alerts; a removed device leaves no topics behind
+        # (convention.md:289).
+        for alert_id in list(self._alerts):
+            self.clear_alert(alert_id)
+
+        # Step 4: Clear internal tracking (no publishing happens here)
         self._nodes.clear()
 
         logger.info(f"reason=deviceDeleteAllFromMqttComplete,deviceId={self._id}")
@@ -2601,6 +2830,8 @@ class Device:
         # may build on (see doc/consuming-a-homie-tree.md). Message set unchanged.
         self.publish_description(republish=True)
         self.publish_nodes(force=force)
+        for alert_id, message in list(self._alerts.items()):
+            self._publish_alert_topic(alert_id, message)
         # Snapshot — main thread may construct child devices (which append
         # to self._children) while this runs on the MQTT loop thread.
         for child in list(self._children):
@@ -2649,12 +2880,12 @@ class Device:
                 description = value if value else self.description()
                 payload = json.dumps(description) if description else None
             elif attribute == "$alert":
-                topic = base_topic + "$alert"
-                if value:
-                    payload = value
-                else:
-                    logger.info(f"reason=devicePublishAlertNoValue,id={self._id}")
-                    return
+                # An alert lives at $alert/[alert ID] (convention.md:517); a bare
+                # $alert topic is not one. Use publish_alert().
+                logger.warning(
+                    f"reason=devicePublishAlertWithoutId,id={self._id},hint=use publish_alert(alert_id, message)"
+                )
+                return
             if payload:
                 mqttc.publish(topic, payload, retain=True, qos=self._qos)
                 if attribute == "$description":
@@ -2666,6 +2897,75 @@ class Device:
                     self._last_description_content_hash = self._description_content_hash(description)
         except Exception as e:
             logger.exception(f"reason=devicePublishException,id={self._id},attribute={attribute},value={value},e={e}")
+
+    def _alert_topic(self, alert_id: str) -> str:
+        return f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/$alert/{alert_id}"
+
+    def _publish_alert_topic(self, alert_id: str, message: str) -> bool:
+        mqttc = self.get_mqtt_client()
+        if not mqttc:
+            _log_missing_client(
+                f"reason=devicePublishAlertNoMqttClient,id={self._id}", by_design=self._transport_free()
+            )
+            return False
+        try:
+            mqttc.publish(self._alert_topic(alert_id), message, retain=True, qos=self._qos)
+            return True
+        except Exception as e:
+            logger.warning(f"reason=devicePublishAlertException,id={self._id},alertId={alert_id},e={e}")
+            return False
+
+    def publish_alert(self, alert_id: str, message: str) -> bool:
+        """Raise a user-facing alert at ``$alert/[alert_id]`` (convention.md:512-527).
+
+        Retained, at the tree QoS. Raising the same id again replaces its message.
+        The alert stays until ``clear_alert(alert_id)``; ``delete()`` clears every
+        alert the device raised, and a reconnect republishes them.
+
+        ``alert_id`` must be a single topic level; one containing ``/``, ``+`` or
+        ``#``, or an empty one, is refused. An id outside the Homie ID format
+        (``a-z``, ``0-9``, ``-``) is warned about and still published. ``message``
+        must be a non-empty string: an empty payload deletes the topic, so clear an
+        alert with ``clear_alert()``. Returns True if published.
+        """
+        if not alert_id or not isinstance(alert_id, str) or any(c in alert_id for c in "/+#"):
+            logger.warning(f"reason=devicePublishAlertInvalidId,id={self._id},alertId={alert_id!r}")
+            return False
+        if not re.fullmatch(r"[a-z0-9-]+", alert_id):
+            _warn_invalid_once(
+                self, f"alertId:{alert_id}", f"reason=devicePublishAlertIdFormat,id={self._id},alertId={alert_id}"
+            )
+        if not isinstance(message, str) or message == "":
+            logger.warning(f"reason=devicePublishAlertEmptyMessage,id={self._id},alertId={alert_id}")
+            return False
+        self._alerts[alert_id] = message
+        return self._publish_alert_topic(alert_id, message)
+
+    def clear_alert(self, alert_id: str) -> bool:
+        """Remove the alert ``alert_id`` by deleting its retained topic (convention.md:519).
+
+        Returns True if the deletion was published. Clearing an alert this device
+        did not raise still publishes the deletion, so a stale alert left by an
+        earlier run can be removed.
+        """
+        if not alert_id or not isinstance(alert_id, str) or any(c in alert_id for c in "/+#"):
+            logger.warning(f"reason=deviceClearAlertInvalidId,id={self._id},alertId={alert_id!r}")
+            return False
+        self._alerts.pop(alert_id, None)
+        mqttc = self.get_mqtt_client()
+        if not mqttc:
+            _log_missing_client(f"reason=deviceClearAlertNoMqttClient,id={self._id}", by_design=self._transport_free())
+            return False
+        try:
+            mqttc.publish(self._alert_topic(alert_id), "", retain=True, qos=self._qos)
+            return True
+        except Exception as e:
+            logger.warning(f"reason=deviceClearAlertException,id={self._id},alertId={alert_id},e={e}")
+            return False
+
+    def alerts(self) -> dict:
+        """The alerts this device has raised and not cleared, ``{alert_id: message}``."""
+        return dict(self._alerts)
 
     def publish_state(self, state: Optional[DeviceState] = None) -> None:
         """

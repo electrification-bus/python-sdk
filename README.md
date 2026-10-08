@@ -127,12 +127,26 @@ It moves the state and publishes it together, and the move is unconditional: pub
 Homie 5 distinguishes two things that both look "empty" on the wire, and the SDK handles each automatically:
 
 - **Clearing (retracting) a retained value** — set the property to `None`. Once it has been published, this emits a zero-length `retain=True` payload, which MQTT/Homie treats as "delete the retained topic", so a subscriber that connects later sees no stale value. (`clear_value()` does the same explicitly; `Node.delete_property()` clears on removal.) A `None` that was never published is a silent no-op — no phantom topic is created.
-- **An actual empty-string value** — set a string property to `""`. This is published as a single null byte (`0x00`), the Homie 5 encoding that keeps `""` distinct from a topic-clear. Inbound `0x00` payloads are decoded back to `""` on the controller and on `/set`. Helpers `encode_empty_string()` / `decode_empty_string()` and the constant `HOMIE_EMPTY_STRING_PAYLOAD` are exported for consumers that need them directly.
+- **An actual empty-string value** — set a `string` property to `""`. This is published as a single null byte (`0x00`), the Homie 5 encoding that keeps `""` distinct from a topic-clear. Only `string` has an empty value: `""` on any other datatype is refused like any other invalid value (see below). Inbound `0x00` payloads are decoded back to `""` on the controller and on `/set`. Helpers `encode_empty_string()` / `decode_empty_string()` and the constant `HOMIE_EMPTY_STRING_PAYLOAD` are exported for consumers that need them directly.
 
 ```python
 temp.set_value(None)     # retracts the retained topic (subscribers see nothing)
 label.set_value("")      # publishes an empty-string VALUE (0x00 on the wire)
 ```
+
+#### Values the datatype cannot represent are refused
+
+A value is encoded for its property's datatype before it is published (convention.md:74-150 at [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md)). A value the datatype cannot represent is refused: nothing is published, the retained topic keeps the last good value, `set_value()` returns `False`, and a `reason=propertyValueRefused` warning names the problem. Refused: NaN and infinities on `float`, a `bool` on `integer` or `float`, an `integer` that is not whole or does not fit in 64 bits, an `enum` value not in its `format`, a `json` value that is not an array or object or contains NaN, and `""` on anything but `string`. Floats are written without `+` in the exponent (`1e20`, not `1e+20`).
+
+Native values are encoded for you: `datetime`/`date` as ISO 8601 (`2026-10-08T12:00:00+00:00`), `timedelta` as `PTxHxMxS` (`PT12H5M46S`; days fold into hours), and a color tuple as the property's first `format` color type plus its components (`(255, 0, 0)` with `format="rgb,hsv"` publishes `rgb,255,0,0`). A string is checked against the datatype's payload grammar and published as given.
+
+#### Event (non-retained) properties
+
+A property with `retained=False` publishes non-retained at QoS 0, as Homie 5 requires for events: a subscriber gets the event now or not at all. A reconnect's `refresh_tree()` and a structural change (`add_node`, `add_property`) never replay an event's last value, and setting it to `None` publishes nothing, since the broker holds nothing to retract.
+
+#### Alerts
+
+`device.publish_alert("battery", "Battery is low, at 8%")` raises a retained alert at `$alert/battery`; `device.clear_alert("battery")` deletes it. Alerts are republished on reconnect and cleared by `delete()`. `publish("$alert", ...)` without an alert id publishes nothing and logs a warning.
 
 #### Unchanged values are not republished
 
@@ -142,7 +156,7 @@ Three carve-outs, each deliberate:
 
 - **A non-retained (event) property is never gated.** The broker stores nothing for it, so an identical consecutive payload is a second real event, not a redundant write.
 - **Retraction always publishes.** `set_value(None)` / `clear_value()` must reach the broker to delete the topic.
-- **Every whole-tree republish forces.** `refresh_tree()`, and the reconnect that calls it, republish every property value regardless. That is what repopulates a broker whose retained store is empty (restarted without persistence, or a fresh one); a gated refresh would find every payload equal to what it last published and send nothing.
+- **Every whole-tree republish forces.** `refresh_tree()`, and the reconnect that calls it, republish every retained property value regardless. That is what repopulates a broker whose retained store is empty (restarted without persistence, or a fresh one); a gated refresh would find every payload equal to what it last published and send nothing.
 
 The retained state left on the broker is identical either way: strictly fewer messages, same truth. `Property.get_last_published_value()` returns the memoized wire payload, and `Property.invalidate_publish_cache()` forgets it, which is what you call if something deletes a retained value topic behind the SDK's back.
 

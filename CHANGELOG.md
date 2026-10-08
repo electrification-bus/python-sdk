@@ -19,9 +19,15 @@ Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com
 - A `json` property whose `format` is a dict publishes it as a JSON string, not a nested object (:395).
 - Invalid producer input is warned about, once per object, and still published; it will raise in the next minor release: a property with no `datatype` (published without one, :340), `retained=None` (published as `false`, the non-retained behavior it always had, :343), an `enum` or `color` with no `format`, an enum format with an empty or duplicate value (:392-393), and a `color` format listing anything but `rgb`, `hsv`, `xyz`.
 - `description_extras` keys that are Homie core `$description` fields (`homie`, `version`, `nodes`, `name`, `type`, `children`, `root`, `parent`, `extensions`) are dropped with a warning. An extra could add `root` and `parent` to a root device (:220).
+- An outbound value the property's datatype cannot represent is refused: nothing is published, `set_value()` returns `False`, and a `reason=propertyValueRefused` warning is logged. Refused: non-finite floats (:99), a `bool` on `integer` or `float`, an integer that is not whole or outside 64 bits (:87-89), an enum value not in `format` (:111), and a `json` value that is not an array or object or contains NaN (:150). Floats are written without `+` in the exponent (:97).
+- The `0x00` empty-string encoding applies only to `string` properties (:65-67); `""` on another datatype is refused.
+- A non-retained (event) property publishes non-retained at QoS 0 (:50). The reconnect and structural-change republish walks skip it, so the last event is no longer replayed (:695), and clearing it publishes nothing instead of a retained empty message on the event topic.
+- `Device.publish("$alert", ...)` publishes nothing and warns: an alert needs an id (:517). Use `publish_alert()`.
 
 ### Added
 
+- Encoders for `datetime` (`datetime`/`date` as ISO 8601, :132), `duration` (`timedelta` as `PTxHxMxS`, :137-144) and `color` (a component tuple in the first `format` color type, :118-123). These fell through to `str()`, which produced `2026-10-08 12:00:00+00:00`, `0:05:00` and `(255, 0, 0)`.
+- `Device.publish_alert(alert_id, message)`, `Device.clear_alert(alert_id)` and `Device.alerts()`. Alerts publish retained to `$alert/[alert ID]` (:517), are republished on reconnect, and are cleared by `delete()` (:289).
 - `Device.invalidate_description_cache()`, the `$description` counterpart of `Property.invalidate_publish_cache()`. `clear_retained_topic()` aimed at the device's own `$description` and `delete_all_from_mqtt()` call it, so a later `publish_description()` is no longer suppressed after the topic was cleared.
 
 ### Fixed
