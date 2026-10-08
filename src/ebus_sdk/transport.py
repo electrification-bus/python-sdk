@@ -52,6 +52,15 @@ class MqttControllerTransport(MqttTransport, Protocol):
     ``is_connected``, ``is_running`` and ``publish_and_flush`` are absent because nothing on
     the ``Controller`` path calls them — they belong to the ``Device`` / ``Property`` path,
     which types its own injection point with ``MqttDeviceTransport`` below.
+
+    ``Controller`` is unpaced on an injected transport unless given
+    ``subscription_batch_size``. Pacing requires that subscribing a filter again
+    delivers its retained messages again, as a broker connection does: the end of a
+    device's burst is the retained ``$description`` resubscribed behind its property
+    filters. A ``subscribe`` that takes a keyword-only ``with_retain`` (ebus-mqtt-client
+    0.7.0) is called with ``with_retain=True`` for ``$description`` and must then pass
+    the retain flag as a third callback argument, so a live republish is not taken for
+    that marker.
     """
 
     def unsubscribe(self, sub: str) -> object: ...

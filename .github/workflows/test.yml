@@ -29,5 +29,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
+      # mosquitto for tests/test_controller_real_broker.py (GH #97), which starts its
+      # own broker on a free port and is skipped when the binary is absent.
+      - run: sudo apt-get update && sudo apt-get install -y mosquitto
       - run: pip install -e '.[dev]'
       - run: python -m pytest -q

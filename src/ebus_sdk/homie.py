@@ -64,7 +64,7 @@ except ImportError:
         pass
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import partial
 from threading import RLock
@@ -3544,6 +3544,129 @@ class DiscoveredDevice:
         return {}
 
 
+# Controller subscription pacing and stuck-device healing (GH #97). Subscribing to many
+# devices at once makes the broker queue every matching retained message for this one
+# client; past its per-client limits (mosquitto: max_queued_messages 1000) it drops the
+# excess, and retained messages are sent only at subscribe time, so a dropped message
+# never arrives.
+#
+# Each device is subscribed in two stages. Stage one subscribes the device's $state and
+# $description at once (at most two retained messages) and needs no batch slot, so a
+# declared device that never publishes blocks nothing. Once both have arrived, stage two
+# subscribes the property filters, which carry the bulk of the retained messages, in
+# batches of at most subscription_batch_size devices and subscription_batch_values
+# retained messages (counted from each $description: one value and one possible $target
+# per retained property). A device whose own count exceeds subscription_batch_values is
+# subscribed node by node, in chunks that fit. A device holds its slot until its burst
+# has drained: either every value and $target it can owe has arrived, or the retained
+# $description it resubscribes after its property filters arrives behind the burst. That
+# marker relies on the broker sending one client's messages in order, as mosquitto does,
+# and on a resubscribe replaying retained messages, which a transport that only records
+# subscriptions does not do; that is why an injected transport is unpaced by default.
+CONTROLLER_SUBSCRIPTION_BATCH_SIZE = 8
+# Half of mosquitto's default max_queued_messages, leaving room for the $state and
+# $description bursts and for live traffic.
+CONTROLLER_SUBSCRIPTION_BATCH_VALUES = 500
+CONTROLLER_STUCK_DEVICE_TIMEOUT = 10.0
+CONTROLLER_MAX_RESUBSCRIBE_ATTEMPTS = 3
+# Upper bound on how often message handling, or the owned client's timer, runs the stuck check.
+_STUCK_CHECK_INTERVAL = 1.0
+# Per-device topic filter suffixes. Wildcard discovery hears $state through its
+# broker-wide {domain}/5/+/$state filter, so a device found that way needs only the rest.
+_DEVICE_FILTERS = ("$state", "$description", "+/+", "+/+/$target")
+_ATTRIBUTE_FILTERS = ("$state", "$description")
+_WILDCARD_ATTRIBUTE_FILTERS = ("$description",)
+_PROPERTY_FILTERS = ("+/+", "+/+/$target")
+# Controller._property_coverage value for a device whose whole-device property filters are subscribed.
+_ALL_NODES = "*"
+
+
+class _DefaultBatchSize:
+    """Sentinel default for subscription_batch_size: paced for an owned client, unpaced for an injected one."""
+
+    def __repr__(self) -> str:
+        return "<default>"
+
+
+_DEFAULT_BATCH_SIZE: Any = _DefaultBatchSize()
+
+
+def _node_filters(nodes) -> tuple:
+    """Property filter suffixes covering only the given nodes."""
+    return tuple(f for node in nodes for f in (f"{node}/+", f"{node}/+/$target"))
+
+
+def _coverage_filters(coverage) -> tuple:
+    """Property filter suffixes that may be subscribed for a Controller._property_coverage value."""
+    if coverage is None or coverage == _ALL_NODES:
+        return _PROPERTY_FILTERS
+    return _PROPERTY_FILTERS + _node_filters(sorted(coverage))
+
+
+@dataclass
+class _SubscriptionWatch:
+    """A subscribed device awaiting its retained messages.
+
+    In stage one it awaits $state and $description; in stage two it holds a batch slot
+    until its property burst drains. In stage two, ``nodes`` is None for the
+    whole-device filters or the nodes of one chunk, ``expected_values`` the retained
+    values those declare, and ``received_values`` the values and targets seen.
+    """
+
+    filters: tuple
+    subscribed_at: float
+    attempts: int = 0
+    expected_values: int = 0
+    received_values: set = field(default_factory=set)
+    nodes: Optional[tuple] = None
+    last_received: Optional[int] = None
+    # Stage one after a reconnect: the device's $description must arrive again, even
+    # though a stale one is on record, before its property filters are paced.
+    refresh: bool = False
+
+    @property
+    def owed(self) -> int:
+        """Retained messages still possible: a value and a $target per expected value."""
+        return max(2 * self.expected_values - len(self.received_values), 0)
+
+    @property
+    def values_received(self) -> int:
+        return sum(1 for key in self.received_values if len(key) == 2)
+
+
+@dataclass
+class _PendingProperties:
+    """A device waiting for a batch slot to subscribe (more of) its property filters."""
+
+    attempts: int = 0
+    # Filters to unsubscribe before subscribing, so the broker replays them (a retry).
+    resubscribe: tuple = ()
+    # Messages the failed attempt received, to stop retrying one that cannot progress.
+    last_received: Optional[int] = None
+
+
+def _retained_counts(description: Any) -> dict:
+    """{node_id: retained properties (the Homie 5 default)} for every node a $description declares."""
+    nodes = description.get("nodes") if isinstance(description, dict) else None
+    if not isinstance(nodes, dict):
+        return {}
+    counts = {}
+    for node_id, node in nodes.items():
+        properties = node.get("properties") if isinstance(node, dict) else None
+        if not isinstance(properties, dict):
+            counts[node_id] = 0
+            continue
+        counts[node_id] = sum(
+            1 for p in properties.values() if not isinstance(p, dict) or p.get("retained", True) is not False
+        )
+    return counts
+
+
+def _retained_property_count(description: Any) -> int:
+    """Properties a $description declares as retained (the Homie 5 default)."""
+    return sum(_retained_counts(description).values())
+
+
 class Controller:
     """
     Homie MQTT Controller - discovers and interacts with Homie devices
@@ -3575,6 +3698,11 @@ class Controller:
         root_device_id: Optional[str] = None,
         qos: int = EBUS_HOMIE_MQTT_QOS,
         mqttc: Optional[MqttControllerTransport] = None,
+        subscription_batch_size: Optional[int] = _DEFAULT_BATCH_SIZE,
+        subscription_batch_values: Optional[int] = CONTROLLER_SUBSCRIPTION_BATCH_VALUES,
+        stuck_device_timeout: Optional[float] = CONTROLLER_STUCK_DEVICE_TIMEOUT,
+        max_resubscribe_attempts: int = CONTROLLER_MAX_RESUBSCRIBE_ATTEMPTS,
+        stuck_check_thread: Optional[bool] = None,
     ):
         """
         Initialize a Homie Controller
@@ -3604,6 +3732,45 @@ class Controller:
                 Assistant consumer driving MQTT on its own loop). Drive discovery
                 with start_discovery() once the client is connected. Default
                 None: the SDK constructs, starts, and owns a client from mqtt_cfg.
+            subscription_batch_size: Most devices whose property filters may
+                await their retained messages at once (GH #97). Every device's
+                $state and $description are subscribed as soon as it is known;
+                its property filters follow once both have arrived, in batches
+                of this many devices, the next starting as an earlier device's
+                retained burst finishes arriving. This keeps the broker's
+                per-client queue from overflowing and dropping retained
+                messages. None or 0 subscribes all of a device's filters at once.
+                Default: CONTROLLER_SUBSCRIPTION_BATCH_SIZE (8) for a client the
+                SDK builds, None for an injected ``mqttc``. Pacing detects the
+                end of a burst by resubscribing ``$description``, so pass a value
+                for an injected transport only if a resubscribe makes it deliver
+                the retained ``$description`` again, as a broker connection does.
+            subscription_batch_values: Most retained messages the devices in a
+                batch may still be owed (GH #97), counted from each device's
+                $description as a value and a possible $target per retained
+                property. A device that would exceed it waits, unless no other
+                device is in flight. A device that exceeds it on its own is
+                subscribed node by node, in chunks that fit. None counts devices
+                only.
+            stuck_device_timeout: Seconds a subscribed device may lack $state or
+                $description, or keep a batch slot, before it is declared stuck:
+                its $state and $description filters are unsubscribed and
+                resubscribed so the broker resends them, or it gives up its slot
+                and waits for another. Message handling runs this check at most
+                once a second, and so does a timer thread when
+                ``stuck_check_thread`` allows it; see check_stuck_children().
+                None disables the automatic check and the thread.
+            max_resubscribe_attempts: Retries per stuck device before it is
+                logged as unrecoverable and no longer checked. 0 only logs. A
+                slot holder whose retry received no more than the attempt
+                before it is not retried again.
+            stuck_check_thread: Whether start_discovery() starts the daemon
+                thread "ebus-controller-stuck-check" that runs the stuck check
+                on a quiet connection. None (default) starts it only for a
+                client the SDK builds. False never starts it: the caller drives
+                check_stuck_children(), and message handling still runs the
+                check. True starts it for an injected ``mqttc`` too. stop()
+                ends the thread.
         """
         if device_id is not None and root_device_id is not None:
             raise ValueError(
@@ -3634,6 +3801,39 @@ class Controller:
         # parent_id linkages so a pre-created-but-not-yet-described child
         # doesn't look "missing" and get re-subscribed every reconcile.
         self._subscribed_children: dict = {}
+
+        # Subscription pacing and stuck-device healing (GH #97). State changes on message
+        # arrival, device removal, resync, or a stuck check (a call to
+        # check_stuck_children(), or the owned client's timer). The lock guards the
+        # bookkeeping only; transport calls are made after releasing it.
+        if subscription_batch_size is _DEFAULT_BATCH_SIZE:
+            subscription_batch_size = CONTROLLER_SUBSCRIPTION_BATCH_SIZE if mqttc is None else None
+        if subscription_batch_size is not None and subscription_batch_size < 0:
+            raise ValueError("subscription_batch_size must be None or >= 0")
+        if max_resubscribe_attempts < 0:
+            raise ValueError("max_resubscribe_attempts must be >= 0")
+        if subscription_batch_values is not None and subscription_batch_values < 1:
+            raise ValueError("subscription_batch_values must be None or >= 1")
+        self._subscription_batch_size = subscription_batch_size or None
+        self._subscription_batch_values = subscription_batch_values
+        self._stuck_device_timeout = stuck_device_timeout
+        self._max_resubscribe_attempts = max_resubscribe_attempts
+        self._stuck_check_thread = mqttc is None if stuck_check_thread is None else stuck_check_thread
+        self._pacing_lock = threading.RLock()
+        # Stage one, {device_id: _SubscriptionWatch}: awaiting $state and $description.
+        self._awaiting_attributes: dict = {}
+        # Stage two, {device_id: _PendingProperties}, insertion-ordered: waiting for a batch slot.
+        self._pending_subscriptions: dict = {}
+        # Stage two, {device_id: _SubscriptionWatch}: holding a batch slot.
+        self._watches: dict = {}
+        # Devices whose $description was resubscribed behind their property filters.
+        self._description_markers: set = set()
+        # {device_id: _ALL_NODES or set of node ids}: whose property filters are subscribed.
+        self._property_coverage: dict = {}
+        self._last_stuck_check = time.monotonic()
+        # Drives the stuck check when _stuck_check_thread is set, so a quiet connection heals.
+        self._stuck_timer: Optional[threading.Thread] = None
+        self._stuck_timer_stop = threading.Event()
 
         # Callbacks
         self._on_device_discovered = None
@@ -3694,7 +3894,44 @@ class Controller:
         ``on_disconnect(clean: bool)`` hook is notified (SDK-al5).
         """
         logger.info(f"reason=controllerDisconnect,transportRc={rc}")
+        try:
+            self._drop_device_subscriptions()
+        except Exception:
+            logger.exception("reason=dropDeviceSubscriptionsException")
         _dispatch_disconnect(self._on_disconnect, rc, "controller")
+
+    def _drop_device_subscriptions(self) -> None:
+        """Remove every discovered device's own filters from the owned client while it is down.
+
+        On reconnect the client resubscribes everything it holds at once, which is the
+        retained-message flood pacing exists to prevent (GH #97). Dropping the per-device
+        filters here leaves it only the discovery filter (wildcard) or the root's filters
+        (tree-rooted), and resync() re-paces the devices. Unpaced and single-device
+        controllers keep their filters.
+        """
+        client = self._owned_client
+        if client is None or not getattr(client, "is_running", False) or not self._paced or self.device_id:
+            return
+        wildcard = not self.is_tree_rooted
+        attributes = _WILDCARD_ATTRIBUTE_FILTERS if wildcard else _ATTRIBUTE_FILTERS
+        with self._pacing_lock:
+            ids = (
+                set(self.devices)
+                | set(self._property_coverage)
+                | set(self._awaiting_attributes)
+                | set(self._pending_subscriptions)
+                | set(self._watches)
+            )
+            ids.discard(self.root_device_id)
+            coverage = {d: self._property_coverage.pop(d, None) for d in ids}
+            for d in ids:
+                self._awaiting_attributes.pop(d, None)
+            self._pending_subscriptions.clear()
+            self._watches.clear()
+            self._description_markers.clear()
+        for device_id in sorted(ids):
+            self._unsubscribe_filters(device_id, attributes + _coverage_filters(coverage[device_id]))
+        logger.info(f"reason=deviceSubscriptionsDropped,devices={len(ids)}")
 
     @property
     def qos(self) -> int:
@@ -3720,8 +3957,13 @@ class Controller:
         ``$state``/``$description`` the broker replays after a (re)connect
         drives a clean re-walk from the root (the state edge that gates
         descendant discovery is seen rather than short-circuited by stale
-        state). A no-op in wildcard and single-device modes, where MqttClient's
-        own sub_callbacks recovery is sufficient.
+        state).
+
+        In wildcard mode with pacing, a device whose filters were dropped when the
+        owned client disconnected is subscribed again like a newly discovered one: its
+        $description first, then its property filters, paced. A device whose filters
+        are still in place is left alone, so this is a no-op for an injected client
+        that keeps its own subscriptions. Single-device mode is a no-op.
 
         The SDK calls this on every (re)connect for a client it owns. A
         bring-your-own-transport caller (``Controller(mqttc=...)``) in
@@ -3730,16 +3972,47 @@ class Controller:
         (via ``MqttClient.from_config``), which an injected client bypasses.
         """
         if self.is_tree_rooted:
+            # The re-walk re-requests every descendant, so pacing work from the previous
+            # connection is dropped. The root's filters were resubscribed by the
+            # transport; watch it so a root whose retained messages are lost also heals.
+            with self._pacing_lock:
+                self._pending_subscriptions.clear()
+                self._watches.clear()
+                self._description_markers.clear()
+                self._awaiting_attributes = {self.root_device_id: _SubscriptionWatch(_DEVICE_FILTERS, time.monotonic())}
+                self._property_coverage = {self.root_device_id: _ALL_NODES}
             # Cold restart of tree-rooted bookkeeping. paho-mqtt's MqttClient
             # has already re-subscribed our root's four filters; retained
             # state/description will arrive momentarily and the state-edge
-            # handler will reconcile descendants from scratch. Wipe the
+            # handler will reconcile descendants from scratch. Replace the
             # in-memory device registry so the init→ready edge sees the
             # transition (the previous state would otherwise short-circuit it).
-            self.devices = {}
+            # One assignment, so another thread never sees a registry without the root.
             self._subscribed_children = {}
-            device = DiscoveredDevice(self.root_device_id, self.homie_domain)
-            self.devices[self.root_device_id] = device
+            self.devices = {self.root_device_id: DiscoveredDevice(self.root_device_id, self.homie_domain)}
+        elif not self.device_id and self._paced:
+            self._repace_wildcard_devices()
+
+    def _repace_wildcard_devices(self) -> None:
+        """Restart stage one for every known device that has no filters subscribed."""
+        restart = []
+        with self._pacing_lock:
+            for device_id in list(self.devices):
+                if (
+                    device_id in self._property_coverage
+                    or device_id in self._awaiting_attributes
+                    or device_id in self._pending_subscriptions
+                    or device_id in self._watches
+                ):
+                    continue
+                self._awaiting_attributes[device_id] = _SubscriptionWatch(
+                    _WILDCARD_ATTRIBUTE_FILTERS, time.monotonic(), refresh=True
+                )
+                restart.append(device_id)
+        if restart:
+            logger.info(f"reason=resyncRepaceDevices,devices={len(restart)}")
+        for device_id in restart:
+            self._subscribe_tracked(device_id, _WILDCARD_ATTRIBUTE_FILTERS)
 
     def start_discovery(self, homie_domain: Optional[str] = None) -> None:
         """
@@ -3766,7 +4039,7 @@ class Controller:
             # discovered via the parent's $description.children
             device = DiscoveredDevice(self.root_device_id, domain)
             self.devices[self.root_device_id] = device
-            self._subscribe_device_topics(self.root_device_id)
+            self._request_subscription(self.root_device_id, paced=False)
         elif self.device_id:
             # Single-device mode: subscribe to exact topics, no wildcard
             # in the device-id position
@@ -3774,41 +4047,388 @@ class Controller:
             # Pre-create the DiscoveredDevice entry
             device = DiscoveredDevice(self.device_id, domain)
             self.devices[self.device_id] = device
-            self._subscribe_device_topics(self.device_id)
+            self._request_subscription(self.device_id, paced=False)
         else:
             # Wildcard discovery mode (original behavior)
             discovery_topic = f"{domain}/{EBUS_HOMIE_VERSION_MAJOR}/+/$state"
             logger.info(f"reason=startDiscovery,topic={discovery_topic}")
             self.mqttc.subscribe(discovery_topic, param=self._on_state_message, qos=self._qos)
+        self._start_stuck_timer()
 
-    def _subscribe_device_topics(self, device_id: str) -> None:
-        """Subscribe to the four exact-device topic patterns for device_id.
+    def _start_stuck_timer(self) -> None:
+        """Run the stuck check from a timer thread when ``stuck_check_thread`` allows it.
 
-        Used by single-device mode, tree-rooted mode (for the root and each
-        discovered descendant). The wildcard $state subscription path uses a
-        different shape and bypasses this.
+        By default an injected client's caller owns its event loop and threads, so it
+        calls check_stuck_children() itself.
         """
+        if not self._stuck_check_thread or self._stuck_device_timeout is None:
+            return
+        if self._stuck_timer is not None and self._stuck_timer.is_alive():
+            return
+        self._stuck_timer_stop.clear()
+        interval = max(min(_STUCK_CHECK_INTERVAL, self._stuck_device_timeout), 0.05)
+
+        def run() -> None:
+            while not self._stuck_timer_stop.wait(interval):
+                try:
+                    self._maybe_check_stuck()
+                except Exception:
+                    logger.exception("reason=stuckCheckTimerException")
+
+        self._stuck_timer = threading.Thread(target=run, name="ebus-controller-stuck-check", daemon=True)
+        self._stuck_timer.start()
+
+    def _subscribe_filters(self, device_id: str, filters: tuple) -> None:
+        """Subscribe the given per-device filter suffixes for device_id, in order.
+
+        Wildcard discovery already hears $state through {domain}/5/+/$state, so it
+        never subscribes a device's own $state filter.
+        """
+        if not self.mqttc:
+            return
         base = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}"
-        self.mqttc.subscribe(
-            f"{base}/$state",
-            param=self._on_state_message,
-            qos=self._qos,
-        )
-        self.mqttc.subscribe(
-            f"{base}/$description",
-            param=partial(self._on_description_message, device_id),
-            qos=self._qos,
-        )
-        self.mqttc.subscribe(
-            f"{base}/+/+",
-            param=partial(self._on_property_message, device_id),
-            qos=self._qos,
-        )
-        self.mqttc.subscribe(
-            f"{base}/+/+/$target",
-            param=partial(self._on_target_message, device_id),
-            qos=self._qos,
-        )
+        for suffix in filters:
+            topic = f"{base}/{suffix}"
+            if suffix == "$state":
+                self.mqttc.subscribe(topic, param=self._on_state_message, qos=self._qos)
+            elif suffix == "$description":
+                # The retain flag tells the resubscribed marker from a live republish.
+                callback = partial(self._on_description_message, device_id)
+                if _subscribe_supports_with_retain(self.mqttc):
+                    self.mqttc.subscribe(topic, param=callback, qos=self._qos, with_retain=True)
+                else:
+                    self.mqttc.subscribe(topic, param=callback, qos=self._qos)
+            elif suffix.endswith("/$target"):
+                self.mqttc.subscribe(topic, param=partial(self._on_target_message, device_id), qos=self._qos)
+            else:
+                self.mqttc.subscribe(topic, param=partial(self._on_property_message, device_id), qos=self._qos)
+
+    def _unsubscribe_filters(self, device_id: str, filters: tuple) -> None:
+        if not self.mqttc:
+            return
+        base = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}"
+        for suffix in filters:
+            self.mqttc.unsubscribe(f"{base}/{suffix}")
+
+    # ── Subscription pacing and stuck-device healing (GH #97) ──────────────
+
+    @property
+    def _paced(self) -> bool:
+        return self._subscription_batch_size is not None
+
+    def _subscribe_tracked(self, device_id: str, filters: tuple) -> None:
+        """Subscribe, then undo it if the device was dropped meanwhile on another thread.
+
+        A drop removes the device from the registry before it unsubscribes, so checking
+        the registry after subscribing leaves the filters unsubscribed whichever thread
+        finishes last.
+        """
+        self._subscribe_filters(device_id, filters)
+        if device_id not in self.devices:
+            logger.info(f"reason=subscriptionUndoneDeviceDropped,deviceID={device_id}")
+            self._unsubscribe_filters(device_id, filters)
+
+    def _request_subscription(self, device_id: str, paced: bool = True) -> None:
+        """Start stage one for a device: subscribe its $state and $description now.
+
+        Unpaced (the tree root, the single device, or subscription_batch_size=None),
+        the property filters are subscribed at the same time and there is no stage two.
+        """
+        wildcard = not (self.is_tree_rooted or self.device_id)
+        filters = _WILDCARD_ATTRIBUTE_FILTERS if wildcard else _ATTRIBUTE_FILTERS
+        if not (paced and self._paced):
+            filters = filters + _PROPERTY_FILTERS
+        with self._pacing_lock:
+            if (
+                device_id in self._awaiting_attributes
+                or device_id in self._pending_subscriptions
+                or device_id in self._watches
+            ):
+                return
+            self._awaiting_attributes[device_id] = _SubscriptionWatch(filters, time.monotonic())
+            if _PROPERTY_FILTERS[0] in filters:
+                self._property_coverage[device_id] = _ALL_NODES
+        self._subscribe_tracked(device_id, filters)
+
+    def _uncovered_nodes_locked(self, device_id: str, description: Any) -> Optional[list]:
+        """Nodes of description whose property filters are not subscribed; None when all are."""
+        coverage = self._property_coverage.get(device_id)
+        if coverage == _ALL_NODES:
+            return None
+        nodes = list(_retained_counts(description))
+        if coverage is None:
+            return nodes
+        uncovered = [n for n in nodes if n not in coverage]
+        return uncovered or None
+
+    def _next_chunk_locked(self, device_id: str, description: Any):
+        """The next property filters to subscribe for a device: (nodes, filters, expected values).
+
+        The whole-device filters when nothing is subscribed yet and the device's retained
+        messages fit the value budget; otherwise the next nodes, in declared order, that
+        fit it (at least one). None when every node is already covered.
+        """
+        uncovered = self._uncovered_nodes_locked(device_id, description)
+        if uncovered is None:
+            return None
+        counts = _retained_counts(description)
+        budget = self._subscription_batch_values
+        total = sum(counts[n] for n in uncovered)
+        if device_id not in self._property_coverage and (budget is None or 2 * total <= budget):
+            return None, _PROPERTY_FILTERS, total
+        nodes, expected = [], 0
+        for node in uncovered:
+            if nodes and budget is not None and 2 * (expected + counts[node]) > budget:
+                break
+            nodes.append(node)
+            expected += counts[node]
+        return tuple(nodes), _node_filters(nodes), expected
+
+    def _queue_front_locked(self, device_id: str, entry: _PendingProperties) -> None:
+        self._pending_subscriptions = {device_id: entry, **self._pending_subscriptions}
+
+    def _take_pending_locked(self) -> list:
+        """Move pending devices into free batch slots; the caller subscribes them unlocked.
+
+        A device starts when a slot is free and the retained messages its next chunk
+        declares fit in the value budget beside those still owed to the devices in
+        flight. With nothing in flight it starts whatever its size.
+        """
+        started = []
+        owed = sum(w.owed for w in self._watches.values())
+        while self._pending_subscriptions and len(self._watches) < self._subscription_batch_size:
+            device_id = next(iter(self._pending_subscriptions))
+            device = self.devices.get(device_id)
+            entry = self._pending_subscriptions[device_id]
+            chunk = None if device is None else self._next_chunk_locked(device_id, device.description)
+            if chunk is None:
+                del self._pending_subscriptions[device_id]
+                continue
+            nodes, filters, expected = chunk
+            budget = self._subscription_batch_values
+            if self._watches and budget is not None and owed + 2 * expected > budget:
+                break
+            del self._pending_subscriptions[device_id]
+            owed += 2 * expected
+            if nodes is None:
+                self._property_coverage[device_id] = _ALL_NODES
+            else:
+                self._property_coverage.setdefault(device_id, set()).update(nodes)
+            if expected:
+                self._watches[device_id] = _SubscriptionWatch(
+                    filters,
+                    time.monotonic(),
+                    attempts=entry.attempts,
+                    expected_values=expected,
+                    nodes=nodes,
+                    last_received=entry.last_received,
+                )
+                self._description_markers.add(device_id)
+            started.append((device_id, filters, entry.resubscribe, bool(expected)))
+        return started
+
+    def _start_subscriptions(self, started: list) -> None:
+        """Subscribe each started device's property filters, then resubscribe its $description.
+
+        The broker resends the retained $description behind the property burst, so its
+        arrival marks the burst as drained.
+        """
+        for device_id, filters, resubscribe, marked in started:
+            logger.info(
+                f"reason=pacedSubscribe,deviceID={device_id},filters={len(filters)},"
+                f"pending={len(self._pending_subscriptions)}"
+            )
+            if resubscribe:
+                self._unsubscribe_filters(device_id, resubscribe)
+            self._subscribe_tracked(device_id, filters + (("$description",) if marked else ()))
+
+    def _requeue_uncovered_locked(self, device_id: str, front: bool = False) -> None:
+        """Queue a device for stage two if any of its nodes still lacks property filters."""
+        device = self.devices.get(device_id)
+        if (
+            device is None
+            or device.state is None
+            or device.description is None
+            or device_id in self._awaiting_attributes
+            or device_id in self._pending_subscriptions
+            or device_id in self._watches
+            or self._uncovered_nodes_locked(device_id, device.description) is None
+        ):
+            return
+        if front:
+            self._queue_front_locked(device_id, _PendingProperties())
+        else:
+            self._pending_subscriptions[device_id] = _PendingProperties()
+
+    def _release_slot(self, device_id: str) -> None:
+        """A device's property burst has drained: free its slot for the next pending device.
+
+        A device subscribed node by node goes back to the front of the queue for its next chunk.
+        """
+        with self._pacing_lock:
+            if device_id not in self._watches:
+                return
+            self._release_slot_locked(device_id)
+            started = self._take_pending_locked()
+        self._start_subscriptions(started)
+
+    def _release_slot_locked(self, device_id: str) -> None:
+        del self._watches[device_id]
+        self._description_markers.discard(device_id)
+        self._requeue_uncovered_locked(device_id, front=True)
+
+    def _note_device_progress(self, device_id: str) -> None:
+        """Queue a device for stage two once it has $state and $description and lacks property filters.
+
+        This also covers a device that appears after stage one gave up on it, and new
+        nodes in a changed $description of a device subscribed node by node.
+        """
+        device = self.devices.get(device_id)
+        if device is None or device.state is None or device.description is None:
+            return
+        with self._pacing_lock:
+            watch = self._awaiting_attributes.get(device_id)
+            if watch is not None and watch.refresh:
+                return
+            self._awaiting_attributes.pop(device_id, None)
+            if not self._paced:
+                return
+            self._requeue_uncovered_locked(device_id)
+            if device_id not in self._pending_subscriptions:
+                return
+            started = self._take_pending_locked()
+        self._start_subscriptions(started)
+
+    def _forget_subscription(self, device_id: str) -> tuple:
+        """Drop a device from pacing, freeing any batch slot it held.
+
+        Returns the property filter suffixes recorded as subscribed for it.
+        """
+        with self._pacing_lock:
+            self._awaiting_attributes.pop(device_id, None)
+            self._pending_subscriptions.pop(device_id, None)
+            self._watches.pop(device_id, None)
+            self._description_markers.discard(device_id)
+            coverage = self._property_coverage.pop(device_id, None)
+            started = self._take_pending_locked() if self._paced else []
+        self._start_subscriptions(started)
+        return _coverage_filters(coverage)
+
+    def check_stuck_children(self, timeout: Optional[float] = None) -> List[str]:
+        """Heal subscribed devices whose retained messages have not arrived (GH #97).
+
+        A device counts as stuck after ``timeout`` seconds (default: the
+        constructor's ``stuck_device_timeout``) in either of two cases:
+
+        - It still lacks ``$state`` or ``$description``. Those two filters are
+          unsubscribed and resubscribed so the broker resends them. They hold no
+          batch slot, so a device that never publishes delays no other device.
+        - It still holds a batch slot because its property burst has not been
+          seen to drain. It gives up the slot and rejoins the end of the queue;
+          when its turn comes, its property filters are resubscribed, paced like
+          any other device.
+
+        After ``max_resubscribe_attempts`` retries a device is logged as
+        unrecoverable and no longer checked; so is a slot holder whose retry
+        received no more messages than the attempt before it. Its subscriptions
+        stay in place. A device that gave up lacking ``$state`` or
+        ``$description`` and publishes them later is discovered and gets its
+        property filters; one that gave up holding a slot keeps the filters it
+        has and moves on to any nodes not yet subscribed.
+
+        Message handling calls this at most once a second when
+        ``stuck_device_timeout`` is set, and so does a timer thread when the
+        SDK built the client or ``stuck_check_thread=True`` was passed. With an
+        injected client on a connection that goes quiet and no such thread,
+        healing waits for the next message unless you call it from your own
+        timer or event loop. It is safe to call from any thread.
+
+        Returns the ids of the devices resubscribed or requeued by this call.
+        """
+        if timeout is None:
+            timeout = self._stuck_device_timeout
+        if timeout is None:
+            return []
+        now = time.monotonic()
+        resubscribe = []
+        requeued = []
+        with self._pacing_lock:
+            self._last_stuck_check = now
+            for device_id, watch in list(self._awaiting_attributes.items()):
+                if now - watch.subscribed_at < timeout:
+                    continue
+                device = self.devices.get(device_id)
+                if device is None:
+                    del self._awaiting_attributes[device_id]
+                    continue
+                missing = [
+                    name
+                    for name, v in (("$state", device.state), ("$description", device.description))
+                    if v is None or (name == "$description" and watch.refresh)
+                ]
+                if not missing:
+                    continue  # _note_device_progress finishes it
+                if watch.attempts >= self._max_resubscribe_attempts:
+                    del self._awaiting_attributes[device_id]
+                    logger.error(
+                        f"reason=stuckDeviceGaveUp,deviceID={device_id},missing={'+'.join(missing)},"
+                        f"attempts={watch.attempts}"
+                    )
+                    continue
+                watch.attempts += 1
+                watch.subscribed_at = now
+                resubscribe.append((device_id, watch.filters, watch.attempts, missing))
+            for device_id, watch in list(self._watches.items()):
+                if now - watch.subscribed_at < timeout:
+                    continue
+                del self._watches[device_id]
+                self._description_markers.discard(device_id)
+                received = f"{watch.values_received}/{watch.expected_values}"
+                stalled = watch.last_received is not None and len(watch.received_values) <= watch.last_received
+                if watch.attempts >= self._max_resubscribe_attempts or stalled:
+                    logger.error(
+                        f"reason=stuckDeviceGaveUp,deviceID={device_id},missing=properties,"
+                        f"received={received},attempts={watch.attempts}" + (",noProgress=true" if stalled else "")
+                    )
+                    # Its filters stay subscribed; move on to any nodes still uncovered.
+                    self._requeue_uncovered_locked(device_id)
+                    continue
+                coverage = self._property_coverage.get(device_id)
+                if watch.nodes is None:
+                    self._property_coverage.pop(device_id, None)
+                elif isinstance(coverage, set):
+                    coverage.difference_update(watch.nodes)
+                self._pending_subscriptions[device_id] = _PendingProperties(
+                    attempts=watch.attempts + 1,
+                    resubscribe=watch.filters,
+                    last_received=len(watch.received_values),
+                )
+                requeued.append((device_id, watch.attempts + 1, received))
+            started = self._take_pending_locked() if self._paced else []
+
+        for device_id, filters, attempt, missing in resubscribe:
+            logger.warning(
+                f"reason=stuckDeviceResubscribe,deviceID={device_id},missing={'+'.join(missing)},"
+                f"attempt={attempt}/{self._max_resubscribe_attempts}"
+            )
+            self._unsubscribe_filters(device_id, filters)
+            self._subscribe_tracked(device_id, filters)
+        for device_id, attempt, received in requeued:
+            logger.warning(
+                f"reason=stuckDeviceRequeue,deviceID={device_id},missing=properties,received={received},"
+                f"attempt={attempt}/{self._max_resubscribe_attempts}"
+            )
+        self._start_subscriptions(started)
+        return [device_id for device_id, *_ in resubscribe] + [device_id for device_id, *_ in requeued]
+
+    def _maybe_check_stuck(self) -> None:
+        """Rate-limited stuck check run from message handling and the owned client's timer."""
+        timeout = self._stuck_device_timeout
+        if timeout is None or not (self._awaiting_attributes or self._watches):
+            return
+        if time.monotonic() - self._last_stuck_check < min(_STUCK_CHECK_INTERVAL, timeout):
+            return
+        self.check_stuck_children()
 
     def _on_state_message(self, topic: str, payload: bytes) -> None:
         """
@@ -3817,6 +4437,7 @@ class Controller:
         Topic format: {domain}/5/{device_id}/$state
         Payload: init, ready, disconnected, sleeping, lost, or empty (device removal)
         """
+        self._maybe_check_stuck()
         parts = topic.split("/")
         if len(parts) != 4 or parts[3] != "$state":
             logger.warning(f"reason=invalidStateTopic,topic={topic}")
@@ -3831,12 +4452,27 @@ class Controller:
         # Empty payload indicates device removal
         if not payload_str or len(payload_str) == 0:
             logger.info(f"reason=deviceRemoved,deviceID={device_id}")
+            property_filters = self._forget_subscription(device_id)
+            if self.is_tree_rooted and device_id in self.devices and device_id != self.root_device_id:
+                # Its $state and $description filters stay, so a return is heard; the
+                # property filters are paced again when it comes back. The root keeps
+                # its property filters: resync() records them as subscribed.
+                self._unsubscribe_filters(device_id, property_filters)
             if device_id in self.devices:
                 removed_device = self.devices[device_id]
                 del self.devices[device_id]
                 if self._on_device_removed:
                     self._on_device_removed(removed_device)
             return
+
+        # Tree-rooted mode tracks only what the tree declares. A device that cleared its
+        # $state and is still declared comes back; a $state for anything else arrives on
+        # filters left over from a dropped device: remove them.
+        if self.is_tree_rooted and device_id not in self.devices:
+            if not self._readopt_removed_device(device_id):
+                logger.info(f"reason=untrackedDeviceUnsubscribed,deviceID={device_id}")
+                self._unsubscribe_filters(device_id, _DEVICE_FILTERS)
+                return
 
         # New or existing device
         if device_id not in self.devices:
@@ -3850,8 +4486,8 @@ class Controller:
             device.update_state(payload_str)
             self.devices[device_id] = device
 
-            # Subscribe to device's $description and all properties
-            self._subscribe_to_device(device_id)
+            # Subscribe to the device's $description now and its properties paced
+            self._request_subscription(device_id)
 
             if self._on_device_discovered:
                 self._on_device_discovered(device)
@@ -3890,50 +4526,32 @@ class Controller:
         if self.is_tree_rooted and payload_str == DeviceState.READY.value and old_state != DeviceState.READY.value:
             self._reconcile_descendants(device_id)
 
-    def _subscribe_to_device(self, device_id: str) -> None:
-        """Subscribe to all topics for a discovered device (wildcard-mode helper).
+        self._note_device_progress(device_id)
 
-        Wildcard discovery hears a device's $state via the {domain}/5/+/$state
-        subscription; once it knows the device exists, it needs three more
-        filters (description, properties, targets) to track everything else.
-        Tree-rooted and single-device modes don't go through here — they call
-        _subscribe_device_topics directly to get all four filters at once.
+    def _readopt_removed_device(self, device_id: str) -> bool:
+        """Track again a tree device that cleared its $state and has returned.
+
+        True when the device is the root or a child the tree still holds as subscribed.
+        Its retained $description is requested again, since the one it published before
+        this $state arrived while it was untracked.
         """
-        if not self.mqttc:
-            return
-
-        base_topic = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}"
-
-        # Subscribe to $description
-        description_topic = f"{base_topic}/$description"
-        self.mqttc.subscribe(
-            description_topic,
-            param=partial(self._on_description_message, device_id),
-            qos=self._qos,
+        declared = device_id == self.root_device_id or any(
+            device_id in children for children in self._subscribed_children.values()
         )
-
-        # Subscribe to all properties and targets
-        property_topic = f"{base_topic}/+/+"
-        self.mqttc.subscribe(
-            property_topic,
-            param=partial(self._on_property_message, device_id),
-            qos=self._qos,
-        )
-
-        # Subscribe to all property targets
-        target_topic = f"{base_topic}/+/+/$target"
-        self.mqttc.subscribe(
-            target_topic,
-            param=partial(self._on_target_message, device_id),
-            qos=self._qos,
-        )
+        if not declared:
+            return False
+        logger.info(f"reason=removedDeviceReturned,deviceID={device_id}")
+        self.devices[device_id] = DiscoveredDevice(device_id, self.homie_domain)
+        self._request_subscription(device_id, paced=device_id != self.root_device_id)
+        return True
 
     def _reconcile_descendants(self, device_id: str) -> None:
         """Diff a device's announced children against what's subscribed (SDK-o1h).
 
-        Fired on the init→ready edge in tree-rooted mode. Added children get
-        full topic subscriptions (their own retained $state/$description then
-        cascade through this same handler, surfacing grandchildren). Removed
+        Fired on the init→ready edge in tree-rooted mode. Added children are
+        subscribed, their property filters paced (their own retained
+        $state/$description then cascade through this same handler, surfacing
+        grandchildren). Removed
         children are unsubscribed and dropped from the registry recursively.
 
         The state-edge gate (in _on_state_message) guarantees we only act when
@@ -3949,17 +4567,19 @@ class Controller:
         declared = set(device.children_ids)
         current = set(self._subscribed_children.get(device_id, set()))
 
-        added = declared - current
+        # A child that cleared its $state is still subscribed but untracked: re-add it.
+        added = declared - (current & set(self.devices))
         removed = current - declared
 
-        for child_id in added:
+        # Declared order, so paced subscriptions follow the description's order.
+        for child_id in [c for c in dict.fromkeys(device.children_ids) if c in added]:
             logger.info(f"reason=treeRootedAddDescendant,parentID={device_id},childID={child_id}")
             # Pre-create child entry; its own retained $state/$description
             # arrive via the new subscriptions and drive update + cascade.
             if child_id not in self.devices:
                 self.devices[child_id] = DiscoveredDevice(child_id, self.homie_domain)
             self._subscribed_children.setdefault(device_id, set()).add(child_id)
-            self._subscribe_device_topics(child_id)
+            self._request_subscription(child_id)
 
         for child_id in removed:
             logger.info(f"reason=treeRootedRemoveDescendant,parentID={device_id},childID={child_id}")
@@ -3971,32 +4591,32 @@ class Controller:
         Unsubscribes the four topic filters, removes the entry from the
         registry, and fires on_device_removed (leaves-first so callbacks see a
         consistent view: when fired for a parent, its children are already
-        gone). No-op if the device isn't tracked.
+        gone). A device that already cleared its own $state left the registry
+        then; it is still unsubscribed and forgotten here, without a second
+        on_device_removed.
         """
-        if device_id not in self.devices:
-            return
         # Snapshot before mutating: collect this device's transitive
         # descendants from our subscription registry (the authoritative record
         # of what we subscribed for; doesn't depend on the child's own
-        # description having arrived). Recurse leaves-first.
-        children = list(self._subscribed_children.get(device_id, set()))
+        # description having arrived). Recurse leaves-first. Popped first, so a
+        # cycle in the declared tree ends here.
+        children = list(self._subscribed_children.pop(device_id, set()))
         for child_id in children:
             self._unsubscribe_and_drop(child_id)
 
-        # This device is no longer a parent in our tree
-        self._subscribed_children.pop(device_id, None)
         # Remove this device from any parent's subscribed-children set
         for siblings in self._subscribed_children.values():
             siblings.discard(device_id)
 
         device = self.devices.pop(device_id, None)
+
+        # Unconditionally: after a reconnect the transport holds filters subscribed in an
+        # earlier connection, whatever the pacing bookkeeping says.
+        property_filters = self._forget_subscription(device_id)
+        self._unsubscribe_filters(device_id, _ATTRIBUTE_FILTERS + property_filters)
+
         if device is None:
             return
-
-        if self.mqttc:
-            base = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}"
-            for suffix in ("$state", "$description", "+/+", "+/+/$target"):
-                self.mqttc.unsubscribe(f"{base}/{suffix}")
 
         if self._on_device_removed:
             try:
@@ -4009,14 +4629,47 @@ class Controller:
         self._tree_complete.pop(device_id, None)
         self._reevaluate_tree_completeness()
 
-    def _on_description_message(self, device_id: str, topic: str, payload: bytes) -> None:
-        """Handle device $description messages"""
+    def _on_description_message(
+        self, device_id: str, topic: str, payload: bytes, retained: Optional[bool] = None
+    ) -> None:
+        """Handle device $description messages.
+
+        ``retained`` is the message's retain flag when the transport delivers it
+        (``subscribe(..., with_retain=True)``), else None.
+        """
+        self._maybe_check_stuck()
         if device_id not in self.devices:
             return
 
         payload_str = payload.decode("utf-8") if isinstance(payload, bytes) else payload
         device = self.devices[device_id]
+
+        # The $description resubscribed behind a device's property filters marks the
+        # end of its property burst. An unchanged one is only that marker. A live
+        # republish (retain flag clear) is not the marker.
+        if device_id in self._description_markers and retained is not False:
+            self._description_markers.discard(device_id)
+            self._release_slot(device_id)
+            try:
+                unchanged = device.description is not None and json.loads(payload_str) == device.description
+            except ValueError:
+                unchanged = False
+            if unchanged:
+                device.last_seen = time.time()
+                return
+
         device.update_description(payload_str)
+
+        # A device holding a slot owes what its new description declares.
+        with self._pacing_lock:
+            refreshing = self._awaiting_attributes.get(device_id)
+            if refreshing is not None:
+                refreshing.refresh = False
+            watch = self._watches.get(device_id)
+            if watch is not None and device.description is not None:
+                counts = _retained_counts(device.description)
+                nodes = counts if watch.nodes is None else watch.nodes
+                watch.expected_values = sum(counts.get(n, 0) for n in nodes)
 
         logger.info(f"reason=descriptionReceived,deviceID={device_id}")
         if self._on_description_received:
@@ -4039,6 +4692,8 @@ class Controller:
         # this description just introduced is already registered.
         self._reevaluate_tree_completeness()
 
+        self._note_device_progress(device_id)
+
     def _on_property_message(self, device_id: str, topic: str, payload: bytes) -> None:
         """
         Handle property value messages
@@ -4046,6 +4701,7 @@ class Controller:
         Topic format: {domain}/5/{device_id}/{node_id}/{property_id}
         Skip $target topics (handled separately)
         """
+        self._maybe_check_stuck()
         # Skip $target topics
         if topic.endswith("/$target"):
             return
@@ -4072,11 +4728,32 @@ class Controller:
         old_value = device.get_property(node_id, property_id)
         device.update_property(node_id, property_id, payload_str)
 
+        self._note_burst_message(device_id, (node_id, property_id))
+
         logger.debug(
             f"reason=propertyChanged,deviceID={device_id},node={node_id},property={property_id},value={payload_str}"
         )
         if self._on_property_changed:
             self._on_property_changed(device_id, node_id, property_id, payload_str, old_value)
+
+    def _note_burst_message(self, device_id: str, key: tuple) -> None:
+        """Count a value or $target toward a slot holder's burst.
+
+        Every value and target its description allows has arrived: the burst is over.
+        Usually the resubscribed $description ends it instead, because $target is optional.
+        """
+        with self._pacing_lock:
+            watch = self._watches.get(device_id)
+            if watch is None or (watch.nodes is not None and key[0] not in watch.nodes):
+                return
+            if key in watch.received_values:
+                return
+            watch.received_values.add(key)
+            if watch.owed == 0:
+                self._release_slot_locked(device_id)
+            # Less is owed now, so the next pending device may fit the value budget.
+            started = self._take_pending_locked() if self._pending_subscriptions else []
+        self._start_subscriptions(started)
 
     def _on_target_message(self, device_id: str, topic: str, payload: bytes) -> None:
         """
@@ -4084,6 +4761,7 @@ class Controller:
 
         Topic format: {domain}/5/{device_id}/{node_id}/{property_id}/$target
         """
+        self._maybe_check_stuck()
         parts = topic.split("/")
         if len(parts) != 6 or parts[5] != "$target":
             return
@@ -4098,6 +4776,7 @@ class Controller:
         payload_str = decode_empty_string(payload_str)
         device = self.devices[device_id]
         device.update_property_target(node_id, property_id, payload_str)
+        self._note_burst_message(device_id, (node_id, property_id, "$target"))
 
         logger.debug(
             f"reason=targetChanged,deviceID={device_id},node={node_id},property={property_id},target={payload_str}"
@@ -4394,6 +5073,17 @@ class Controller:
         self.devices.clear()
         self._subscribed_children.clear()
         self._tree_complete.clear()
+        with self._pacing_lock:
+            self._awaiting_attributes.clear()
+            self._watches.clear()
+            self._pending_subscriptions.clear()
+            self._description_markers.clear()
+            self._property_coverage.clear()
+        self._stuck_timer_stop.set()
+        timer = self._stuck_timer
+        if timer is not None and timer is not threading.current_thread():
+            timer.join(timeout=2.0)
+        self._stuck_timer = None
         # Clear callback references to break reference cycles
         self._on_device_discovered = None
         self._on_device_state_changed = None

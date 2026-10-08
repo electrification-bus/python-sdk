@@ -301,6 +301,25 @@ see the root and none of its children. As the publisher mutates the tree
 (`Device(parent=...)` to add, `child.delete()` to remove), descendants are
 subscribed or dropped on the parent's next init→ready transition.
 
+#### Paced subscriptions and stuck devices
+
+A broker queues every retained message matching a new subscription for that one client and drops what exceeds its per-client limit (mosquitto: `max_queued_messages` 1000). Retained messages are sent only at subscribe time, so a device whose `$state`, `$description` or property values were dropped never receives them. The Controller therefore subscribes each device in two stages (tree-rooted descendants and wildcard-discovered devices). Its `$state` and `$description` are subscribed as soon as the device is known. Once both have arrived, its property filters are subscribed, at most `subscription_batch_size` devices (default 8) and `subscription_batch_values` retained messages (default 500, counting a value and a possible `$target` for each retained property its `$description` declares) at a time. A device larger than `subscription_batch_values` on its own is subscribed node by node, in chunks that fit. A device keeps its slot until its `$description`, resubscribed behind its property filters, arrives again, or until every value and `$target` it can owe has arrived. A device that never publishes holds no slot, so it delays no other device, and if it publishes later it gets its property filters then.
+
+Pacing is on by default for a client the Controller builds from `mqtt_cfg` and off for an injected `mqttc`. Pass `subscription_batch_size` to pace an injected transport only if subscribing a filter again makes it deliver the retained messages again, as a broker connection does.
+
+`on_tree_ready` and `is_tree_complete()` mean every declared device has published its `$description`. With pacing, descendants' retained property values arrive after that, through `on_property_changed`.
+
+A device still lacking `$state` or `$description` after `stuck_device_timeout` seconds (default 10) has those two filters unsubscribed and resubscribed, so the broker resends them. A device still holding a slot after that long gives it up and rejoins the end of the queue. Each is retried up to `max_resubscribe_attempts` times (default 3); a slot holder whose retry received no more than the attempt before it is not retried again. Message handling runs this check at most once a second, and so does a daemon thread named `ebus-controller-stuck-check` when the Controller built the client. `stuck_check_thread=True` starts that thread for an injected `mqttc` too, and `stuck_check_thread=False` never starts it; `stop()` ends it. With an injected client on a connection that goes quiet and no thread, call it yourself:
+
+```python
+controller = Controller(mqtt_cfg=cfg, root_device_id='panel-1',
+                        subscription_batch_size=8, stuck_device_timeout=10.0)
+...
+healed = controller.check_stuck_children()  # or check_stuck_children(timeout=30)
+```
+
+`subscription_batch_size=None` subscribes all of every device's filters at once; `subscription_batch_values=None` counts devices only; `stuck_device_timeout=None` turns off the automatic check.
+
 ## Module Structure
 
 ```
