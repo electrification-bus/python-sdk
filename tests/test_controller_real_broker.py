@@ -1,10 +1,10 @@
-"""Real-broker regression test for tree-rooted discovery on a busy tree (GH #97).
+"""Real-broker regression tests for Controller discovery on a busy bus (GH #97).
 
-Subscribing to every child of a large tree at once makes the broker queue every
-matching retained message for one client. Past mosquitto's default per-client
-limits (``max_inflight_messages`` 20, ``max_queued_messages`` 1000) it drops the
-rest, and retained messages are sent only at subscribe time, so the children
-subscribed last never deliver ``$state`` or ``$description``.
+Subscribing to many devices at once makes the broker queue every matching retained
+message for one client. Past mosquitto's default per-client limits
+(``max_inflight_messages`` 20, ``max_queued_messages`` 1000) it drops the rest, and
+retained messages are sent only at subscribe time, so the devices subscribed last never
+deliver their ``$state``, ``$description`` or property values.
 
 Skipped when no ``mosquitto`` binary is available.
 """
@@ -36,9 +36,9 @@ MOSQUITTO = _find_mosquitto()
 pytestmark = pytest.mark.skipif(MOSQUITTO is None, reason="mosquitto binary not found")
 
 CHILDREN = 30
-PROPERTIES_PER_CHILD = 60
-NODES_PER_CHILD = 3
+NODES_PER_DEVICE = 3
 ROOT_ID = "busy-root"
+BASE = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}"
 
 
 def _free_port():
@@ -83,74 +83,145 @@ def broker(tmp_path):
             proc.wait(timeout=5)
 
 
-def _child_id(i):
-    return f"busy-child-{i:02d}"
-
-
-def _description(device_id, children=None):
-    props_per_node = PROPERTIES_PER_CHILD // NODES_PER_CHILD
+def _description(device_id, properties, children=None, root=None):
+    per_node = properties // NODES_PER_DEVICE
     nodes = {
         f"node-{n}": {
             "name": f"Node {n}",
-            "properties": {f"p{p:02d}": {"name": f"P{p}", "datatype": "integer"} for p in range(props_per_node)},
+            "properties": {f"p{p:03d}": {"name": f"P{p}", "datatype": "integer"} for p in range(per_node)},
         }
-        for n in range(NODES_PER_CHILD)
+        for n in range(NODES_PER_DEVICE)
     }
     description = {"homie": "5.0", "version": 1, "name": device_id, "nodes": nodes}
     if children is not None:
         description["children"] = children
-    else:
-        description["root"] = ROOT_ID
-        description["parent"] = ROOT_ID
+    if root is not None:
+        description["root"] = root
+        description["parent"] = root
     return description
 
 
-def _seed_tree(port):
-    """Publish a retained tree with a raw paho client and wait until the broker has it."""
-    client = paho.Client(paho.CallbackAPIVersion.VERSION2, client_id=f"seeder-{uuid.uuid4()}")
-    client.max_inflight_messages_set(1000)
-    client.connect("127.0.0.1", port)
-    client.loop_start()
-    infos = []
-    base = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}"
+class _Seeder:
+    """Publishes retained Homie topics with a raw paho client and waits until the broker has them."""
 
-    def pub(topic, payload):
-        infos.append(client.publish(topic, payload, qos=1, retain=True))
+    def __init__(self, port):
+        self.client = paho.Client(paho.CallbackAPIVersion.VERSION2, client_id=f"seeder-{uuid.uuid4()}")
+        self.client.max_inflight_messages_set(1000)
+        self.client.connect("127.0.0.1", port)
+        self.client.loop_start()
+        self.infos = []
 
+    def pub(self, topic, payload):
+        self.infos.append(self.client.publish(topic, payload, qos=1, retain=True))
+
+    def device(self, device_id, properties, children=None, root=None):
+        self.pub(f"{BASE}/{device_id}/$description", json.dumps(_description(device_id, properties, children, root)))
+        for n in range(NODES_PER_DEVICE):
+            for p in range(properties // NODES_PER_DEVICE):
+                self.pub(f"{BASE}/{device_id}/node-{n}/p{p:03d}", str(n * 1000 + p))
+        self.pub(f"{BASE}/{device_id}/$state", "ready")
+
+    def close(self):
+        try:
+            for info in self.infos:
+                info.wait_for_publish(timeout=10)
+        finally:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
+def _seed_tree(port, properties, silent_children=0):
+    """A root declaring `silent_children` children that never publish, then CHILDREN real ones."""
+    seeder = _Seeder(port)
     try:
-        children = [_child_id(i) for i in range(CHILDREN)]
+        children = [f"busy-child-{i:02d}" for i in range(CHILDREN)]
+        silent = [f"silent-child-{i:02d}" for i in range(silent_children)]
         for child in children:
-            pub(f"{base}/{child}/$description", json.dumps(_description(child)))
-            for n in range(NODES_PER_CHILD):
-                for p in range(PROPERTIES_PER_CHILD // NODES_PER_CHILD):
-                    pub(f"{base}/{child}/node-{n}/p{p:02d}", str(n * 100 + p))
-            pub(f"{base}/{child}/$state", "ready")
-        pub(f"{base}/{ROOT_ID}/$description", json.dumps(_description(ROOT_ID, children=children)))
-        pub(f"{base}/{ROOT_ID}/$state", "ready")
-        for info in infos:
-            info.wait_for_publish(timeout=10)
+            seeder.device(child, properties, root=ROOT_ID)
+        seeder.device(ROOT_ID, 0, children=silent + children)
     finally:
-        client.loop_stop()
-        client.disconnect()
+        seeder.close()
     return children
 
 
-def test_tree_rooted_controller_discovers_every_child_of_a_busy_tree(broker):
-    children = _seed_tree(broker)
+def _seed_bus(port, properties, state_only=0):
+    """CHILDREN independent devices, plus `state_only` leftovers with a retained `lost` and nothing else."""
+    seeder = _Seeder(port)
+    try:
+        for i in range(state_only):
+            seeder.pub(f"{BASE}/aaa-dead-{i:02d}/$state", "lost")
+        devices = [f"busy-device-{i:02d}" for i in range(CHILDREN)]
+        for device in devices:
+            seeder.device(device, properties)
+    finally:
+        seeder.close()
+    return devices
 
+
+def _complete(ctrl, device_id, properties):
+    device = ctrl.get_device(device_id)
+    if device is None or device.description is None or device.state != "ready":
+        return False
+    return sum(len(values) for values in device.properties.values()) == properties
+
+
+def _await_discovery(ctrl, devices, properties, timeout=30.0):
+    """Wait until every device has its state, description and every retained property value."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(_complete(ctrl, d, properties) for d in devices):
+            return
+        time.sleep(0.1)
+    described = [d for d in devices if (dev := ctrl.get_device(d)) is not None and dev.description is not None]
+    full = [d for d in devices if _complete(ctrl, d, properties)]
+    pytest.fail(
+        f"{len(described)}/{len(devices)} described, {len(full)}/{len(devices)} with all {properties} values; "
+        f"incomplete {sorted(set(devices) - set(full))}"
+    )
+
+
+@pytest.mark.parametrize("properties", [60, 150, 300])
+def test_tree_rooted_controller_discovers_every_child_of_a_busy_tree(broker, properties):
+    children = _seed_tree(broker, properties)
     ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker}, root_device_id=ROOT_ID)
     try:
         ctrl.start_discovery()
-        deadline = time.monotonic() + 30.0
-        described = set()
-        while time.monotonic() < deadline:
-            described = {c for c in children if (d := ctrl.get_device(c)) is not None and d.description is not None}
-            if len(described) == len(children):
-                break
-            time.sleep(0.1)
-        missing = sorted(set(children) - described)
-        assert not missing, f"{len(described)}/{len(children)} children described; missing {missing}"
-        for child in children:
-            assert ctrl.get_device(child).state == "ready"
+        _await_discovery(ctrl, children, properties)
+    finally:
+        ctrl.stop()
+
+
+def test_wildcard_controller_discovers_every_device_of_a_busy_bus(broker):
+    devices = _seed_bus(broker, 150)
+    ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker})
+    try:
+        ctrl.start_discovery()
+        _await_discovery(ctrl, devices, 150)
+    finally:
+        ctrl.stop()
+
+
+def test_silent_declared_children_do_not_stall_a_quiet_tree(broker):
+    """Children declared ahead of the real ones that never publish must not hold up the rest.
+
+    Nothing publishes after seeding and nobody calls check_stuck_children(), so only the
+    retained messages the Controller's own subscriptions bring can drive discovery.
+    """
+    children = _seed_tree(broker, 60, silent_children=8)
+    ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker}, root_device_id=ROOT_ID)
+    try:
+        ctrl.start_discovery()
+        _await_discovery(ctrl, children, 60, timeout=8.0)
+    finally:
+        ctrl.stop()
+
+
+def test_state_only_leftovers_do_not_stall_a_quiet_wildcard_bus(broker):
+    """Devices with a retained $state and no $description must not hold up the rest."""
+    devices = _seed_bus(broker, 60, state_only=8)
+    ctrl = Controller(mqtt_cfg={"host": "127.0.0.1", "port": broker})
+    try:
+        ctrl.start_discovery()
+        _await_discovery(ctrl, devices, 60, timeout=8.0)
     finally:
         ctrl.stop()

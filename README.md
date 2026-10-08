@@ -303,18 +303,18 @@ subscribed or dropped on the parent's next init→ready transition.
 
 #### Paced subscriptions and stuck devices
 
-A broker queues every retained message matching a new subscription for that one client and drops what exceeds its per-client limit (mosquitto: `max_queued_messages` 1000). Retained messages are sent only at subscribe time, so a device whose `$state` or `$description` was dropped is never discovered. The Controller therefore subscribes to at most `subscription_batch_size` devices at a time (default 8; tree-rooted descendants and wildcard-discovered devices) and subscribes the next as each one's `$state` and `$description` arrive.
+A broker queues every retained message matching a new subscription for that one client and drops what exceeds its per-client limit (mosquitto: `max_queued_messages` 1000). Retained messages are sent only at subscribe time, so a device whose `$state`, `$description` or property values were dropped never receives them. The Controller therefore subscribes each device in two stages (tree-rooted descendants and wildcard-discovered devices). Its `$state` and `$description` are subscribed as soon as the device is known. Once both have arrived, its property filters are subscribed, at most `subscription_batch_size` devices (default 8) and `subscription_batch_values` retained values (default 500, counted from each `$description`) at a time. A device keeps its slot until every retained value its `$description` declares has arrived, or until its `$description`, resubscribed behind its property filters, arrives again. A device that never publishes holds no slot, so it delays no other device.
 
-A device still lacking either after `stuck_device_timeout` seconds (default 10) gives up its slot and is unsubscribed and resubscribed, so the broker resends its retained messages, up to `max_resubscribe_attempts` times (default 3). Message handling runs this check at most once a second, so a controller that receives traffic heals without help. On a quiet connection, or under a caller-driven event loop, call it yourself:
+A device still lacking `$state` or `$description` after `stuck_device_timeout` seconds (default 10) has those two filters unsubscribed and resubscribed, so the broker resends them. A device still holding a slot after that long gives it up and rejoins the end of the queue. Each is retried up to `max_resubscribe_attempts` times (default 3). Message handling runs this check at most once a second. On a connection that goes quiet, or under a caller-driven event loop, call it yourself:
 
 ```python
 controller = Controller(mqtt_cfg=cfg, root_device_id='panel-1',
                         subscription_batch_size=8, stuck_device_timeout=10.0)
 ...
-resubscribed = controller.check_stuck_children()  # or check_stuck_children(timeout=30)
+healed = controller.check_stuck_children()  # or check_stuck_children(timeout=30)
 ```
 
-`subscription_batch_size=None` subscribes every device at once; `stuck_device_timeout=None` turns off the automatic check.
+`subscription_batch_size=None` subscribes all of every device's filters at once; `subscription_batch_values=None` counts devices only; `stuck_device_timeout=None` turns off the automatic check.
 
 ## Module Structure
 
