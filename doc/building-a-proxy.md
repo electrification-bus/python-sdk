@@ -206,7 +206,7 @@ Each `add()` announces its own device and makes the parent republish its `$descr
 
 - **Batch structural changes.** Adding N nodes/properties inside one `with device.state_transition():` collapses to a single `$description` publish and one `init` to `ready` edge, instead of N. Always build a device's structure inside a transition.
 - **Connect before you publish.** `Device(..., mqtt_cfg=...)` connects asynchronously. If you build and publish before the broker connection is established, the first retained `$description` / `$state` the broker keeps can be a pre-connect snapshot until the SDK's on-connect refresh corrects it. Wait for `device.mqttc.is_connected()` before the initial build so the first retained state is correct.
-- **Drive `$state` from availability.** When your upstream reports ONE device offline, `set_state(DeviceState.LOST)` on that child (and `READY` when it returns). When the whole bridge is dying, `root.declare_lost()` publishes the root's `$state=lost`, which per the Homie 5 effective-state rule covers every descendant in a single publish; follow it with `stop(announce=False)` so the teardown does not overwrite it with `disconnected`. Do not reach for `declare_lost()` for one dead upstream: it blanks the entire tree's liveness. The root's Last Will still covers process death, which neither call can, since a crashed process calls nothing.
+- **Drive `$state` from availability.** When your upstream reports ONE device offline, `set_state(DeviceState.LOST)` on that child (and `READY` when it returns). When the whole bridge is dying, `root.declare_lost()` publishes the root's `$state=lost`, which per the Homie 5 effective-state rule covers every descendant in a single publish; follow it with `stop(announce=False)`, which does not overwrite it with `disconnected` and ends the connection without a clean DISCONNECT, so the broker's will re-asserts the same `lost`. Do not reach for `declare_lost()` for one dead upstream: it blanks the entire tree's liveness. The root's Last Will still covers process death, which neither call can, since a crashed process calls nothing.
 
 ## Settable / bidirectional properties (control back to the device)
 
@@ -224,7 +224,7 @@ If you build the tree by hand instead of via `build_from_declarations`, wire the
 
 ### Settable `json` properties and `$format` validation
 
-For a settable `json` property (a compound command like `flex/request`), give the `PropertySpec` a `format` that is the JSON Schema of the command surface your device accepts. An inbound `/set` payload is then `json.loads`ed to a `dict`/`list` and validated against that schema before your `entity_setter` runs, so your `entity_setter` receives a parsed, schema-valid object and a malformed or out-of-surface command is rejected for you:
+For a settable `json` property (a compound command like `flex/request`), give the `PropertySpec` a `format` that is the JSON Schema of the command surface your device accepts. An inbound `/set` payload is then `json.loads`ed, required to be a `dict`/`list` (Homie 5 allows only an array or object), and validated against that schema before your `entity_setter` runs, so your `entity_setter` receives a parsed, schema-valid object and a malformed or out-of-surface command is rejected for you:
 
 ```python
 PropertySpec(

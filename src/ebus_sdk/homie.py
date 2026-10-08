@@ -28,7 +28,7 @@ This is the initial version, there are things to add in the future (as needed):
         homie / 5 / [device ID] / [node ID] / [property ID]; reported property values (for string types)
         homie / 5 / [device ID] / [node ID] / [property ID] / set; the topic to set properties (of string types)
         homie / 5 / [device ID] / [node ID] / [property ID] / $target; the target property value (for string types)
-    The SDK encodes "" as 0x00 on publish (Property.publish_value, Controller.set_property) and decodes
+    The SDK encodes "" as 0x00 on publish of a string value (Property.publish_value, Controller.set_property) and decodes
     0x00 back to "" on receive (Controller._on_property_message / _on_target_message, Property._settable_callback).
     This convention specifies no way to represent an actual value of a 1-character string with a single byte 0.
     If a device needs this, then it should provide an escape mechanism on the application level.
@@ -38,11 +38,20 @@ This is the initial version, there are things to add in the future (as needed):
 """
 
 import asyncio
+import contextlib
+import datetime
+import decimal
 import hashlib
+import inspect
 import json
 import logging
+import math
+import numbers
 import os
 import re
+import socket
+import sys
+import threading
 import time
 import uuid
 from enum import Enum
@@ -56,6 +65,7 @@ except ImportError:
 
 
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import partial
 from threading import RLock
 
@@ -88,6 +98,20 @@ def _log_missing_client(message: str, *, by_design: bool, level: int = logging.W
     "you forgot to start the root" warning stays as loud as it was.
     """
     logger.log(logging.DEBUG if by_design else level, message)
+
+
+def _warn_invalid_once(owner: Any, problem: str, message: str) -> None:
+    """Warn about invalid producer input once per object and problem.
+
+    The policy for invalid producer input (#91): warn in this release, still
+    publish, and raise in the next minor release. Once per object keeps a tree
+    rebuilt on every reconnect from repeating itself.
+    """
+    warned = owner.__dict__.setdefault("_invalid_input_warned", set())
+    if problem in warned:
+        return
+    warned.add(problem)
+    logger.warning(f"{message},hint=invalid Homie 5 input; this will raise in the next minor release")
 
 
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
@@ -166,6 +190,15 @@ if EBUS_HOMIE_MQTT_QOS < 1:
 # sole character is 0x00; a device needing that must escape it at the
 # application level (see module header).
 HOMIE_EMPTY_STRING_PAYLOAD = "\x00"
+
+# The color formats a `color` property's $format may list (convention.md:393).
+_COLOR_FORMATS = frozenset({"rgb", "hsv", "xyz"})
+
+# The Homie 5 core $description fields (convention.md:212-222). description_extras
+# may add extension fields, never one of these.
+_DESCRIPTION_CORE_FIELDS = frozenset(
+    {"homie", "version", "nodes", "name", "type", "children", "root", "parent", "extensions"}
+)
 
 
 @dataclass(frozen=True)
@@ -351,6 +384,383 @@ class PropertyDatatype(StrEnum):
     JSON = "json"
 
 
+# ── Payload encoding and validation (convention.md:74-150) ──────────────────
+#
+# Each encoder takes a Python value and returns ``(payload, None)`` for a valid
+# wire payload, or ``(None, problem)`` when the datatype cannot represent the
+# value. The device refuses to publish a refused value; the /set path uses the
+# same grammar to reject a command.
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+# re.ASCII: a payload's digits are 0-9 only (convention.md:89, :97), where a bare
+# \d also matches every other Unicode decimal digit.
+_INTEGER_PAYLOAD = re.compile(r"-?\d+", re.ASCII)
+_FLOAT_PAYLOAD = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE]-?\d+)?", re.ASCII)
+_DURATION_PAYLOAD = re.compile(r"PT(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?", re.ASCII)
+# ISO 8601 (convention.md:132) in its calendar, ordinal and week date forms,
+# extended or basic, with an optional time of day and zone designator.
+_DATETIME_PAYLOAD = re.compile(
+    r"""
+    (?P<year>\d{4})
+    (?:
+        -(?P<month>\d{2})(?:-(?P<day>\d{2}))?
+      | (?P<bmonth>\d{2})(?P<bday>\d{2})
+      | -?(?P<ordinal>\d{3})
+      | -?W(?P<week>\d{2})(?:-?(?P<weekday>\d))?
+    )?
+    (?:
+        T(?P<hour>\d{2})(?::?(?P<minute>\d{2})(?::?(?P<second>\d{2}))?)?(?:[.,]\d+)?
+        (?:Z|[+-](?P<zhour>\d{2})(?::?(?P<zminute>\d{2}))?)?
+    )?
+    """,
+    re.ASCII | re.VERBOSE,
+)
+_FLOAT_MAX_DECIMAL = decimal.Decimal(sys.float_info.max)
+_COLOR_RANGES = {"rgb": (255.0, 255.0, 255.0), "hsv": (360.0, 100.0, 100.0), "xyz": (1.0, 1.0)}
+
+
+def _reject_json_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _format_float(number: float) -> Optional[str]:
+    """A finite float in the convention's grammar: no `+` in the exponent (:97)."""
+    if not math.isfinite(number):
+        return None
+    return repr(float(number)).replace("e+", "e")
+
+
+def _encode_integer(value: Any) -> tuple:
+    if isinstance(value, bool):
+        return None, "booleanOnNumeric"
+    if isinstance(value, str):
+        if not _INTEGER_PAYLOAD.fullmatch(value):
+            return None, "integerGrammar"
+        number = int(value)
+    elif isinstance(value, numbers.Integral):
+        number = int(value)
+    elif isinstance(value, numbers.Real):
+        if not math.isfinite(value) or not float(value).is_integer():
+            return None, "integerNotWhole"
+        number = int(value)
+    else:
+        return None, "integerType"
+    if not _INT64_MIN <= number <= _INT64_MAX:
+        return None, "integerOutOf64Bit"
+    return (value if isinstance(value, str) else str(number)), None
+
+
+def _encode_float(value: Any) -> tuple:
+    if isinstance(value, bool):
+        return None, "booleanOnNumeric"
+    if isinstance(value, str):
+        if not _FLOAT_PAYLOAD.fullmatch(value) or not math.isfinite(float(value)):
+            return None, "floatGrammar"
+        return value, None
+    if isinstance(value, decimal.Decimal):
+        if not value.is_finite():
+            return None, "floatNotFinite"
+        if abs(value) > _FLOAT_MAX_DECIMAL:
+            return None, "floatOutOfRange"
+        return str(value).replace("E+", "E"), None
+    if isinstance(value, numbers.Integral):
+        # Float range (convention.md:95-96).
+        if abs(int(value)) > sys.float_info.max:
+            return None, "floatOutOfRange"
+        return str(int(value)), None
+    if isinstance(value, numbers.Real):
+        # A non-float Real (numpy's float32, say) keeps its own shortest text when
+        # that is already a payload: repr(float()) would expand float32 0.1 to
+        # 0.10000000149011612.
+        if not isinstance(value, float):
+            text = str(value)
+            if _FLOAT_PAYLOAD.fullmatch(text) and math.isfinite(float(text)):
+                return text, None
+        try:
+            payload = _format_float(float(value))
+        except OverflowError:
+            return None, "floatOutOfRange"
+        return (payload, None) if payload is not None else (None, "floatNotFinite")
+    return None, "floatType"
+
+
+def _encode_boolean(value: Any) -> tuple:
+    if not isinstance(value, bool):
+        return None, "booleanType"
+    return ("true" if value else "false"), None
+
+
+def _enum_values(format_: Any) -> Optional[list]:
+    return format_.split(",") if isinstance(format_, str) and format_ else None
+
+
+def _encode_enum(value: Any, format_: Any) -> tuple:
+    payload = str(value.value) if isinstance(value, Enum) else str(value)
+    if payload == "":
+        return None, "enumEmpty"
+    allowed = _enum_values(format_)
+    if allowed is not None and payload not in allowed:
+        return None, "enumNotInFormat"
+    return payload, None
+
+
+def _check_color_payload(payload: str, format_: Any) -> Optional[str]:
+    parts = payload.split(",")
+    kind = parts[0]
+    ranges = _COLOR_RANGES.get(kind)
+    if ranges is None:
+        return "colorType"
+    allowed = _enum_values(format_)
+    if allowed is not None and kind not in allowed:
+        return "colorTypeNotInFormat"
+    if len(parts) != len(ranges) + 1:
+        return "colorComponentCount"
+    for text, upper in zip(parts[1:], ranges):
+        if not _FLOAT_PAYLOAD.fullmatch(text):
+            return "colorComponentGrammar"
+        if not 0.0 <= float(text) <= upper:
+            return "colorComponentRange"
+    return None
+
+
+def _encode_color(value: Any, format_: Any) -> tuple:
+    if isinstance(value, str):
+        problem = _check_color_payload(value, format_)
+        return (None, problem) if problem else (value, None)
+    if isinstance(value, (tuple, list)):
+        # Components alone: encode them in the property's preferred (first) color
+        # format (convention.md:393).
+        allowed = _enum_values(format_)
+        if not allowed:
+            return None, "colorFormatMissing"
+        components = []
+        for component in value:
+            text, problem = _encode_float(component)
+            if problem:
+                return None, "colorComponentGrammar"
+            components.append(text)
+        payload = ",".join([allowed[0], *components])
+        problem = _check_color_payload(payload, format_)
+        return (None, problem) if problem else (payload, None)
+    return None, "colorType"
+
+
+def _check_datetime_payload(text: str) -> Optional[str]:
+    """None if ``text`` is an ISO 8601 date or date-time (convention.md:132), else a problem."""
+    match = _DATETIME_PAYLOAD.fullmatch(text)
+    if not match:
+        return "datetimeGrammar"
+    fields = {k: int(v) for k, v in match.groupdict().items() if v is not None}
+    if "hour" in fields and not fields.keys() & {"day", "bday", "ordinal", "weekday"}:
+        return "datetimeGrammar"  # a time of day needs a complete date
+    try:
+        if "month" in fields or "bmonth" in fields:
+            datetime.date(
+                fields["year"], fields.get("month", fields.get("bmonth")), fields.get("day", fields.get("bday", 1))
+            )
+    except ValueError:
+        return "datetimeRange"
+    limits = {"ordinal": (1, 366), "week": (1, 53), "weekday": (1, 7), "hour": (0, 24), "minute": (0, 59)}
+    limits.update({"second": (0, 60), "zhour": (0, 23), "zminute": (0, 59)})
+    for name, (low, high) in limits.items():
+        if name in fields and not low <= fields[name] <= high:
+            return "datetimeRange"
+    return None
+
+
+def _encode_datetime(value: Any) -> tuple:
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        # ISO 8601 extended form, `T` separator (convention.md:132).
+        return value.isoformat(), None
+    if isinstance(value, str):
+        problem = _check_datetime_payload(value)
+        return (None, problem) if problem else (value, None)
+    return None, "datetimeType"
+
+
+def _encode_duration(value: Any) -> tuple:
+    if isinstance(value, datetime.timedelta):
+        if value < datetime.timedelta(0):
+            return None, "durationNegative"
+        # PTxHxMxS (convention.md:137-144): days fold into hours, which the
+        # format has no larger unit than.
+        hours, rest = divmod(value.days * 86400 + value.seconds, 3600)
+        minutes, seconds = divmod(rest, 60)
+        payload = "PT"
+        if hours:
+            payload += f"{hours}H"
+        if minutes:
+            payload += f"{minutes}M"
+        if value.microseconds:
+            payload += f"{seconds}.{value.microseconds:06d}".rstrip("0") + "S"
+        elif seconds or payload == "PT":
+            payload += f"{seconds}S"
+        return payload, None
+    if isinstance(value, str):
+        if value == "PT" or not _DURATION_PAYLOAD.fullmatch(value):
+            return None, "durationGrammar"
+        return value, None
+    return None, "durationType"
+
+
+def _decode_json_container(text: str) -> tuple:
+    """Parse a json payload: an array or object, never NaN/Infinity (convention.md:150)."""
+    try:
+        decoded = json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError):
+        return None, "jsonInvalid"
+    if not isinstance(decoded, (list, dict)):
+        return None, "jsonNotArrayOrObject"
+    return decoded, None
+
+
+def _encode_json(value: Any) -> tuple:
+    if isinstance(value, str):
+        _, problem = _decode_json_container(value)
+        # A valid JSON string passes through unchanged rather than re-encoded.
+        return (None, problem) if problem else (value, None)
+    if not isinstance(value, (list, tuple, dict)):
+        return None, "jsonNotArrayOrObject"
+    try:
+        return json.dumps(value, allow_nan=False), None
+    except (TypeError, ValueError):
+        return None, "jsonInvalid"
+
+
+def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tuple:
+    """Encode ``value`` as a Homie 5 payload for ``datatype``.
+
+    Returns ``(payload, None)``, or ``(None, problem)`` when ``datatype`` cannot
+    represent ``value`` (convention.md:78). ``problem`` is a short camelCase reason.
+    The payload is the value's text; the ``0x00`` empty-string encoding is applied
+    by the publisher, and only for ``string`` (convention.md:65-67).
+    """
+    if datatype == PropertyDatatype.INTEGER:
+        return _encode_integer(value)
+    if datatype == PropertyDatatype.FLOAT:
+        return _encode_float(value)
+    if datatype == PropertyDatatype.BOOLEAN:
+        return _encode_boolean(value)
+    if datatype == PropertyDatatype.ENUM:
+        return _encode_enum(value, format_)
+    if datatype == PropertyDatatype.COLOR:
+        return _encode_color(value, format_)
+    if datatype == PropertyDatatype.DATETIME:
+        return _encode_datetime(value)
+    if datatype == PropertyDatatype.DURATION:
+        return _encode_duration(value)
+    if datatype == PropertyDatatype.JSON:
+        return _encode_json(value)
+    # string, and a missing or unknown datatype (already warned about).
+    return (str(value.value) if isinstance(value, Enum) else str(value)), None
+
+
+def _numeric_format(format_: Any) -> tuple:
+    """``(min, max, step)`` as Fractions (each may be None) from ``[min]:[max][:step]``.
+
+    A format that does not parse imposes no constraint. A step that is not > 0 is
+    ignored (convention.md:390-391).
+    """
+    if not isinstance(format_, str) or not format_:
+        return None, None, None
+    parts = format_.split(":")
+    if len(parts) not in (2, 3):
+        return None, None, None
+
+    def bound(text: str) -> Optional[Fraction]:
+        if not _FLOAT_PAYLOAD.fullmatch(text):
+            return None
+        return Fraction(text)
+
+    low, high = bound(parts[0]), bound(parts[1])
+    step = bound(parts[2]) if len(parts) == 3 else None
+    if step is not None and step <= 0:
+        step = None
+    return low, high, step
+
+
+def _round_and_range_check(number: Fraction, format_: Any, current: Any) -> tuple:
+    """Round to the format's step, then check min/max (convention.md:397-413).
+
+    The step base is ``min``, else ``max``, else the property's current value;
+    with none of them there is nothing to round against and the value stands.
+    Rounding is ``floor(x + 0.5)`` so it always goes up, as :408-413 recommend.
+    Returns ``(rounded, problem)``.
+    """
+    low, high, step = _numeric_format(format_)
+    if step is not None:
+        base = low if low is not None else high
+        if base is None and isinstance(current, numbers.Real) and not isinstance(current, bool):
+            if math.isfinite(current):
+                base = Fraction(current)
+        if base is not None:
+            number = math.floor((number - base) / step + Fraction(1, 2)) * step + base
+    if low is not None and number < low:
+        return None, "belowMin"
+    if high is not None and number > high:
+        return None, "aboveMax"
+    return number, None
+
+
+def _parse_set_payload(text: str, datatype: Any, format_: Any, current: Any) -> tuple:
+    """Validate an inbound ``/set`` payload for ``datatype``.
+
+    Returns ``(value, None)`` with the value to hand the set callback, or
+    ``(None, problem)``. The value is the payload text for every datatype but
+    ``json`` (the decoded array or object) and ``string`` (with ``0x00`` decoded
+    to ``""``). A number that step rounding changed is handed over in its
+    rounded payload form.
+    """
+    if datatype == PropertyDatatype.JSON:
+        return _decode_json_container(text)
+    if datatype == PropertyDatatype.INTEGER:
+        if not _INTEGER_PAYLOAD.fullmatch(text) or not _INT64_MIN <= int(text) <= _INT64_MAX:
+            return None, "integerGrammar"
+        rounded, problem = _round_and_range_check(Fraction(int(text)), format_, current)
+        if problem:
+            return None, problem
+        if rounded.denominator != 1:
+            return None, "integerStepNotWhole"
+        return (text if rounded == int(text) else str(int(rounded))), None
+    if datatype == PropertyDatatype.FLOAT:
+        if not _FLOAT_PAYLOAD.fullmatch(text) or not math.isfinite(float(text)):
+            return None, "floatGrammar"
+        number = Fraction(text)
+        rounded, problem = _round_and_range_check(number, format_, current)
+        if problem:
+            return None, problem
+        return (text if rounded == number else _format_float(float(rounded))), None
+    if datatype == PropertyDatatype.BOOLEAN:
+        return (text, None) if text in ("true", "false") else (None, "booleanGrammar")
+    if datatype == PropertyDatatype.ENUM:
+        allowed = _enum_values(format_)
+        if text == "" or (allowed is not None and text not in allowed):
+            return None, "enumNotInFormat"
+        return text, None
+    if datatype == PropertyDatatype.COLOR:
+        problem = _check_color_payload(text, format_)
+        return (None, problem) if problem else (text, None)
+    if datatype == PropertyDatatype.DURATION:
+        return _encode_duration(text)
+    if datatype == PropertyDatatype.DATETIME:
+        return _encode_datetime(text)
+    # string, and a missing or unknown datatype (already warned about).
+    return decode_empty_string(text), None
+
+
+def _subscribe_supports_with_retain(mqttc: Any) -> bool:
+    """Whether ``mqttc.subscribe`` takes ``with_retain`` (ebus-mqtt-client with #24).
+
+    Only a parameter of that name counts: a transport taking ``**kwargs`` may not
+    deliver the flag.
+    """
+    try:
+        return "with_retain" in inspect.signature(mqttc.subscribe).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def sanitize_homie_id(value: Optional[str]) -> str:
     """Coerce an arbitrary string to a Homie-legal id segment (a-z, 0-9, -).
 
@@ -509,15 +919,23 @@ class Property:
             self._name = id
         self._datatype = datatype
         self._format = format
-        self._settable = settable
+        self._settable = bool(settable)
         # Don't assign set_callback unless this property is settable
         if settable:
             self._set_callback = set_callback
         else:
             self._set_callback = None
-        self._retained = retained
+        if retained is None:
+            # `retained` is a non-nullable boolean in $description (convention.md:343).
+            # The publish path always treated None as non-retained, so keep that.
+            _warn_invalid_once(self, "retainedNull", f"reason=propertyRetainedNull,propertyID={id},treatedAs=false")
+        self._retained = bool(retained)
         self._unit = unit
         self._supports_target = supports_target
+        if supports_target:
+            # $target is not implemented (publish_target_value() is a stub), so a
+            # property must never use it (convention.md:333).
+            logger.warning(f"reason=propertySupportsTargetInert,propertyID={id},hint=$target is not implemented")
         self._node = node
         self._device = device
         self.async_loop = async_loop
@@ -569,6 +987,43 @@ class Property:
         self._initial_value_was_none = value is None
         # Check for skip_initial_publish flag from dict
         self._skip_initial_publish = from_dict.get("skip_initial_publish", False) if from_dict else False
+        self._check_description_fields()
+
+    def _check_description_fields(self) -> None:
+        """Warn (once per problem) about $description fields Homie 5 rejects.
+
+        ``datatype`` is required (convention.md:340); ``enum`` and ``color`` require
+        a ``format``; an enum format lists at least one value, none empty and none
+        duplicated (:392); a color format lists only ``rgb``, ``hsv`` and ``xyz``
+        (:393).
+        """
+        pid = self._id
+        datatype = self._datatype
+        if datatype is None:
+            _warn_invalid_once(self, "datatypeMissing", f"reason=propertyDatatypeMissing,propertyID={pid}")
+            return
+        if datatype not in PropertyDatatype._value2member_map_:
+            _warn_invalid_once(
+                self, "datatypeUnknown", f"reason=propertyDatatypeUnknown,propertyID={pid},datatype={datatype}"
+            )
+            return
+        fmt = self._format
+        if datatype in (PropertyDatatype.ENUM, PropertyDatatype.COLOR) and not fmt:
+            _warn_invalid_once(
+                self, "formatMissing", f"reason=propertyFormatMissing,propertyID={pid},datatype={datatype}"
+            )
+            return
+        if datatype == PropertyDatatype.ENUM and isinstance(fmt, str):
+            values = fmt.split(",")
+            if "" in values:
+                _warn_invalid_once(self, "enumEmptyValue", f"reason=propertyEnumFormatEmptyValue,propertyID={pid}")
+            if len(set(values)) != len(values):
+                _warn_invalid_once(self, "enumDuplicate", f"reason=propertyEnumFormatDuplicate,propertyID={pid}")
+        if datatype == PropertyDatatype.COLOR and isinstance(fmt, str):
+            if not set(fmt.split(",")) <= _COLOR_FORMATS:
+                _warn_invalid_once(
+                    self, "colorFormatInvalid", f"reason=propertyColorFormatInvalid,propertyID={pid},format={fmt}"
+                )
 
     def as_dict(self) -> dict:
         return {
@@ -708,42 +1163,33 @@ class Property:
         ``_format`` because no setter existed (SDK-6do.2).
         """
         self._format = new_format
+        self._check_description_fields()
 
     def coerced_value(self) -> Optional[str]:
         """
-        Returns the property's value (potentially rounded), as a string.
-        Returns None if the value is invalid or cannot be coerced.
+        Returns the property's value (potentially rounded) as its Homie 5 payload
+        text, or None if the value is None or the datatype cannot represent it
+        (convention.md:78-150). A refusal is logged at warning.
+
+        datetime/date values encode as ISO 8601, timedelta as ``PTxHxMxS``, a
+        color tuple as the first ``$format`` color type plus its components, and a
+        json value must be an array or object (a JSON string of one passes through
+        unchanged). The ``0x00`` empty-string encoding is not applied here.
         """
+        payload, problem = self._encode()
+        if problem is not None:
+            logger.warning(
+                f"reason=propertyValueRefused,propertyId={self._id},datatype={self._datatype},"
+                f"problem={problem},value={self._value!r}"
+            )
+        return payload
+
+    def _encode(self) -> tuple:
+        """``(payload, problem)`` for the current value; both None for a None value."""
         property_value = self.value()
         if property_value is None:
-            return None
-
-        # A json-datatype property's wire payload MUST be serialized JSON text
-        # (Homie 5 §JSON), the same serialization used for $description. Mirror
-        # the inbound /set path (json.loads); do NOT fall through to str(), which
-        # emits Python repr (single quotes) and is invalid JSON. An already-valid
-        # JSON string is passed through unchanged so we don't double-encode it.
-        if self.is_json_datatype():
-            if isinstance(property_value, str):
-                return property_value
-            try:
-                return json.dumps(property_value)
-            except (TypeError, ValueError) as e:
-                logger.warning(f"reason=coercedValueInvalidJson,propertyId={self._id},value={property_value},error={e}")
-                return None
-
-        property_type = self.datatype()
-        if property_type == PropertyDatatype.BOOLEAN:
-            if not isinstance(property_value, bool):
-                logger.warning(f"reason=coercedValueInvalidBoolean,propertyId={self._id},value={property_value}")
-                return None
-            return str(property_value).lower()
-
-        # For enum values, use .value to get the underlying value
-        if isinstance(property_value, Enum):
-            return str(property_value.value)
-
-        return str(property_value)
+            return None, None
+        return _encode_property_value(property_value, self._datatype, self._format)
 
     def id(self) -> str:
         """
@@ -845,6 +1291,7 @@ class Property:
         """
         The $target attribute must either be used for every value update (including the initial one), or it must never be used.
         TODO: Currently unimplemented, TBD how $target gets set on initial property value set...
+        Nothing in the SDK calls this; ``supports_target=True`` is inert.
         """
         logger.info(f"reason=propertyPublishTargetValue,propertyID={self._id},value={payload}")
         logger.warning(f"reason=propertyPublishTargetValueNotImplemented,propertyID={self._id},value={payload}")
@@ -909,12 +1356,14 @@ class Property:
             try:
                 value = self.coerced_value()
                 if value is None:
-                    logger.warning(
-                        f"reason=propertyPublishValueCoercionFailed,propertyID={self._id},rawValue={self._value}"
-                    )
+                    # Refused (logged by coerced_value): publish nothing rather than a
+                    # payload the datatype does not allow (convention.md:78).
                     return False
                 # Encode an empty-string value as a single 0x00 byte so the broker
-                # does not mistake it for a zero-length "clear retained" payload.
+                # does not mistake it for a zero-length "clear retained" payload. Only
+                # for string (convention.md:65-67); another datatype never encodes to
+                # "" because its encoder refuses an empty value. A missing datatype was
+                # warned about at construction and keeps the string behavior.
                 payload = encode_empty_string(value)
                 # GH #50: skip a republish whose final wire payload is byte-identical to
                 # the one already sitting on this topic. Compared AFTER coercion and
@@ -925,13 +1374,14 @@ class Property:
                 # RETAINED only. The broker stores nothing for an event property, so an
                 # identical consecutive payload there is a second real event and dropping
                 # it would lose information rather than save a redundant write.
-                # Truthiness rather than `is True`: retained is Optional[bool] and may be
-                # None, which the publish call below already treats as non-retained.
                 if not force and self.retained() and self._ever_published and self._last_published == (topic, payload):
                     logger.debug(f"reason=propertyPublishValueUnchanged,propertyID={self._id},topic={topic}")
                     return True
                 logger.debug(f"reason=propertyPublishValue,value={value},topic={topic},retained={self.retained()}")
-                mqttc.publish(topic, payload, retain=self.retained(), qos=self._qos)
+                # A non-retained (event) property publishes non-retained at QoS 0
+                # (convention.md:50, :695): an event arrives now or not at all.
+                qos = self._qos if self.retained() else 0
+                mqttc.publish(topic, payload, retain=self.retained(), qos=qos)
                 self._ever_published = True  # FIX: Mark as published
                 # Memoize only after publish() returns, inside the try: a transport that
                 # raises must not leave a memo claiming the broker holds a payload it
@@ -973,6 +1423,13 @@ class Property:
             # This prevents creating phantom topics during cleanup
             if not self._ever_published:
                 logger.info(f"reason=propertySkipClearNeverPublished,propertyID={self._id}")
+                return True
+            if not self.retained():
+                # The broker stores nothing for an event property, so there is nothing
+                # to retract; a retained empty message on an event topic would deliver
+                # a zero-length "event" to every live subscriber instead.
+                self._ever_published = False
+                self._last_published = None
                 return True
 
             mqttc = self.get_mqtt_client()
@@ -1047,24 +1504,44 @@ class Property:
         logger.debug(f"reason=propertyDescriptionEntered,id={self._id}")
         property = dict()
         property["name"] = self._name
-        property["datatype"] = self.datatype()
+        if self._datatype is not None:
+            # Required (convention.md:340); a missing datatype was warned about at
+            # construction, and null is not a valid value for it.
+            property["datatype"] = self.datatype()
         if self._format:
-            property["format"] = self.format()
+            fmt = self.format()
+            # A json format is a JSONschema carried as a string, NOT a nested
+            # object (convention.md:395).
+            property["format"] = json.dumps(fmt) if isinstance(fmt, dict) else fmt
         if self._settable:
-            property["settable"] = self._settable
+            property["settable"] = True
         if not self._retained:
-            property["retained"] = self._retained
+            property["retained"] = False
         if self._unit:
             property["unit"] = self._unit
         return property
 
-    def _settable_callback(self, topic: str, payload: Union[bytes, bytearray]) -> None:
+    def _settable_callback(self, topic: str, payload: Union[bytes, bytearray], retained: Optional[bool] = None) -> None:
         """
         For each settable property, there is a property/set topic that can be published to
         This is the callback for the subscription to each such property/set topic
         Examples:
         [homieDomain]/[homieVerson]/[deviceID]/[nodeID]/mode/set
         [homieDomain]/[homieVerion]/[deviceID]/[nodeID]/setpoint/set
+
+        ``retained`` is the MQTT retain flag, delivered when the transport supports
+        ``subscribe(..., with_retain=True)``. A retained ``/set`` is a stale command
+        the broker replays at subscribe time (controllers publish ``/set``
+        non-retained only, convention.md:48, :483), so it is ignored.
+
+        The payload is validated for the datatype before the callback runs, and an
+        invalid one is dropped with a ``reason=propertySetRejected`` warning: json
+        must be an array or object (and match a ``$format`` JSONschema when one can
+        be checked), integer and float must follow the payload grammar, a number is
+        rounded to the format's step and then checked against min/max
+        (convention.md:399), an enum must be in ``$format``, a boolean must be
+        ``true`` or ``false``. The ``0x00`` empty-string decoding applies to string
+        properties only.
         """
         logger.debug(f"reason=propertySetCallback,topic={topic}")
         try:
@@ -1085,6 +1562,9 @@ class Property:
         ):
             logger.debug(f"reason=nodeSetCallbackInvalidTopic,topic={topic}")
             return
+        if retained:
+            logger.warning(f"reason=propertySetRetainedIgnored,propertyID={property_id},topic={topic}")
+            return
         # It is possible that we have a valid property/set
         set_callback = self.get_set_callback()
         if not self.settable():
@@ -1094,28 +1574,26 @@ class Property:
             logger.info(f"reason=propertySetCallbackPropertyNoSetCallback,propertyID={property_id}")
             return
         try:
-            decoded_payload = payload.decode("utf-8")  # do we need to str() this?
-            # Homie 5: a single 0x00 byte on /set denotes an empty-string value.
-            decoded_payload = decode_empty_string(decoded_payload)
-            if self.is_json_datatype():
-                payload = json.loads(decoded_payload)
+            decoded_payload = payload.decode("utf-8")
+            value, problem = _parse_set_payload(decoded_payload, self._datatype, self._format, self._value)
+            if problem is None and self.is_json_datatype():
                 # Validate the decoded command against the property's $format
-                # JSONSchema (its advertised control surface). Reject an invalid
-                # command rather than acting on it. Graceful: skipped if there is
-                # no $format or the jsonschema package is not installed.
-                error = validate_json_format(payload, self._format)
+                # JSONSchema (its advertised control surface). Graceful: skipped if
+                # there is no $format or the jsonschema package is not installed.
+                error = validate_json_format(value, self._format)
                 if error is not None:
-                    logger.warning(f"reason=propertySetRejectedSchemaInvalid,propertyID={property_id},error={error}")
-                    return
-            else:
-                payload = decoded_payload
+                    problem = f"schemaInvalid:{error}"
+            if problem is not None:
+                logger.warning(
+                    f"reason=propertySetRejected,propertyID={property_id},datatype={self._datatype},"
+                    f"problem={problem},payload={decoded_payload!r}"
+                )
+                return
+            payload = value
             # We have the payload
             logger.debug(
                 f"reason=propertySetCallbackValue,propertyID={property_id},payload={payload},callback={set_callback}"
             )
-            if self.supports_target():
-                # Property supports_target, publish that!
-                self.publish_target_value(payload)
             # Call the property's set_callback function
             # Run the callback: a sync callback runs inline here (on the transport's
             # network thread, as before); an async (coroutine) callback is scheduled onto
@@ -1169,7 +1647,12 @@ class Property:
             return
         topic = f"{self._homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}/set"
         try:
-            mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos)
+            if _subscribe_supports_with_retain(mqttc):
+                # Deliver the retain flag so a stale retained /set is ignored.
+                mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos, with_retain=True)
+            else:
+                logger.debug(f"reason=propertySetSubscribeNoRetainFlag,id={self._id},hint=retained /set not detected")
+                mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos)
         except Exception as e:
             logger.warning(f"reason=propertySetSubscribeSubscribeException,e={e}")
         # Start the MQTT client loop() thread
@@ -1285,17 +1768,22 @@ class Node:
             property.async_loop = self._device._async_loop
         # Note set_subscribe() checks if property is settable...
         property.set_subscribe()
-        # Add property to dictionary BEFORE publishing description
+        # Outside a transition a ready device goes to init first, so the value lands
+        # before the $description that names it and before ready (convention.md:279).
+        # A node not yet attached to its device, or a re-declaration with identical
+        # content, leaves the $description unchanged and publishes only the value.
         self._properties.update({property.id(): property})
-        self.device().publish_description()
-        # force: announcing a property is a structural republish, so its value must
-        # land regardless of the GH #50 skip. A fresh property would pass the gate
-        # anyway (it has never published), and so would one re-added after
-        # delete_property() (clear_value() resets both gate conjuncts). What force
-        # actually covers is the property whose retained topic was deleted behind its
-        # back -- clear_retained_topic(), or an operator wiping the broker -- where
-        # the memo still claims the broker holds this payload and it does not.
-        property.publish_value(force=True)
+        with self.device()._reconfiguration():
+            # force: announcing a property is a structural republish, so its value must
+            # land regardless of the GH #50 skip. A fresh property would pass the gate
+            # anyway (it has never published), and so would one re-added after
+            # delete_property() (clear_value() resets both gate conjuncts). What force
+            # actually covers is the property whose retained topic was deleted behind its
+            # back -- clear_retained_topic(), or an operator wiping the broker -- where
+            # the memo still claims the broker holds this payload and it does not.
+            # An event property is not replayed by a structural change (:695).
+            if property.retained():
+                property.publish_value(force=True)
         return property
 
     def add_property_from_dict(self, property_dict: dict) -> Property:
@@ -1338,13 +1826,16 @@ class Node:
             logger.warning(f"reason=nodeDeletePropertyNotFound,nodeId={self._id},propertyId={property_id}")
             return False
         property = self._properties[property_id]
-        property.clear_value()
-        del self._properties[property_id]
-        # Delete from the dict BEFORE republishing, so the new $description
-        # reflects the removal (add_property() has the same ordering rule).
         device = self.device()
         if device:
-            device.publish_description()
+            # The description that drops the property is published when the
+            # reconfiguration scope closes, after the removal.
+            del self._properties[property_id]
+            with device._reconfiguration():
+                property.clear_value()
+        else:
+            property.clear_value()
+            del self._properties[property_id]
         logger.info(f"reason=nodeDeletedProperty,nodeId={self._id},propertyId={property_id}")
         return True
 
@@ -1378,7 +1869,9 @@ class Node:
         logger.debug(f"reason=nodeDescriptionEntered,id={self._id}")
         description = dict()
         description["name"] = self._name
-        description["type"] = self._type
+        if self._type is not None:
+            # Optional and not nullable (convention.md:305): omitted when unset.
+            description["type"] = self._type
         properties = dict()
         properties_snapshot = dict(self._properties)
         for property_id, attributes in properties_snapshot.items():
@@ -1400,6 +1893,11 @@ class Node:
         logger.debug(f"reason=nodePublish,nodeId={node_id},propertyCount={property_count}")
         # Use list() to create a shallow copy, preventing crash if dict changes during iteration
         for property_id, property in list(self._properties.items()):
+            if not property.retained():
+                # A republish walk restores the broker's retained store. An event
+                # property has nothing there, and replaying its last event would
+                # report it again (convention.md:695).
+                continue
             logger.debug(f"reason=nodePublishProperty,nodeId={node_id},propertyId={property_id}")
             # Best-effort per property. Property.publish_value() reaches the MQTT
             # client directly and does not wrap it, so an injected transport that
@@ -1465,6 +1963,41 @@ def _dispatch_disconnect(callback: Optional[Callable[[bool], None]], rc, source:
         callback(clean)
     except Exception:
         logger.exception(f"reason=onDisconnectCallbackException,source={source}")
+
+
+def _drop_connection_without_disconnect(client: Any, *, timeout: float) -> None:
+    """End an owned client's connection WITHOUT an MQTT DISCONNECT packet.
+
+    The broker then treats the connection as badly disconnected and publishes the
+    Last Will. ``Device.stop(announce=False)`` uses this so a teardown that announced
+    nothing is a bad disconnect (convention.md:281, :284) rather than a clean one.
+
+    ebus-mqtt-client has no unclean-stop API, so this stops the paho network loop
+    (which sends nothing) and shuts the socket down underneath it. The client's own
+    ``stop()`` runs afterwards to release its resources; its DISCONNECT then has no
+    live connection to reach. Bounded by ``timeout`` like ``MqttClient.stop()``.
+    """
+    paho = getattr(client, "mqttc", None)
+    if paho is None or not callable(getattr(paho, "socket", None)):
+        logger.warning("reason=deviceDropConnectionUnsupported,hint=the will may not fire")
+        return
+
+    def _drop() -> None:
+        with contextlib.suppress(Exception):
+            paho.loop_stop()
+        sock = paho.socket()
+        if sock is None:
+            return
+        with contextlib.suppress(Exception):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            sock.close()
+
+    worker = threading.Thread(target=_drop, name="ebus-sdk-drop-connection", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        logger.warning(f"reason=deviceDropConnectionTimeout,timeout={timeout}")
 
 
 class Device:
@@ -1654,14 +2187,28 @@ class Device:
         # description fields (convention §Forward compatibility), so these are
         # safe; core fields always take precedence over an extra of the same key.
         self._description_extras = dict(description_extras) if description_extras else {}
+        for key in sorted(self._description_extras.keys() & _DESCRIPTION_CORE_FIELDS):
+            # A core field is the SDK's to compute: an extra could otherwise add
+            # `root`/`parent` to a root device (convention.md:220) or a `type` the
+            # SDK omits. Dropped, with a warning per the invalid-input policy.
+            del self._description_extras[key]
+            _warn_invalid_once(
+                self, f"extrasCoreField:{key}", f"reason=deviceDescriptionExtrasCoreFieldDropped,id={id},field={key}"
+            )
         # Counter of how many state_transition() / delete() scopes are currently active
         # on this device. >0 means "a transition is in progress" — suppresses child-induced
         # parent flaps and makes nested state_transition()s reentrant (only the outermost
         # entry/exit publishes INIT/READY). Init→ready transitions force every controller
         # in the wild to resync, so emitting only the minimum is a correctness concern.
         self._transition_depth = 0
-        # SDK-n83: hash of the last $description we actually published, with the
-        # always-fresh `version` timestamp removed. publish_description() uses it
+        # Set by delete(): the device no longer exists on the broker, so nothing may
+        # republish its $state (stop(), a reconnect's refresh_tree(), the will).
+        self._deleted = False
+        # Alerts this device has raised and not cleared: alert id -> message.
+        # Tracked so a reconnect republishes them and delete() clears them.
+        self._alerts: dict = {}
+        # SDK-n83: hash of the last $description we actually published, with
+        # `version` removed. publish_description() uses it
         # to skip a republish whose content has not changed (saves the ~KB
         # payload and the gratuitous INIT→READY flap). Maintained in publish().
         self._last_description_content_hash = None
@@ -1862,70 +2409,114 @@ class Device:
     def stop(self, *, announce: bool = True, flush_timeout: float = 1.0, stop_timeout: float = 2.0) -> None:
         """Gracefully and promptly tear down this device tree's MQTT connection.
 
-        Publishes a final ``$state=disconnected`` for the root (best-effort) then
-        stops the root's MQTT client. This is a TREE-level teardown: children
-        share the root's connection, so a call on any device stops the whole
-        tree; per the Homie 5 effective-state rule, the root going
-        ``disconnected`` covers every descendant.
+        Publishes a final ``$state=disconnected`` for EVERY device in the tree
+        (best-effort), descendants first and the root last, then stops the root's
+        MQTT client with a clean disconnect. Homie 5 requires a device to send
+        ``disconnected`` before it cleanly disconnects (convention.md:280-281), and
+        children share the root's connection, so each of them disconnects too; the
+        root-to-child cascade (convention.md:262-267) covers only ``lost``. This is
+        a TREE-level teardown: a call on any device stops the whole tree.
 
         BOUNDED end to end (at most ~``flush_timeout`` + ``stop_timeout``): if the
-        broker is unreachable the disconnected publish is skipped and ``stop()``
+        broker is unreachable the disconnected publishes are skipped and ``stop()``
         still returns promptly, so a shutting-down process never stalls on a dead
-        broker. Because ``MqttClient.stop()`` performs a clean disconnect (which
-        suppresses the LWT), publishing ``$state=disconnected`` first is what lets
-        consumers see a clean shutdown rather than a stale ``ready`` or a
-        badly-disconnected ``lost``. After ``stop()`` this device tree should not
-        be reused.
+        broker. The root's publish is the one flushed; it is sent last, so the
+        children's publishes precede it on the wire. Because ``MqttClient.stop()``
+        performs a clean disconnect (which suppresses the LWT), publishing
+        ``disconnected`` first is what lets consumers see a clean shutdown rather
+        than a stale ``ready``. After ``stop()`` this device tree should not be
+        reused.
 
         For a bring-your-own-transport root (``mqttc=``) the SDK does not own the
-        client: ``stop()`` publishes the final ``$state=disconnected`` as a plain
-        retained message and returns immediately, without flushing and without
-        closing the client, so it never blocks the caller's loop. The caller
-        stops and disconnects its own client. ``flush_timeout``/``stop_timeout``
-        apply to the owned path only.
+        client: ``stop()`` publishes the same ``$state=disconnected`` messages as
+        plain retained messages and returns immediately, without flushing and
+        without closing the client, so it never blocks the caller's loop. The
+        caller stops and disconnects its own client. ``flush_timeout`` and
+        ``stop_timeout`` apply to the owned path only.
 
-        ``announce=False`` tears down without publishing anything, leaving the
-        retained ``$state`` exactly as it stands. Pair it with ``declare_lost()``
-        for a producer that is dying rather than shutting down: that publishes
-        ``lost`` first, and the default ``announce=True`` would then overwrite it
-        with ``disconnected``. Unpaired it leaves whatever was published last,
-        typically a stale ``ready``, and nothing will correct that: the clean
-        disconnect on the owned path suppresses the LWT (see above). The teardown
-        itself stays bounded and clean in both modes; only the announcement differs.
+        ``announce=False`` publishes nothing and ends the connection WITHOUT a
+        clean MQTT DISCONNECT, so the broker delivers the Last Will (the root's
+        ``$state=lost``). Homie 5 forbids a clean disconnect without a preceding
+        ``disconnected`` (convention.md:281) and defines ``lost`` as a bad
+        disconnect (convention.md:284), so a silent teardown is a bad disconnect.
+        Pair it with ``declare_lost()`` for a producer that is dying rather than
+        shutting down: that publishes ``lost`` while the link is up, and the will
+        then re-asserts the same retained payload. On a bring-your-own transport
+        the SDK closes nothing; the caller must drop its connection without a clean
+        DISCONNECT for the same guarantee.
+
+        After ``delete()`` on the root, ``stop()`` announces nothing in either mode
+        and always disconnects cleanly: the device no longer exists
+        (convention.md:288), and a ``disconnected`` or a will-driven ``lost`` would
+        re-create it as a bare ``$state`` with no ``$description``.
         """
         root = self.root()
         mqttc = root.mqttc
         if mqttc is None:
             _log_missing_client(f"reason=deviceStopNoMqttClient,id={self._id}", by_design=self._transport_free())
             return
-        # Best-effort graceful $state=disconnected. publish_and_flush is bounded
-        # and returns False (never blocks/raises) when the broker is unreachable,
-        # so this can't stall shutdown. Note the state move lives inside this branch,
-        # so announce=False cannot overwrite a $state a caller just declared.
-        if not announce:
+        owned = root._owns_client and root._owned_client is not None
+        if root._deleted:
+            logger.info(f"reason=deviceStopDeletedTreeSilent,id={root._id}")
+            if owned and mqttc.is_connected():
+                # Nothing to announce, but delete()'s retained clears may still be in
+                # flight. Re-clearing the root's $state (a no-op deletion) is flushed,
+                # and with it everything queued before it, ahead of the disconnect.
+                state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
+                root._owned_client.publish_and_flush(state_topic, "", qos=root._qos, retain=True, timeout=flush_timeout)
+        elif not announce:
             logger.info(f"reason=deviceStopSilent,id={root._id}")
+            if owned:
+                # No disconnected was sent, so the disconnect must not be clean: drop
+                # the connection and let the broker publish the will.
+                _drop_connection_without_disconnect(root._owned_client, timeout=stop_timeout)
         elif mqttc.is_connected():
-            root._state = DeviceState.DISCONNECTED
-            state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state"
-            if root._owns_client and root._owned_client is not None:
-                flushed = root._owned_client.publish_and_flush(
-                    state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
-                )
-                logger.info(f"reason=deviceStopDisconnectedPublished,id={root._id},flushed={flushed}")
-            else:
-                # Bring-your-own-transport: the caller owns the loop and teardown.
-                # Publish the final state as a plain retained message (the caller's
-                # loop delivers it) and return without flushing or closing — both
-                # publish_and_flush and stop() are owned-only, off the injected
-                # transport surface, so this never blocks the caller's thread.
-                mqttc.publish(state_topic, DeviceState.DISCONNECTED.value, retain=True, qos=root._qos)
-                logger.info(f"reason=deviceStopDisconnectedPublishedInjected,id={root._id}")
+            # Best-effort graceful $state=disconnected for the whole tree. The state
+            # moves live inside this branch, so announce=False cannot overwrite a
+            # $state a caller just declared.
+            for device in root._tree_post_order():
+                device._state = DeviceState.DISCONNECTED
+                state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device._id}/$state"
+                if device is root and owned:
+                    # publish_and_flush is bounded and returns False (never blocks or
+                    # raises) when the broker is unreachable, so this cannot stall
+                    # shutdown.
+                    flushed = root._owned_client.publish_and_flush(
+                        state_topic, DeviceState.DISCONNECTED.value, qos=root._qos, retain=True, timeout=flush_timeout
+                    )
+                    logger.info(f"reason=deviceStopDisconnectedPublished,id={root._id},flushed={flushed}")
+                    continue
+                # A descendant, or any device on an injected transport: a plain
+                # retained publish. publish_and_flush is owned-only and off the
+                # injected transport surface, so this never blocks the caller's thread.
+                try:
+                    mqttc.publish(state_topic, DeviceState.DISCONNECTED.value, retain=True, qos=root._qos)
+                except Exception as e:
+                    logger.warning(f"reason=deviceStopDisconnectedPublishFailed,id={device._id},e={e}")
+                    continue
+                if device is root:
+                    logger.info(f"reason=deviceStopDisconnectedPublishedInjected,id={root._id}")
         else:
             logger.info(f"reason=deviceStopBrokerUnreachable,id={root._id}")
-        if root._owns_client and root._owned_client is not None:
+        if owned:
             root._owned_client.stop(timeout=stop_timeout)
         root.mqttc = None
         root._owned_client = None
+
+    def _tree_post_order(self) -> List["Device"]:
+        """This device and every descendant, each device after all of its descendants."""
+        ordered: List[Device] = []
+        for child in list(self._children):
+            ordered.extend(child._tree_post_order())
+        ordered.append(self)
+        return ordered
+
+    def _tree_pre_order(self) -> List["Device"]:
+        """This device and every descendant, each device before any of its descendants."""
+        ordered: List[Device] = [self]
+        for child in list(self._children):
+            ordered.extend(child._tree_pre_order())
+        return ordered
 
     def declare_lost(self, *, flush_timeout: float = 1.0) -> bool:
         """Declare this device tree dead: move the ROOT to ``$state=lost`` and publish it.
@@ -2001,9 +2592,12 @@ class Device:
         logger.debug(f"reason=deviceDescriptionEntered,id={self._id}")
         description = dict()
         description["homie"] = f"{EBUS_HOMIE_VERSION_MAJOR}.{EBUS_HOMIE_VERSION_MINOR}"
-        # Version should be changed any time the description document is changed
-        description["version"] = Device.now_ems()
-        description["type"] = self._type
+        # Placeholder keeps `version` second in the document; filled in below from
+        # the content, which the hash computes without it.
+        description["version"] = 0
+        if self._type is not None:
+            # Optional and not nullable (convention.md:218): omitted when unset.
+            description["type"] = self._type
         description["name"] = self._name
         nodes_descriptions = dict()
         nodes_snapshot = dict(self._nodes)
@@ -2017,9 +2611,15 @@ class Device:
             # Required if the parent is NOT the root device. Defaults to the value of the root property.
             description["parent"] = self._parent.id()
         description["extensions"] = self._extensions
-        # Merge extension-defined device attributes, never clobbering a core field.
+        # Merge extension-defined device attributes (core fields were dropped from
+        # the extras at construction).
         for key, value in self._description_extras.items():
             description.setdefault(key, value)
+        # A new version whenever the document changes (convention.md:215), and the
+        # same version while it does not, so a reconnect republishes an identical
+        # document: the top 52 bits of the content hash, an integer below 2^53 that
+        # every JSON consumer reads exactly.
+        description["version"] = int(self._description_content_hash(description)[:13], 16)
         return description
 
     def set_state(self, state: DeviceState) -> bool:
@@ -2054,12 +2654,14 @@ class Device:
             if self._async_loop is not None:
                 prop.async_loop = self._async_loop
         node_id = node.id()
+        # Outside a transition a ready device goes to init first, so the node's
+        # values land before the $description that names them and before ready.
         self._nodes.update({node_id: node})
-        # Explicit force (also Node.publish's default): adopting a node is a
-        # structural republish, so every property lands on the broker under this
-        # device regardless of the GH #50 unchanged-payload skip.
-        node.publish(force=True)
-        self.publish_description()
+        with self._reconfiguration():
+            # Explicit force (also Node.publish's default): adopting a node is a
+            # structural republish, so every property lands on the broker under this
+            # device regardless of the GH #50 unchanged-payload skip.
+            node.publish(force=True)
         return node
 
     def add_node_from_dict(self, node_dict: dict) -> Node:
@@ -2090,7 +2692,8 @@ class Device:
         """
         if node_id in self._nodes:
             self._nodes.pop(node_id, None)
-            self.publish_description()
+            with self._reconfiguration():
+                pass
             return True
         else:
             return False
@@ -2116,20 +2719,19 @@ class Device:
             logger.warning(f"reason=deviceDeleteNodeNotFound,deviceId={self._id},nodeId={node_id}")
             return False
         node = self._nodes[node_id]
-        # Clear all property topics first
-        # Note: This explicitly clears each property's retained message from MQTT
-        # to avoid leaving orphaned topics in the broker
-        node.clear_all_properties()
-        # Remove node from device's internal structure
+        # The description that drops the node is published when the reconfiguration
+        # scope closes, after its property topics are cleared.
         del self._nodes[node_id]
-        # Update device description (which removes the node from the schema)
-        self.publish_description()
+        with self._reconfiguration():
+            # Clear each published property's retained message so no orphaned
+            # topics are left in the broker.
+            node.clear_all_properties()
         logger.info(f"reason=deviceDeletedNode,deviceId={self._id},nodeId={node_id}")
         return True
 
     def delete_all_from_mqtt(self) -> None:
         """
-        Clear this device's retained property values and $description from the broker.
+        Clear this device's retained property values, alerts and $description from the broker.
 
         A low-level data-cleanup helper: it clears every published property value and
         the $description topic, but deliberately does NOT touch $state, so on its own it
@@ -2167,7 +2769,10 @@ class Device:
                     elif hasattr(prop, "_ever_published") and prop._ever_published:
                         was_published = True
 
-                    if was_published:
+                    if was_published and not prop.retained():
+                        # Nothing retained to clear on an event topic (see clear_value).
+                        prop.invalidate_publish_cache()
+                    elif was_published:
                         prop_topic = f"{base_topic}/{node_id}/{prop_id}"
                         try:
                             mqttc.publish(prop_topic, "", retain=True, qos=self._qos)
@@ -2186,66 +2791,80 @@ class Device:
         description_topic = f"{base_topic}/$description"
         try:
             mqttc.publish(description_topic, "", retain=True, qos=self._qos)
+            self.invalidate_description_cache()
             logger.info(f"reason=deviceClearedDescription,deviceId={self._id},topic={description_topic}")
         except Exception as e:
             logger.warning(f"reason=deviceClearDescriptionFailed,deviceId={self._id},error={e}")
 
-        # Step 3: Clear internal tracking (no publishing happens here)
+        # Step 3: Clear raised alerts; a removed device leaves no topics behind
+        # (convention.md:289).
+        for alert_id in list(self._alerts):
+            self.clear_alert(alert_id)
+
+        # Step 4: Clear internal tracking (no publishing happens here)
         self._nodes.clear()
 
         logger.info(f"reason=deviceDeleteAllFromMqttComplete,deviceId={self._id}")
 
     def delete(self) -> None:
         """
-        Remove this device from the tree (Homie remove-child protocol).
+        Remove this device, and every descendant, from the broker (Homie removal).
 
-        On a child: clears the child's retained MQTT data (state, description,
-        all property values), detaches from parent, then triggers the parent
-        to republish its $description (without this child in `children`).
-        Parent's INIT→READY flap is suppressed if the parent is already mid
-        state_transition (S3: batched remove inside `with parent.state_transition()`).
+        On a child, in the order convention.md:635-641 gives: the parent is updated
+        first (``init``, ``$description`` without this child in ``children``,
+        ``ready``), then this device's topics are cleared starting with its
+        ``$state``. The parent's update is deferred, as for any structural change,
+        when the parent is already inside a ``state_transition()``.
 
-        On a root: clears all retained data for this device. (Does not stop
-        the MQTT client — that's the caller's responsibility, after which the
-        LWT publish covers the whole tree.) Note this REMOVES the device: an absent
-        retained ``$state`` is the Homie removal signal, so do not follow it with
-        ``declare_lost()``, which would resurrect the device on the broker as a bare
-        ``$state=lost`` with no ``$description``. (The root's will is a separate
-        matter: it is armed on the connection, not on the device, so it still fires
-        if the process then dies uncleanly.) To retire a tree as dead but still
-        present, use ``declare_lost()`` plus ``stop(announce=False)`` instead.
+        The removed subtree is cleared leaves first, and each device's ``$state``
+        is cleared before its other topics: values, alerts and ``$description``
+        (convention.md:287-289). No device in the subtree publishes an
+        ``init``/``ready`` flap on its way out.
 
-        While delete() is running, this device acts as if it were mid
-        state_transition so descendants' delete()-triggered parent-flap
-        notifications collapse into nothing — a recursive teardown shouldn't
-        publish gratuitous INIT/READY on dying devices.
+        On a root: clears all retained data for the tree. It does not stop the MQTT
+        client; ``stop()`` afterwards disconnects cleanly and announces nothing,
+        and a reconnect republishes nothing, since an absent retained ``$state`` is
+        the removal signal and any later ``$state`` would re-create the device with
+        no ``$description``. The will is armed on the connection, so it still fires
+        if the process dies uncleanly before ``stop()``. Do not follow this with
+        ``declare_lost()``; to retire a tree as dead but still present, use
+        ``declare_lost()`` plus ``stop(announce=False)`` instead.
 
         After delete(), this Device object should not be used further.
         """
         logger.info(f"reason=deviceDelete,deviceId={self._id},isRoot={self._parent is None}")
-        # Bump transition depth so structural-change notifications from descendants
-        # we're about to tear down get suppressed — they'd be calling
-        # _notify_structural_change on a corpse.
-        self._transition_depth += 1
-        try:
-            # Recursively delete children first so the broker sees a leaves-first cleanup.
-            for child in list(self._children):
-                child.delete()
-            # Clear $state FIRST, per the Homie 5 removal order (convention: clear
-            # the retained $state and "the device will cease to exist", then clear
-            # its other retained topics). delete_all_from_mqtt only handles property
-            # values and $description, so $state is cleared here separately.
-            base_topic = f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}"
-            self.clear_retained_topic(f"{base_topic}/$state")
-            self.delete_all_from_mqtt()
-        finally:
-            self._transition_depth -= 1
-        if self._parent is not None:
-            parent = self._parent
+        subtree = self._tree_pre_order()
+        for device in subtree:
+            device._deleted = True
+        parent = self._parent
+        if parent is not None:
+            # Step 1: the parent drops this child from `children` and re-announces.
+            # The child keeps its _parent link until its topics are cleared: the
+            # topic domain and the MQTT client are both resolved through the root.
             parent._children.remove(self)
-            self._parent = None
-            # Only fires if parent isn't itself mid-delete or mid state_transition.
             parent._notify_structural_change()
+        # Step 2: clear the subtree leaves first, so no device is seen whose parent
+        # is already gone. Each device's $state goes before its other topics, so it
+        # ceases to exist first (convention.md:287-289).
+        for device in reversed(subtree):
+            base_topic = f"{device.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device._id}"
+            device.clear_retained_topic(f"{base_topic}/$state")
+            device.delete_all_from_mqtt()
+        for device in subtree:
+            device._children = []
+        self._parent = None
+
+    def invalidate_description_cache(self) -> None:
+        """Forget which ``$description`` this device last published.
+
+        ``publish_description()`` skips a document identical to the last one it
+        published, on the assumption that the broker still holds it. Anything that
+        deletes the retained ``$description`` behind the device's back must call
+        this, or the next ``publish_description()`` is skipped and the device stays
+        without a description. ``clear_retained_topic()`` aimed at this device's
+        ``$description`` and ``delete_all_from_mqtt()`` call it themselves.
+        """
+        self._last_description_content_hash = None
 
     def clear_retained_topic(self, topic_path: str) -> bool:
         """
@@ -2267,6 +2886,9 @@ class Device:
         try:
             mqttc.publish(topic_path, "", retain=True, qos=self._qos)
             logger.info(f"reason=deviceClearedTopic,topic={topic_path}")
+            if topic_path == f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/$description":
+                # The broker no longer holds the document the hash describes.
+                self.invalidate_description_cache()
             return True
         except Exception as e:
             logger.warning(f"reason=deviceClearTopicException,topic={topic_path},e={e}")
@@ -2309,7 +2931,7 @@ class Device:
         """
         Republish this device's $description after a structural change
         (a child was added or removed). Performs INIT → publish description
-        → READY unless this device is already inside a state_transition() —
+        → READY (or back to sleeping) unless this device is already inside a state_transition() —
         in which case the in-progress transition will publish on exit and
         we suppress the per-change flap (S1: many children, one parent cycle).
 
@@ -2322,13 +2944,53 @@ class Device:
                 f"reason=deviceStructuralChangeSuppressed,deviceId={self._id},transitionDepth={self._transition_depth}"
             )
             return
-        if self._state != DeviceState.READY:
-            self.publish_description(republish=True)
+        # publish_description() wraps the change in INIT when the device is ready
+        # or sleeping, and publishes it directly otherwise.
+        self.publish_description()
+
+    def _description_changed(self) -> bool:
+        """Whether ``$description`` now differs from the one last published."""
+        try:
+            return self._description_content_hash(self.description()) != self._last_description_content_hash
+        except Exception:
+            # publish_description() logs the compose failure.
+            return True
+
+    @contextlib.contextmanager
+    def _reconfiguration(self):
+        """Publish a structural change made outside an explicit ``state_transition()``.
+
+        The caller applies the change to the in-memory tree first, without
+        publishing, then publishes inside this scope what the change requires (new
+        values included).
+
+        Homie 5 reconfiguration (convention.md:207, :279, :611): a ``ready`` or
+        ``sleeping`` device whose ``$description`` the change alters goes to
+        ``init``, runs the body, publishes the new ``$description``, and only then
+        returns to the state it was in, so ``ready`` is never announced ahead of the
+        values it vouches for. A change that leaves the ``$description`` as last
+        published (a node not attached to the device, an identical re-declaration)
+        runs the body with no ``init``/``ready`` flap (convention.md:616). Inside an
+        open transition the change joins it. In any other state (not yet announced,
+        ``init``, ``disconnected``, ``lost``) the body and the new ``$description``
+        are published directly.
+        """
+        if self._transition_depth > 0:
+            yield
             return
-        # Steady-state structural change: full INIT → desc → READY cycle.
+        prior = self._state
+        if prior not in (DeviceState.READY, DeviceState.SLEEPING) or not self._description_changed():
+            yield
+            self.publish_description()
+            return
+        self._transition_depth += 1
         self.set_state(DeviceState.INIT)
-        self.publish("$description")
-        self.set_state(DeviceState.READY)
+        try:
+            yield
+        finally:
+            self._transition_depth -= 1
+            self.publish_description()
+            self.set_state(prior)
 
     def state_transition(self) -> StateTransitionContext:
         """
@@ -2368,6 +3030,10 @@ class Device:
         re-raised; callers wanting to detect it should watch for
         ``reason=deviceRefreshTreeChildFailed`` in the log.
         """
+        if self._deleted:
+            # delete() removed this device; republishing would re-create it.
+            logger.info(f"reason=deviceRefreshTreeDeletedSkipped,deviceId={self._id}")
+            return
         logger.info(
             f"reason=deviceRefreshTree,deviceId={self._id},"
             f"nodeCount={len(self._nodes)},childCount={len(self._children)}"
@@ -2383,8 +3049,15 @@ class Device:
         # finishes makes the refresh one atomic commit, flipped by one publish.
         # This narrows a producer-side window; it is NOT a guarantee a consumer
         # may build on (see doc/consuming-a-homie-tree.md). Message set unchanged.
+        # A document that differs from the last one published (its memo was
+        # invalidated, or never stored) is a change, so a ready or sleeping device
+        # announces init first (convention.md:207); the state publish below ends it.
+        if self._state in (DeviceState.READY, DeviceState.SLEEPING) and self._description_changed():
+            self.publish_state(DeviceState.INIT)
         self.publish_description(republish=True)
         self.publish_nodes(force=force)
+        for alert_id, message in list(self._alerts.items()):
+            self._publish_alert_topic(alert_id, message)
         # Snapshot — main thread may construct child devices (which append
         # to self._children) while this runs on the MQTT loop thread.
         for child in list(self._children):
@@ -2433,23 +3106,92 @@ class Device:
                 description = value if value else self.description()
                 payload = json.dumps(description) if description else None
             elif attribute == "$alert":
-                topic = base_topic + "$alert"
-                if value:
-                    payload = value
-                else:
-                    logger.info(f"reason=devicePublishAlertNoValue,id={self._id}")
-                    return
+                # An alert lives at $alert/[alert ID] (convention.md:517); a bare
+                # $alert topic is not one. Use publish_alert().
+                logger.warning(
+                    f"reason=devicePublishAlertWithoutId,id={self._id},hint=use publish_alert(alert_id, message)"
+                )
+                return
             if payload:
                 mqttc.publish(topic, payload, retain=True, qos=self._qos)
                 if attribute == "$description":
-                    # SDK-n83: remember what we just put on the wire (sans the
-                    # version timestamp) so a later unchanged republish no-ops.
+                    # SDK-n83: remember what we just put on the wire (sans
+                    # version) so a later unchanged republish no-ops.
                     # Updated here — the single $description chokepoint — so every
                     # caller (publish_description, _notify_structural_change,
                     # reconnect) keeps the hash current.
                     self._last_description_content_hash = self._description_content_hash(description)
         except Exception as e:
             logger.exception(f"reason=devicePublishException,id={self._id},attribute={attribute},value={value},e={e}")
+
+    def _alert_topic(self, alert_id: str) -> str:
+        return f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/$alert/{alert_id}"
+
+    def _publish_alert_topic(self, alert_id: str, message: str) -> bool:
+        mqttc = self.get_mqtt_client()
+        if not mqttc:
+            _log_missing_client(
+                f"reason=devicePublishAlertNoMqttClient,id={self._id}", by_design=self._transport_free()
+            )
+            return False
+        try:
+            mqttc.publish(self._alert_topic(alert_id), message, retain=True, qos=self._qos)
+            return True
+        except Exception as e:
+            logger.warning(f"reason=devicePublishAlertException,id={self._id},alertId={alert_id},e={e}")
+            return False
+
+    def publish_alert(self, alert_id: str, message: str) -> bool:
+        """Raise a user-facing alert at ``$alert/[alert_id]`` (convention.md:512-527).
+
+        Retained, at the tree QoS. Raising the same id again replaces its message.
+        The alert stays until ``clear_alert(alert_id)``; ``delete()`` clears every
+        alert the device raised, and a reconnect republishes them.
+
+        ``alert_id`` must be a single topic level; one containing ``/``, ``+`` or
+        ``#``, or an empty one, is refused. An id outside the Homie ID format
+        (``a-z``, ``0-9``, ``-``) is warned about and still published. ``message``
+        must be a non-empty string: an empty payload deletes the topic, so clear an
+        alert with ``clear_alert()``. Returns True if published.
+        """
+        if not alert_id or not isinstance(alert_id, str) or any(c in alert_id for c in "/+#"):
+            logger.warning(f"reason=devicePublishAlertInvalidId,id={self._id},alertId={alert_id!r}")
+            return False
+        if not re.fullmatch(r"[a-z0-9-]+", alert_id):
+            _warn_invalid_once(
+                self, f"alertId:{alert_id}", f"reason=devicePublishAlertIdFormat,id={self._id},alertId={alert_id}"
+            )
+        if not isinstance(message, str) or message == "":
+            logger.warning(f"reason=devicePublishAlertEmptyMessage,id={self._id},alertId={alert_id}")
+            return False
+        self._alerts[alert_id] = message
+        return self._publish_alert_topic(alert_id, message)
+
+    def clear_alert(self, alert_id: str) -> bool:
+        """Remove the alert ``alert_id`` by deleting its retained topic (convention.md:519).
+
+        Returns True if the deletion was published. Clearing an alert this device
+        did not raise still publishes the deletion, so a stale alert left by an
+        earlier run can be removed.
+        """
+        if not alert_id or not isinstance(alert_id, str) or any(c in alert_id for c in "/+#"):
+            logger.warning(f"reason=deviceClearAlertInvalidId,id={self._id},alertId={alert_id!r}")
+            return False
+        self._alerts.pop(alert_id, None)
+        mqttc = self.get_mqtt_client()
+        if not mqttc:
+            _log_missing_client(f"reason=deviceClearAlertNoMqttClient,id={self._id}", by_design=self._transport_free())
+            return False
+        try:
+            mqttc.publish(self._alert_topic(alert_id), "", retain=True, qos=self._qos)
+            return True
+        except Exception as e:
+            logger.warning(f"reason=deviceClearAlertException,id={self._id},alertId={alert_id},e={e}")
+            return False
+
+    def alerts(self) -> dict:
+        """The alerts this device has raised and not cleared, ``{alert_id: message}``."""
+        return dict(self._alerts)
 
     def publish_state(self, state: Optional[DeviceState] = None) -> None:
         """
@@ -2464,51 +3206,59 @@ class Device:
     @staticmethod
     def _description_content_hash(description: dict) -> str:
         """
-        SHA-256 of a $description dict with the always-fresh `version` timestamp
-        removed, so two structurally-identical descriptions hash equal even
-        though description() stamps a new version on every call.
+        SHA-256 of a $description dict with `version` removed. ``description()``
+        derives ``version`` from this hash, and the publish gate compares it to
+        decide whether the document changed.
         """
         content = {k: v for k, v in description.items() if k != "version"}
         return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
     def publish_description(self, republish: bool = False) -> None:
+        """Publish this device's ``$description`` if its content changed.
+
+        Homie 5 lets ``$description`` change only while ``$state`` is ``init``,
+        ``disconnected`` or ``lost`` (convention.md:207). A change made while the
+        device is ``ready`` or ``sleeping`` is therefore wrapped: ``init``, the new
+        document, then the state the device was in.
+
+        Unchanged content is skipped. ``version`` is derived from the content
+        (see ``description()``), so ``republish=True`` (the reconnect path) puts
+        the same document back on the broker, which is not a change and needs no
+        ``init``. ``republish=True`` publishes the document without the wrap even
+        when it changed: ``refresh_tree()`` publishes ``init`` ahead of it and the
+        device's state after everything the document names. ``republish=True`` is
+        also exempt from the in-transition defer.
+        """
         # SDK-9ps: while a state_transition() is open, defer interim $description
         # publishes to the single consolidated publish at _end_state_transition().
         # Adding N nodes inside one transition then puts 1 description on the wire,
-        # not N+1. A forced republish (reconnect / not-yet-READY) is exempt — it
-        # must reach the broker now. (_end_state_transition leaves the transition
-        # scope before its own call so that consolidated publish isn't deferred.)
+        # not N+1. (_end_state_transition leaves the transition scope before its own
+        # call so that consolidated publish isn't deferred.)
         if self._transition_depth > 0 and not republish:
             logger.debug(
                 f"reason=publishDescriptionDeferredInTransition,deviceId={self._id},depth={self._transition_depth}"
             )
             return
 
-        # SDK-n83: defensive no-op when the description content (ignoring the
-        # always-fresh `version` timestamp) is byte-identical to what we last
-        # published — avoids the redundant ~KB republish and the gratuitous
-        # INIT→READY flap that forces every subscriber to resync. A forced
-        # republish is exempt so reconnect always restores the retained topic.
-        if not republish:
-            if self._description_content_hash(self.description()) == self._last_description_content_hash:
-                logger.debug(f"reason=publishDescriptionUnchanged,deviceId={self._id}")
-                return
-
-        if republish:
-            self.publish("$description")
+        try:
+            description = self.description()
+            changed = self._description_content_hash(description) != self._last_description_content_hash
+        except Exception as e:
+            # Best-effort, like every Device.publish(): one unserializable entry must
+            # not abort a tree-wide refresh.
+            logger.exception(f"reason=publishDescriptionComposeFailed,deviceId={self._id},e={e}")
+            return
+        if not changed and not republish:
+            # SDK-n83: nothing to announce; skip the ~KB republish and the INIT flap.
+            logger.debug(f"reason=publishDescriptionUnchanged,deviceId={self._id}")
+            return
+        prior = self._state
+        if changed and not republish and prior in (DeviceState.READY, DeviceState.SLEEPING):
+            self.publish_state(DeviceState.INIT)
+            self.publish("$description", description)
+            self.publish_state(prior)
         else:
-            if self._state == DeviceState.READY:
-                # Need to transition first to INIT
-                self.publish_state(DeviceState.INIT)
-                self.publish("$description")
-                # Now that we've republished, restore $state to ready
-                self.publish_state(DeviceState.READY)
-            else:
-                # TODO: should we be able to publish if DISCONNECTED, SLEEPING, or LOST?
-                # If not in READY state, then we don't need to transition to INIT...
-                logger.info(f"reason=publishDescriptionNotRepublishNotReady,state={self._state.name}")
-                # Just publish description
-                self.publish("$description")
+            self.publish("$description", description)
 
     def publish_nodes(self, *, force: bool = True) -> None:
         # Snapshot — invoked from on_connect() on the MQTT loop thread while
@@ -2579,11 +3329,18 @@ class Device:
         ``declare_lost()`` publishes this same topic and payload explicitly, for a
         producer that knows it is dying: the will fires only on an unclean
         disconnect, and the clean disconnect ``stop()`` performs suppresses it.
+
+        ``qos`` and ``retain`` are the tree's: every other ``$state`` publish is
+        retained at the tree QoS (convention.md:45-47), and a will on the same topic
+        at a lower QoS would break the ordering a single QoS level guarantees
+        (convention.md:689-691).
         """
         root = self.root()
         return {
             "topic": f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{root._id}/$state",
             "payload": DeviceState.LOST.value,
+            "qos": root._qos,
+            "retain": True,
         }
 
     def connect_broker(self) -> None:

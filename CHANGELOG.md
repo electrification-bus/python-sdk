@@ -4,6 +4,41 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com/electrification-bus/python-sdk/issues/95), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)). Line numbers refer to [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md).
+
+### Changed
+
+- `Device.stop()` publishes `$state=disconnected` for every device in the tree, descendants first and the root last, before its clean disconnect. Only the root announced it before, so each child's retained `$state` stayed `ready` after a clean shutdown (convention.md:280-281; the cascade at :262-267 covers only `lost`).
+- `Device.stop(announce=False)` no longer disconnects cleanly. On an SDK-owned client it ends the connection without an MQTT DISCONNECT, so the broker publishes the Last Will. A clean disconnect must be preceded by `disconnected` (:281), and `lost` is the state of a bad disconnect (:284). After `declare_lost()` the will re-asserts the same retained `lost`; unpaired, it replaces the stale `ready` the clean disconnect used to leave.
+- `child.delete()` updates the parent first (`init`, `$description` without the child, `ready`) and only then clears the child's topics, starting with `$state` (:635-641). The order was reversed.
+- `Device.will()` carries `qos` (the tree's) and `retain: True`, so the Last Will is no longer sent at QoS 0 while every other `$state` uses the tree QoS (:45, :689-691).
+- `$description` `version` is the top 52 bits of the SHA-256 of the document without `version` (the content hash the publish gate already used), replacing epoch milliseconds. Every change gets a new version, two documents published in one millisecond no longer share one, and an unchanged document keeps its version, so a reconnect republishes a byte-identical document (:215).
+- A `$description` change on a `sleeping` device is wrapped in `init` and returns to `sleeping`, as a change on a `ready` device already was (:207). A reconnect republish of unchanged content is not a change and publishes no `init`. When the content differs from the last document published (after `invalidate_description_cache()`, say), `refresh_tree()` publishes `init` first and the device's state once, after its values and children.
+- `Node.add_property()`, `Device.add_node()`, `Node.delete_property()`, `Device.remove_node()` and `Device.delete_node()` called outside a `state_transition()` on a `ready` or `sleeping` device publish `init`, the changed values, the new `$description`, then the prior state. `ready` was announced before a new property's value existed (:279, :611). A change that leaves the `$description` as last published (a property added to a node not yet attached to its device, or an identical re-declaration) publishes only its values, with no `init`/`ready` flap (:616).
+- `$description` omits `type` for a device or node that has none instead of publishing `"type": null` (:218, :305), and a property's `retained` is always a boolean.
+- A `json` property whose `format` is a dict publishes it as a JSON string, not a nested object (:395).
+- Invalid producer input is warned about, once per object, and still published; it will raise in the next minor release: a property with no `datatype` (published without one, :340), `retained=None` (published as `false`, the non-retained behavior it always had, :343), an `enum` or `color` with no `format`, an enum format with an empty or duplicate value (:392-393), and a `color` format listing anything but `rgb`, `hsv`, `xyz`.
+- `description_extras` keys that are Homie core `$description` fields (`homie`, `version`, `nodes`, `name`, `type`, `children`, `root`, `parent`, `extensions`) are dropped with a warning. An extra could add `root` and `parent` to a root device (:220).
+- An outbound value the property's datatype cannot represent is refused: nothing is published, `set_value()` returns `False`, and a `reason=propertyValueRefused` warning is logged. Refused: non-finite floats (:99), a `bool` on `integer` or `float`, an integer that is not whole or outside 64 bits (:87-89), an enum value not in `format` (:111), a `float` beyond the 64-bit float range (:95-96), a `datetime` string that is not ISO 8601 (:132), and a `json` value that is not an array or object or contains NaN (:150). Floats are written without `+` in the exponent (:97). Payload digits are ASCII `0-9` only (:89, :97), so a string carrying another script's digits is refused on `integer`, `float`, `duration`, `datetime` and `color`. A `decimal.Decimal` is accepted on `float`, and a non-`float` real (numpy `float32`, say) keeps its own text when that is already a valid payload, so a rounded `float32` publishes `0.1` and not `0.10000000149011612`.
+- The `0x00` empty-string encoding applies only to `string` properties (:65-67); `""` on another datatype is refused.
+- A non-retained (event) property publishes non-retained at QoS 0 (:50). The reconnect and structural-change republish walks skip it, so the last event is no longer replayed (:695), and clearing it publishes nothing instead of a retained empty message on the event topic.
+- `Device.publish("$alert", ...)` publishes nothing and warns: an alert needs an id (:517). Use `publish_alert()`.
+- An inbound `/set` is validated for the property's datatype before the callback runs, and an invalid one is dropped with a `reason=propertySetRejected` warning: `json` must be an array or object, `integer` and `float` must follow the payload grammar, a number is rounded to the format's step and then checked against min/max (:399), an `enum` value must be in `format`, a `datetime` must be ISO 8601, and a `boolean` must be `true` or `false`. A number that rounding changed reaches the callback in its rounded form. `0x00` decodes to `""` only for `string`.
+- A `/set` delivered with the retain flag is ignored with a warning: it is a stale command replayed at subscribe time (:48, :483). This uses `subscribe(..., with_retain=True)` from ebus-mqtt-client 0.7.0 ([electrification-bus/ebus-mqtt-client#24](https://github.com/electrification-bus/ebus-mqtt-client/issues/24)); the dependency floor rises to `ebus-mqtt-client>=0.7.0`. An injected transport without that parameter skips the check, and a debug line says so.
+- `supports_target=True` is inert: one warning at construction, and `/set` no longer calls the `$target` stub, which ran before the payload was accepted (:466, :470).
+- `.ebus-spec.json` no longer lists `mdns-discovery` under `supports`; the library has no mDNS code.
+- `examples/simple-device`, `simple-tree-device` and `utility-meter` call `stop()` on Ctrl-C. They exited without it, so the broker published the Last Will and the tree was left with its root `lost` and its children `ready`.
+
+### Added
+
+- Encoders for `datetime` (`datetime`/`date` as ISO 8601, :132), `duration` (`timedelta` as `PTxHxMxS`, :137-144) and `color` (a component tuple in the first `format` color type, :118-123). These fell through to `str()`, which produced `2026-10-08 12:00:00+00:00`, `0:05:00` and `(255, 0, 0)`.
+- `Device.publish_alert(alert_id, message)`, `Device.clear_alert(alert_id)` and `Device.alerts()`. Alerts publish retained to `$alert/[alert ID]` (:517), are republished on reconnect, and are cleared by `delete()` (:289).
+- `Device.invalidate_description_cache()`, the `$description` counterpart of `Property.invalidate_publish_cache()`. `clear_retained_topic()` aimed at the device's own `$description` and `delete_all_from_mqtt()` call it, so a later `publish_description()` is no longer suppressed after the topic was cleared.
+
+### Fixed
+
+- `delete()` followed by `stop()` re-created the deleted device as a bare `$state=disconnected` with no `$description` (:272, :288). After `delete()` the root's `stop()` announces nothing, flushes `delete()`'s retained clears and disconnects cleanly in either mode, and a reconnect's `refresh_tree()` republishes nothing.
+
 ## [0.24.0] — 2026-10-03
 
 ### Fixed

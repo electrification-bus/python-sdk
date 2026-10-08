@@ -70,6 +70,12 @@ class MqttDeviceTransport(MqttTransport, Protocol):
 
     This protocol has a data member (``is_running``), so use ``isinstance`` for runtime
     checks; ``issubclass`` is unsupported for protocols with non-method members.
+
+    Optional: a ``subscribe`` that takes a keyword-only ``with_retain`` (as
+    ebus-mqtt-client 0.7.0 does) is called with ``with_retain=True`` for ``/set``
+    subscriptions and must then pass the message's retain flag as a third callback
+    argument, so the device can ignore a retained ``/set``. Without the parameter
+    the SDK subscribes as before and cannot detect one.
     """
 
     def is_connected(self) -> bool: ...

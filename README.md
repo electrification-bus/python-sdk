@@ -67,12 +67,12 @@ Inject the client before it connects, then wire the two Homie-correctness pieces
 client = my_host_mqtt_client()                 # created, not yet connected
 device = Device('panel-1', type='...', mqttc=client)
 
-client.set_will(**device.will())               # LWT ($state=lost); must precede connect
+client.set_will(**device.will())               # LWT ($state=lost, tree QoS, retained); must precede connect
 client.on_connect(device.refresh_tree)         # re-announce the retained tree on every (re)connect
 client.connect()                               # host connects on its own loop
 ```
 
-`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` through the client and returns immediately, without flushing or closing it; `device.stop(announce=False)` publishes nothing and leaves the retained `$state` as it stands, for a caller that published its own final state first (see `declare_lost()` below). `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
+`device.will()` returns the tree's Last Will descriptor and `device.refresh_tree()` republishes the whole tree; the `set_will` / `on_connect` / `connect` calls above are illustrative of your host's own MQTT API. Property values publish once the client is connected (the SDK gates on `is_connected()`, not on its own `start()`, which a caller-driven client never calls). `device.stop()` publishes a final retained `$state=disconnected` for every device in the tree through the client and returns immediately, without flushing or closing it; `device.stop(announce=False)` publishes nothing, for a caller that published its own final state first (see `declare_lost()` below), and that caller then drops the connection without a clean DISCONNECT so the will fires. `on_disconnect=` is inert for an injected client; register disconnect handling on your own client.
 
 For the inbound direction, if the tree has settable properties whose callbacks are async coroutines, pass `Device(async_loop=<your event loop>)`: inbound `/set` arrives on the transport's network thread, and this schedules the callback onto your loop (set once for the whole tree, not per property). A synchronous callback runs inline and needs no loop.
 
@@ -105,7 +105,7 @@ A device has three ways to stop, and they mean different things to a consumer re
 
 | Teardown | `$state` left retained | How |
 | --- | --- | --- |
-| Graceful shutdown | `disconnected` | `device.stop()` |
+| Graceful shutdown | `disconnected` on every device in the tree | `device.stop()` |
 | Ungraceful death (crash, power loss) | `lost` | the Last Will, which fires only on an *unclean* disconnect |
 | Deliberate death | `lost` | `device.declare_lost()` |
 
@@ -113,26 +113,48 @@ The third is for a producer that knows it is failing: a fatal error handler, a s
 
 ```python
 device.declare_lost()          # root's $state=lost, published and (owned path) flushed
-device.stop(announce=False)    # tear down without overwriting it with `disconnected`
+device.stop(announce=False)    # drop the connection without a clean DISCONNECT; the will re-asserts `lost`
 ```
 
 `declare_lost()` is **tree-level**, like `will()` and `stop()`: it publishes the *root's* `$state`, which per the Homie 5 effective-state rule makes every descendant lost too, and it publishes exactly the topic and payload `will()` describes so the two paths cannot drift. To mark one device lost (a proxy whose single upstream vanished), use `set_state(DeviceState.LOST)` on that device instead.
 
 It moves the state and publishes it together, and the move is unconditional: publishing a state the `Device` does not hold is how a later `refresh_tree()` silently republishes `ready` over it. It returns whether `$state` actually moved, the same convention as `set_state`: on an injected transport, a `True` from a connected tree is your cue to drain, and `False` means the root was already lost. It is not a delivery signal and cannot be one there. Publishing is skipped entirely when the broker is unreachable (the state still moves, and the next connect republishes it), so `True` does not by itself prove anything was queued. It does not stop the client.
 
-`stop(announce=False)` unpaired leaves whatever was published last, typically a stale `ready`, and nothing will correct it: the clean disconnect `stop()` performs suppresses the LWT. Neither call substitutes for the will, because a crashed process calls nothing.
+`stop()` publishes `disconnected` for every device in the tree, descendants first and the root last, before its clean disconnect: Homie 5 requires each device to send `disconnected` before cleanly disconnecting, and the root-to-child cascade covers only `lost`. `stop(announce=False)` publishes nothing, so it does not disconnect cleanly either: on an SDK-owned client it ends the connection without an MQTT DISCONNECT and the broker publishes the Last Will (`lost`). Paired with `declare_lost()` that re-asserts the same retained payload; unpaired, the will replaces the stale `ready` the clean disconnect used to leave behind. On an injected client the SDK closes nothing, so drop your connection without a clean DISCONNECT to get the same result. After `delete()` on the root, `stop()` announces nothing in either mode and disconnects cleanly, since any later `$state` would re-create the deleted device. Neither call substitutes for the will, because a crashed process calls nothing.
 
 #### Clearing a value vs. an empty-string value
 
 Homie 5 distinguishes two things that both look "empty" on the wire, and the SDK handles each automatically:
 
 - **Clearing (retracting) a retained value** — set the property to `None`. Once it has been published, this emits a zero-length `retain=True` payload, which MQTT/Homie treats as "delete the retained topic", so a subscriber that connects later sees no stale value. (`clear_value()` does the same explicitly; `Node.delete_property()` clears on removal.) A `None` that was never published is a silent no-op — no phantom topic is created.
-- **An actual empty-string value** — set a string property to `""`. This is published as a single null byte (`0x00`), the Homie 5 encoding that keeps `""` distinct from a topic-clear. Inbound `0x00` payloads are decoded back to `""` on the controller and on `/set`. Helpers `encode_empty_string()` / `decode_empty_string()` and the constant `HOMIE_EMPTY_STRING_PAYLOAD` are exported for consumers that need them directly.
+- **An actual empty-string value** — set a `string` property to `""`. This is published as a single null byte (`0x00`), the Homie 5 encoding that keeps `""` distinct from a topic-clear. Only `string` has an empty value: `""` on any other datatype is refused like any other invalid value (see below). Inbound `0x00` payloads are decoded back to `""` on the controller and, for a `string` property, on `/set`. Helpers `encode_empty_string()` / `decode_empty_string()` and the constant `HOMIE_EMPTY_STRING_PAYLOAD` are exported for consumers that need them directly.
 
 ```python
 temp.set_value(None)     # retracts the retained topic (subscribers see nothing)
 label.set_value("")      # publishes an empty-string VALUE (0x00 on the wire)
 ```
+
+#### Values the datatype cannot represent are refused
+
+A value is encoded for its property's datatype before it is published (convention.md:74-150 at [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md)). A value the datatype cannot represent is refused: nothing is published, the retained topic keeps the last good value, `set_value()` returns `False`, and a `reason=propertyValueRefused` warning names the problem. Refused: NaN and infinities on `float`, a `bool` on `integer` or `float`, an `integer` that is not whole or does not fit in 64 bits, an `enum` value not in its `format`, a `float` beyond the 64-bit float range, a `json` value that is not an array or object or contains NaN, and `""` on anything but `string`. Floats are written without `+` in the exponent (`1e20`, not `1e+20`).
+
+Native values are encoded for you: `datetime`/`date` as ISO 8601 (`2026-10-08T12:00:00+00:00`), `timedelta` as `PTxHxMxS` (`PT12H5M46S`; days fold into hours), and a color tuple as the property's first `format` color type plus its components (`(255, 0, 0)` with `format="rgb,hsv"` publishes `rgb,255,0,0`). A string is checked against the datatype's payload grammar and published as given; for `datetime` that is ISO 8601 (calendar, ordinal or week date, extended or basic form, with an optional time and zone), so `2026-10-08 12:00` is refused. Payload digits are ASCII `0-9`.
+
+#### Event (non-retained) properties
+
+A property with `retained=False` publishes non-retained at QoS 0, as Homie 5 requires for events: a subscriber gets the event now or not at all. A reconnect's `refresh_tree()` and a structural change (`add_node`, `add_property`) never replay an event's last value, and setting it to `None` publishes nothing, since the broker holds nothing to retract.
+
+#### Alerts
+
+`device.publish_alert("battery", "Battery is low, at 8%")` raises a retained alert at `$alert/battery`; `device.clear_alert("battery")` deletes it. Alerts are republished on reconnect and cleared by `delete()`. `publish("$alert", ...)` without an alert id publishes nothing and logs a warning.
+
+#### Inbound `/set` is validated
+
+A `/set` payload is checked against the property's datatype before its `set_callback` runs, and an invalid one is dropped with a `reason=propertySetRejected` warning: `json` must be an array or object (and match a `$format` JSONschema when one can be checked), `integer` and `float` must follow the payload grammar, `boolean` must be `true` or `false`, an `enum` value must be in its `format`, and a `datetime` must be ISO 8601. A number is rounded to its format's step and then checked against min/max (convention.md:397-413): the callback receives the payload as sent, or its rounded form if rounding changed it (`5` on `0:10:2` arrives as `6`).
+
+A `/set` the broker delivers with the retain flag set is a stale command replayed at subscribe time, since controllers publish `/set` non-retained only; it is ignored with a `reason=propertySetRetainedIgnored` warning. That needs ebus-mqtt-client 0.7.0 or later, whose `subscribe(..., with_retain=True)` delivers the flag. With an older client, or an injected transport whose `subscribe` has no `with_retain` parameter, the check is skipped and a debug line says so.
+
+`supports_target=True` is inert: `$target` is not implemented, so the property logs one warning at construction and never publishes `$target`.
 
 #### Unchanged values are not republished
 
@@ -142,7 +164,7 @@ Three carve-outs, each deliberate:
 
 - **A non-retained (event) property is never gated.** The broker stores nothing for it, so an identical consecutive payload is a second real event, not a redundant write.
 - **Retraction always publishes.** `set_value(None)` / `clear_value()` must reach the broker to delete the topic.
-- **Every whole-tree republish forces.** `refresh_tree()`, and the reconnect that calls it, republish every property value regardless. That is what repopulates a broker whose retained store is empty (restarted without persistence, or a fresh one); a gated refresh would find every payload equal to what it last published and send nothing.
+- **Every whole-tree republish forces.** `refresh_tree()`, and the reconnect that calls it, republish every retained property value regardless. That is what repopulates a broker whose retained store is empty (restarted without persistence, or a fresh one); a gated refresh would find every payload equal to what it last published and send nothing.
 
 The retained state left on the broker is identical either way: strictly fewer messages, same truth. `Property.get_last_published_value()` returns the memoized wire payload, and `Property.invalidate_publish_cache()` forgets it, which is what you call if something deletes a retained value topic behind the SDK's back.
 
@@ -172,7 +194,7 @@ panel.children()[0].delete()
 
 Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies, and `root.declare_lost()` publishes the same thing deliberately when the publisher knows it is dying — controllers compute effective state per the Homie 5 precedence table (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
 
-`$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content (ignoring its `version` timestamp) is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)).
+`$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)). The document's `version` is derived from its content (the top 52 bits of a SHA-256 of the document without `version`), so an unchanged document keeps its version across reconnects and restarts, and any change gets a new one. Homie 5 lets `$description` change only while the device is `init`, `disconnected` or `lost`: a structural change made outside a `state_transition()` on a `ready` or `sleeping` device is published as `init`, the changed values, the new `$description`, then the state the device was in. A change that leaves the document as last published (a property added to a node not yet attached to its device, or an identical re-declaration) publishes only its values.
 
 ### Publishing under a different Homie domain
 
@@ -360,7 +382,7 @@ See [`examples/README.md`](examples/README.md) for example scripts demonstrating
 ## Requirements
 
 - Python 3.10+
-- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.6.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.6.0 holds every publish issued while the link is down and flushes it before `on_connect`, where 0.5.0 left QoS 1 and 2 to paho, whose replay landed after the SDK's on-connect republish and could exceed the broker's receive quota, leaving a root's retained `$state` on `init`; 0.5.0 holds retained QoS 0 publishes issued before the link is up and flushes them on connect, rather than dropping them and warning about each: a root built with `mqtt_cfg=` connects asynchronously, so the SDK itself creates that window whenever a construction-time `state_transition()` publishes before CONNACK; 0.4.0 provides `MqttClient.asyncio_driver()`, the loop-native alternative to paho's background thread; 0.3.0 ships the `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class rather than `Any`; 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; and, since 0.1.8, it carries the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
+- [`ebus-mqtt-client`](https://github.com/electrification-bus/ebus-mqtt-client) >= 0.7.0 (the MQTT transport layer; it pins `paho-mqtt`, so the SDK does not depend on paho directly. 0.7.0 exposes the MQTT retain flag, so a device ignores a retained `/set` replayed at resubscribe; 0.6.0 holds every publish issued while the link is down and flushes it before `on_connect`, where 0.5.0 left QoS 1 and 2 to paho, whose replay landed after the SDK's on-connect republish and could exceed the broker's receive quota, leaving a root's retained `$state` on `init`; 0.5.0 holds retained QoS 0 publishes issued before the link is up and flushes them on connect, rather than dropping them and warning about each: a root built with `mqtt_cfg=` connects asynchronously, so the SDK itself creates that window whenever a construction-time `state_transition()` publishes before CONNACK; 0.4.0 provides `MqttClient.asyncio_driver()`, the loop-native alternative to paho's background thread; 0.3.0 ships the `py.typed` marker, so a downstream type checker resolves the re-exported `MqttClient` to the concrete class rather than `Any`; 0.2.0 adds the `on_disconnect_callback` the SDK's disconnect hook adopts; and, since 0.1.8, it carries the asynchronous, down-broker-tolerant connect the resilient-connect behavior relies on)
 
 Optional extras:
 

@@ -19,7 +19,6 @@
     "mqtt-homie-transport",
     "tls",
     "mtls-client-auth",
-    "mdns-discovery",
     "proxy-publishers"
   ],
   "implements": {
@@ -37,5 +36,5 @@
     "devices": { "utility-meter": "0.6" },
     "registries": { "capability-types": "0.19", "device-types": "0.5" }
   },
-  "notes": "role=library: the SDK provides the framework mechanisms (supports). Excluded framework features: broker-hosting (broker's concern, not the SDK) and rest-configuration (not implemented). mdns-discovery is provided via the optional `mdns` extra and the examples. The implements map covers the examples/utility-meter reference publisher plus the capability vocabulary the SDK itself encodes. grid/status/demand/power-quality were previously defined inline in the utility-meter data model and covered implicitly by pinning it; utility-meter 0.6 split them out into standalone catalogs, so they are now pinned directly. soc is pinned because the ebus_sdk.ha customizer maps its properties to Home Assistant metadata and examples/ha-discovery-bridge publishes a soc node; it is a capability the SDK has first-class knowledge of rather than merely transports. If the simulators migrate out of examples/ into their own repo(s), each would carry its own application lockfile and this implements map would reduce to the SDK proper."
+  "notes": "role=library: the SDK provides the framework mechanisms (supports). Excluded framework features: broker-hosting (broker's concern, not the SDK), rest-configuration (not implemented) and mdns-discovery (not implemented in the library; the optional `mdns` extra only installs zeroconf for the examples that browse for a broker). The implements map covers the examples/utility-meter reference publisher plus the capability vocabulary the SDK itself encodes. grid/status/demand/power-quality were previously defined inline in the utility-meter data model and covered implicitly by pinning it; utility-meter 0.6 split them out into standalone catalogs, so they are now pinned directly. soc is pinned because the ebus_sdk.ha customizer maps its properties to Home Assistant metadata and examples/ha-discovery-bridge publishes a soc node; it is a capability the SDK has first-class knowledge of rather than merely transports. If the simulators migrate out of examples/ into their own repo(s), each would carry its own application lockfile and this implements map would reduce to the SDK proper."
 }

@@ -30,7 +30,10 @@ classifiers = [
 dependencies = [
     # MQTT transport lives in ebus-mqtt-client, which pins paho-mqtt; the SDK
     # does not import paho directly, so paho is a transitive dependency (not
-    # declared here). Floor 0.6.0: it holds every publish issued while the link
+    # declared here). Floor 0.7.0: subscribe(..., with_retain=True) exposes the
+    # MQTT retain flag, which lets a device ignore a retained /set the broker
+    # replays at every resubscribe (Homie 5 :48/:483; a caller-supplied transport
+    # without it skips that check). Earlier floors, still relied on: 0.6.0 holds every publish issued while the link
     # is down (retained at any QoS, newest per topic) and flushes it before
     # on_connect, where 0.5.0 left QoS 1 and 2 to paho. paho replayed those on
     # CONNACK uncapped and after the SDK's on-connect refresh_tree, so an older
@@ -58,7 +61,7 @@ dependencies = [
     # on_disconnect_callback the disconnect hook adopts (SDK-al5); 0.1.8 added the
     # connect_async construction the resilient-connect behavior relies on (older
     # clients raised ConnectionRefusedError on a down broker).
-    "ebus-mqtt-client>=0.6.0",
+    "ebus-mqtt-client>=0.7.0",
 ]
 
 [project.optional-dependencies]
