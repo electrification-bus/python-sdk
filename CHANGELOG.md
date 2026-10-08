@@ -4,6 +4,18 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.4.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)).
+
+### Added
+
+- `utility-meter` advertises `_ebus._tcp` and `_device-info._tcp` (framework.md requirement 6) with the library's `Advertiser` when the `mdns` extra is installed, from the meter config's `info`, under the device id as the instance name. `--no-advertise` turns it off.
+
+### Changed
+
+- The `mdns` extra installs `ebus-service-discovery[zeroconf]>=0.4.0` in place of `zeroconf>=0.131.0`. zeroconf still comes with it, as a dependency of that package.
+- `utility-meter --discover` finds the broker with `ebus-service-discovery` (`mdns.browse_many()`, `ebus.rank_brokers()`, `ebus.select_broker()`). A plain (non-TLS) broker config now also accepts `_mqtt._tcp`; a TLS config still accepts only `_secure-mqtt._tcp`. `use_tls` follows the discovered service type, and when the config names a `host`, a discovered broker with that host is preferred among several. The fallback to the config's `host` after `--discover-timeout` seconds is unchanged.
+- `simple-span-controller` accepts only the `_secure-mqtt._tcp` advertisement whose SRV target is `span-<serial>.local` (it matched a substring of the target before, and also browsed `_mqtt._tcp`), and connects by that host name instead of the first IPv4 address. When this host cannot resolve `.local` names, it connects to the panel's most-preferred advertised address.
+
 ## [0.25.0] — 2026-10-08
 
 Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com/electrification-bus/python-sdk/issues/95), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)); and a `Controller` that paces its subscriptions so the broker no longer drops retained messages ([#97](https://github.com/electrification-bus/python-sdk/issues/97)). Line numbers refer to [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md).

@@ -16,7 +16,8 @@ Example:
     ./simple-span-controller nt-2026-c192x mypassword
 
 The controller will:
-1. Discover the SPAN Panel broker via mDNS (span-{serial-number}.local)
+1. Discover the SPAN Panel broker via mDNS (`_secure-mqtt._tcp` advertised by
+   span-{serial-number}.local), using ebus-service-discovery
 2. Connect to the MQTTS broker on port 8883
 3. Watch the MID child's `grid` capability (islanding-state / grid-state /
    grid-forming-entity) to know if the home is on- or off-grid, and the
@@ -33,10 +34,12 @@ schema migration guide.
 
 import argparse
 import logging
+import socket
 import time
 from typing import Optional
 
-from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+from ebus_service_discovery import mdns
+from ebus_service_discovery.ebus import SECURE_MQTT_SERVICE, BrokerEndpoint
 
 from ebus_sdk import Controller, DiscoveredDevice
 
@@ -59,45 +62,31 @@ ENCLOSURE_WATCH_NODE = "power-flows"
 MID_WATCH_NODE = "grid"
 
 
-class MdnsDiscovery(ServiceListener):
-    """mDNS service discovery for a SPAN Panel MQTT broker."""
+def discover_panel_broker(serial_number: str, timeout: float = 5.0) -> Optional[BrokerEndpoint]:
+    """The panel's MQTTS broker, matched by its host name `span-<serial>.local`.
 
-    def __init__(self, serial_number: str):
-        self.serial_number = serial_number
-        self.hostname = f"span-{serial_number}.local"
-        self.broker_host: Optional[str] = None
-        self.broker_port = 8883  # Default MQTTS port
-        self.discovered = False
-
-    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        pass
-
-    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        pass
-
-    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        info = zc.get_service_info(type_, name)
-        if info and info.server and self.hostname in info.server.lower() and info.addresses:
-            import socket
-
-            self.broker_host = socket.inet_ntoa(info.addresses[0])
-            self.broker_port = info.port if info.port else 8883
-            self.discovered = True
-            logger.info(f"Discovered SPAN Panel: {self.hostname} at {self.broker_host}:{self.broker_port}")
-
-    def discover(self, timeout: float = 5.0) -> bool:
-        logger.info(f"Starting mDNS discovery for: {self.hostname}")
-        zeroconf = Zeroconf()
-        for service_type in ("_secure-mqtt._tcp.local.", "_mqtt._tcp.local."):
-            ServiceBrowser(zeroconf, service_type, self)
-        start_time = time.time()
-        while not self.discovered and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-        zeroconf.close()
-        if not self.discovered:
-            logger.warning(f"mDNS discovery timed out, using hostname directly: {self.hostname}")
-            self.broker_host = self.hostname
-        return True
+    Only an advertisement whose SRV target is this panel's host name is
+    accepted, and the endpoint's host is that SRV target, so another broker on
+    the network never receives this panel's credentials. When this host cannot
+    resolve `.local` names, the host is the panel's advertised address instead.
+    Returns None if the panel is not heard within `timeout`.
+    """
+    hostname = f"span-{serial_number}.local".lower()
+    logger.info(f"Starting mDNS discovery for: {hostname}")
+    for inst in mdns.browse(SECURE_MQTT_SERVICE, timeout=timeout):
+        if inst.server.lower() != hostname:
+            continue
+        host = inst.server
+        try:
+            socket.getaddrinfo(host, inst.port)
+        except socket.gaierror:
+            addresses = inst.candidate_addresses()
+            if addresses:
+                host = addresses[0].address
+                logger.info(f"{inst.server} does not resolve on this host; connecting to {host}")
+        logger.info(f"Discovered SPAN Panel: {inst.server} at {host}:{inst.port}")
+        return BrokerEndpoint(SECURE_MQTT_SERVICE, host, inst.port)
+    return None
 
 
 class SpanPanelMonitor:
@@ -116,26 +105,24 @@ class SpanPanelMonitor:
         self.enclosure_id = enclosure_id
         self.mid_id: Optional[str] = None  # discovered by device type
 
-        if broker_host is None:
-            logger.info("No broker host specified, attempting mDNS discovery...")
-            discovery = MdnsDiscovery(serial_number)
-            discovery.discover(timeout=5.0)
-            broker_host = discovery.broker_host
-            broker_port = discovery.broker_port
-            if broker_host is None:
-                raise RuntimeError("Failed to discover SPAN Panel broker; use --broker-host")
-        else:
-            logger.info(f"Using specified broker host: {broker_host}:{broker_port}")
-
-        mqtt_cfg = {
-            "host": broker_host,
-            "port": broker_port,
+        base_cfg = {
             "authentication": {"type": "USER_PASS", "username": serial_number, "password": password},
             "use_tls": True,
             "tls_insecure": tls_insecure,
         }
         if tls_ca_cert:
-            mqtt_cfg["tls_ca_cert"] = tls_ca_cert
+            base_cfg["tls_ca_cert"] = tls_ca_cert
+
+        if broker_host is None:
+            logger.info("No broker host specified, attempting mDNS discovery...")
+            endpoint = discover_panel_broker(serial_number, timeout=5.0)
+            if endpoint is None:
+                endpoint = BrokerEndpoint(SECURE_MQTT_SERVICE, f"span-{serial_number}.local", broker_port)
+                logger.warning(f"mDNS discovery timed out, using hostname directly: {endpoint.host}")
+        else:
+            logger.info(f"Using specified broker host: {broker_host}:{broker_port}")
+            endpoint = BrokerEndpoint(SECURE_MQTT_SERVICE, broker_host, broker_port)
+        mqtt_cfg = endpoint.mqtt_cfg(base_cfg)
 
         logger.info(f"Connecting to MQTTS broker at {mqtt_cfg['host']}:{mqtt_cfg['port']} as {serial_number}")
         self.controller = Controller(mqtt_cfg=mqtt_cfg)
