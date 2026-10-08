@@ -53,6 +53,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from functools import partial
 from http import HTTPStatus
@@ -718,31 +719,32 @@ def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logg
     """
     try:
         from ebus_service_discovery import mdns
-        from ebus_service_discovery.ebus import RetrySchedule
+        from ebus_service_discovery.ebus import (
+            SECURE_MQTT_SERVICE,
+            TCP_BROKER_TYPES,
+            BrokerEndpoint,
+            rank_brokers,
+            select_broker,
+        )
     except ImportError:
         log.error("discovery needs the 'mdns' extra: pip install 'ebus-sdk[mdns]'")
         return None
 
-    mode = "discovery-with-fallback" if mqtt_cfg.get("host") else "discovery-only"
-    stop = threading.Event()
-    timer = threading.Timer(timeout, stop.set)
-    timer.daemon = True
-    timer.start()
+    # The steps of mdns.find_broker(), driven here so that each browse ends by
+    # the deadline: find_broker's browse window is fixed for the whole call.
+    accept = (SECURE_MQTT_SERVICE,) if mqtt_cfg.get("use_tls") else TCP_BROKER_TYPES
+    configured = BrokerEndpoint.from_mqtt_cfg(mqtt_cfg) if mqtt_cfg.get("host") else None
+    deadline = time.monotonic() + timeout
+    zc = mdns.new_zeroconf()
     try:
-        endpoint = mdns.find_broker(
-            mode,
-            base_cfg=mqtt_cfg,
-            stop=stop,
-            # Browse back to back until `timeout`; the timer, not the
-            # library's attempt count, decides when to give up.
-            schedule=RetrySchedule(fast_attempts=sys.maxsize, fast_interval=0.0),
-            browse_timeout=min(3.0, timeout),
-        )
+        while (remaining := deadline - time.monotonic()) > 0:
+            found = mdns.browse_many(accept, min(3.0, remaining), zc)
+            usable = rank_brokers((BrokerEndpoint.from_instance(i) for i in found), accept=accept)
+            if usable:
+                return select_broker("discovery-with-fallback", configured, usable).mqtt_cfg(mqtt_cfg)
     finally:
-        timer.cancel()
-    if endpoint is None:
-        return None
-    return endpoint.mqtt_cfg(mqtt_cfg)
+        zc.close()
+    return None
 
 
 def _identity_from_info(device_id: str, info: Dict[str, Any]):

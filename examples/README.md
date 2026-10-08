@@ -63,7 +63,7 @@ Discovers eBus devices and walks them as a TREE (roots then descendants), the cu
 
 Connects to a live SPAN panel via mDNS + MQTTS and determines whether the home is islanded from the grid, watching the MID child's `grid` capability (`islanding-state` / `grid-state` / `grid-forming-entity`) plus the enclosure's `power-flows`. Targets the current parent/child data model (the legacy flat `core/dominant-power-source` is retired).
 
-Discovery accepts only the `_secure-mqtt._tcp` advertisement whose host is `span-<serial-number>.local`, so another broker on the network never receives this panel's credentials, and connects by host name rather than by IP address. If the panel is not heard within 5 s, it connects to `span-<serial-number>.local` directly.
+Discovery accepts only the `_secure-mqtt._tcp` advertisement whose host is `span-<serial-number>.local`, so another broker on the network never receives this panel's credentials, and connects by that host name, or by the panel's advertised address when this host cannot resolve `.local` names. If the panel is not heard within 5 s, it connects to `span-<serial-number>.local` directly.
 
 Requires the `mdns` extra:
 
