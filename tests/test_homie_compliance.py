@@ -4,6 +4,7 @@ Line numbers in docstrings refer to homieiot/convention@7edc221 convention.md.
 """
 
 import datetime
+import decimal
 import enum
 import inspect
 import json
@@ -11,6 +12,7 @@ import logging
 import socket
 from unittest.mock import MagicMock, patch
 
+import pytest
 from ebus_mqtt_client import MqttClient
 
 from ebus_sdk.homie import (
@@ -417,6 +419,31 @@ class TestNewValuesPrecedeReady:
         kinds = [e[0] if e[0].startswith("$") else "value" for e in events]
         assert kinds == ["$state", "value", "$description", "$state"]
 
+    def test_add_property_on_a_detached_node_publishes_only_the_value(self):
+        """:616: no init/ready flap when the $description does not change."""
+        root, client = _make_root()
+        node = root.new_node("n")
+        client.publish.reset_mock()
+
+        node.add_property(Property(id="a", value=1, datatype=PropertyDatatype.INTEGER))
+        node.add_property(Property(id="b", value=2, datatype=PropertyDatatype.INTEGER))
+
+        assert _publishes(client) == [(f"{BASE}/root/n/a", "1"), (f"{BASE}/root/n/b", "2")]
+
+        root.add_node(node)
+        assert _states(client, "root") == ["init", "ready"]
+
+    def test_re_adding_an_identical_property_publishes_only_the_value(self):
+        root, client = _make_root()
+        node = root.new_node("n")
+        root.add_node(node)
+        node.add_property(Property(id="a", value=1, datatype=PropertyDatatype.INTEGER))
+        client.publish.reset_mock()
+
+        node.add_property(Property(id="a", value=1, datatype=PropertyDatatype.INTEGER))
+
+        assert _publishes(client) == [(f"{BASE}/root/n/a", "1")]
+
     def test_inside_a_transition_nothing_extra_is_published(self):
         root, client = _make_root()
         client.publish.reset_mock()
@@ -436,6 +463,24 @@ class TestDescriptionCacheInvalidation:
         root.publish_description()
 
         assert len(_descriptions(client, "root")) == 1
+
+    def test_refresh_after_invalidation_publishes_ready_once_and_last(self):
+        """:207 and :279: init first, then the document, values and children, then ready."""
+        root, client = _make_root()
+        node = root.new_node("n")
+        root.add_node(node)
+        node.add_property(Property(id="p", value=1.5, datatype=PropertyDatatype.FLOAT))
+        Device(id="kid", parent=root)
+        root.clear_retained_topic(f"{BASE}/root/$description")
+        client.publish.reset_mock()
+
+        root.refresh_tree()
+
+        events = [(t.split("/", 2)[2], p) for t, p in _publishes(client)]
+        topics = [t for t, _ in events]
+        assert _states(client, "root") == ["init", "ready"]
+        assert events[0] == ("root/$state", "init") and events[-1] == ("root/$state", "ready")
+        assert topics.index("root/$description") < topics.index("root/n/p") < topics.index("kid/$state")
 
 
 # ── C. Property values ───────────────────────────────────────────────────
@@ -482,6 +527,27 @@ class TestOutboundNumbers:
         assert _published(PropertyDatatype.FLOAT, 21.5) == "21.5"
         assert _published(PropertyDatatype.FLOAT, 5) == "5"
         assert _published(PropertyDatatype.FLOAT, "-3.25") == "-3.25"
+
+    def test_non_ascii_digits_are_refused(self):
+        """:89 and :97: payload digits are 0-9."""
+        assert _published(PropertyDatatype.INTEGER, "\u0661\u0662") is None
+        assert _published(PropertyDatatype.FLOAT, "\u0663") is None
+        assert _published(PropertyDatatype.DURATION, "PT\u0661S") is None
+
+    def test_decimal_on_a_float_property(self):
+        assert _published(PropertyDatatype.FLOAT, decimal.Decimal("1.5")) == "1.5"
+        assert _published(PropertyDatatype.FLOAT, decimal.Decimal("1E+5")) == "1E5"
+        assert _published(PropertyDatatype.FLOAT, decimal.Decimal("NaN")) is None
+        assert _published(PropertyDatatype.FLOAT, decimal.Decimal("1E+400")) is None
+
+    def test_float_range_applies_to_integers(self):
+        """:95-96."""
+        assert _published(PropertyDatatype.FLOAT, 10**300) == str(10**300)
+        assert _published(PropertyDatatype.FLOAT, 10**400) is None
+
+    def test_numpy_float32_keeps_its_rounded_text(self):
+        np = pytest.importorskip("numpy")
+        assert _published(PropertyDatatype.FLOAT, np.float32(0.14494), round_to=1) == "0.1"
 
     def test_booleans_are_refused_on_numeric_properties(self):
         assert _published(PropertyDatatype.FLOAT, True) is None
@@ -532,6 +598,13 @@ class TestOutboundEncoders:
         stamp = datetime.datetime(2026, 10, 8, 12, 0, tzinfo=datetime.timezone.utc)
         assert _published(PropertyDatatype.DATETIME, stamp) == "2026-10-08T12:00:00+00:00"
         assert _published(PropertyDatatype.DATETIME, datetime.date(2026, 10, 8)) == "2026-10-08"
+
+    def test_datetime_strings_are_checked(self):
+        """:132: calendar, ordinal and week dates, extended or basic, with optional time."""
+        for good in ("2026-10-08T12:00:00+00:00", "2026-10-08T12:00Z", "20261008T120000Z", "2026-281", "2026-W41-4"):
+            assert _published(PropertyDatatype.DATETIME, good) == good, good
+        for bad in ("garbage", "2026-10-08 12:00", "2026-13-01", "2026-02-30", "2026-10-08T25:00", "\u0662026-10-08"):
+            assert _published(PropertyDatatype.DATETIME, bad) is None, bad
 
     def test_duration_is_ptxhxmxs(self):
         """:137-144."""
@@ -702,6 +775,16 @@ class TestInboundValidation:
 
     def test_the_current_value_is_the_step_base_without_min_or_max(self):
         assert _accepts(PropertyDatatype.INTEGER, "6", format="::4", value=1) == "5"
+
+    def test_non_ascii_digits_are_rejected(self):
+        assert _accepts(PropertyDatatype.INTEGER, "\u0661") == "REJECTED"
+        assert _accepts(PropertyDatatype.FLOAT, "\u0663.5") == "REJECTED"
+        assert _accepts(PropertyDatatype.DURATION, "PT\u0661S") == "REJECTED"
+
+    def test_datetime_must_be_iso_8601(self):
+        assert _accepts(PropertyDatatype.DATETIME, "2026-10-08T12:00:00Z") == "2026-10-08T12:00:00Z"
+        for bad in ("banana", "2026-10-08 12:00", ""):
+            assert _accepts(PropertyDatatype.DATETIME, bad) == "REJECTED", bad
 
     def test_boolean_is_case_sensitive(self):
         assert _accepts(PropertyDatatype.BOOLEAN, "true") == "true"

@@ -40,6 +40,7 @@ This is the initial version, there are things to add in the future (as needed):
 import asyncio
 import contextlib
 import datetime
+import decimal
 import hashlib
 import inspect
 import json
@@ -49,6 +50,7 @@ import numbers
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -391,9 +393,30 @@ class PropertyDatatype(StrEnum):
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
-_INTEGER_PAYLOAD = re.compile(r"-?\d+")
-_FLOAT_PAYLOAD = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE]-?\d+)?")
-_DURATION_PAYLOAD = re.compile(r"PT(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?")
+# re.ASCII: a payload's digits are 0-9 only (convention.md:89, :97), where a bare
+# \d also matches every other Unicode decimal digit.
+_INTEGER_PAYLOAD = re.compile(r"-?\d+", re.ASCII)
+_FLOAT_PAYLOAD = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE]-?\d+)?", re.ASCII)
+_DURATION_PAYLOAD = re.compile(r"PT(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?", re.ASCII)
+# ISO 8601 (convention.md:132) in its calendar, ordinal and week date forms,
+# extended or basic, with an optional time of day and zone designator.
+_DATETIME_PAYLOAD = re.compile(
+    r"""
+    (?P<year>\d{4})
+    (?:
+        -(?P<month>\d{2})(?:-(?P<day>\d{2}))?
+      | (?P<bmonth>\d{2})(?P<bday>\d{2})
+      | -?(?P<ordinal>\d{3})
+      | -?W(?P<week>\d{2})(?:-?(?P<weekday>\d))?
+    )?
+    (?:
+        T(?P<hour>\d{2})(?::?(?P<minute>\d{2})(?::?(?P<second>\d{2}))?)?(?:[.,]\d+)?
+        (?:Z|[+-](?P<zhour>\d{2})(?::?(?P<zminute>\d{2}))?)?
+    )?
+    """,
+    re.ASCII | re.VERBOSE,
+)
+_FLOAT_MAX_DECIMAL = decimal.Decimal(sys.float_info.max)
 _COLOR_RANGES = {"rgb": (255.0, 255.0, 255.0), "hsv": (360.0, 100.0, 100.0), "xyz": (1.0, 1.0)}
 
 
@@ -435,10 +458,29 @@ def _encode_float(value: Any) -> tuple:
         if not _FLOAT_PAYLOAD.fullmatch(value) or not math.isfinite(float(value)):
             return None, "floatGrammar"
         return value, None
+    if isinstance(value, decimal.Decimal):
+        if not value.is_finite():
+            return None, "floatNotFinite"
+        if abs(value) > _FLOAT_MAX_DECIMAL:
+            return None, "floatOutOfRange"
+        return str(value).replace("E+", "E"), None
     if isinstance(value, numbers.Integral):
+        # Float range (convention.md:95-96).
+        if abs(int(value)) > sys.float_info.max:
+            return None, "floatOutOfRange"
         return str(int(value)), None
     if isinstance(value, numbers.Real):
-        payload = _format_float(float(value))
+        # A non-float Real (numpy's float32, say) keeps its own shortest text when
+        # that is already a payload: repr(float()) would expand float32 0.1 to
+        # 0.10000000149011612.
+        if not isinstance(value, float):
+            text = str(value)
+            if _FLOAT_PAYLOAD.fullmatch(text) and math.isfinite(float(text)):
+                return text, None
+        try:
+            payload = _format_float(float(value))
+        except OverflowError:
+            return None, "floatOutOfRange"
         return (payload, None) if payload is not None else (None, "floatNotFinite")
     return None, "floatType"
 
@@ -504,12 +546,36 @@ def _encode_color(value: Any, format_: Any) -> tuple:
     return None, "colorType"
 
 
+def _check_datetime_payload(text: str) -> Optional[str]:
+    """None if ``text`` is an ISO 8601 date or date-time (convention.md:132), else a problem."""
+    match = _DATETIME_PAYLOAD.fullmatch(text)
+    if not match:
+        return "datetimeGrammar"
+    fields = {k: int(v) for k, v in match.groupdict().items() if v is not None}
+    if "hour" in fields and not fields.keys() & {"day", "bday", "ordinal", "weekday"}:
+        return "datetimeGrammar"  # a time of day needs a complete date
+    try:
+        if "month" in fields or "bmonth" in fields:
+            datetime.date(
+                fields["year"], fields.get("month", fields.get("bmonth")), fields.get("day", fields.get("bday", 1))
+            )
+    except ValueError:
+        return "datetimeRange"
+    limits = {"ordinal": (1, 366), "week": (1, 53), "weekday": (1, 7), "hour": (0, 24), "minute": (0, 59)}
+    limits.update({"second": (0, 60), "zhour": (0, 23), "zminute": (0, 59)})
+    for name, (low, high) in limits.items():
+        if name in fields and not low <= fields[name] <= high:
+            return "datetimeRange"
+    return None
+
+
 def _encode_datetime(value: Any) -> tuple:
     if isinstance(value, (datetime.datetime, datetime.date)):
         # ISO 8601 extended form, `T` separator (convention.md:132).
         return value.isoformat(), None
-    if isinstance(value, str) and value:
-        return value, None
+    if isinstance(value, str):
+        problem = _check_datetime_payload(value)
+        return (None, problem) if problem else (value, None)
     return None, "datetimeType"
 
 
@@ -678,7 +744,7 @@ def _parse_set_payload(text: str, datatype: Any, format_: Any, current: Any) -> 
     if datatype == PropertyDatatype.DURATION:
         return _encode_duration(text)
     if datatype == PropertyDatatype.DATETIME:
-        return (text, None) if text else (None, "datetimeEmpty")
+        return _encode_datetime(text)
     # string, and a missing or unknown datatype (already warned about).
     return decode_empty_string(text), None
 
@@ -1704,8 +1770,10 @@ class Node:
         property.set_subscribe()
         # Outside a transition a ready device goes to init first, so the value lands
         # before the $description that names it and before ready (convention.md:279).
+        # A node not yet attached to its device, or a re-declaration with identical
+        # content, leaves the $description unchanged and publishes only the value.
+        self._properties.update({property.id(): property})
         with self.device()._reconfiguration():
-            self._properties.update({property.id(): property})
             # force: announcing a property is a structural republish, so its value must
             # land regardless of the GH #50 skip. A fresh property would pass the gate
             # anyway (it has never published), and so would one re-added after
@@ -1762,9 +1830,9 @@ class Node:
         if device:
             # The description that drops the property is published when the
             # reconfiguration scope closes, after the removal.
+            del self._properties[property_id]
             with device._reconfiguration():
                 property.clear_value()
-                del self._properties[property_id]
         else:
             property.clear_value()
             del self._properties[property_id]
@@ -2588,8 +2656,8 @@ class Device:
         node_id = node.id()
         # Outside a transition a ready device goes to init first, so the node's
         # values land before the $description that names them and before ready.
+        self._nodes.update({node_id: node})
         with self._reconfiguration():
-            self._nodes.update({node_id: node})
             # Explicit force (also Node.publish's default): adopting a node is a
             # structural republish, so every property lands on the broker under this
             # device regardless of the GH #50 unchanged-payload skip.
@@ -2623,8 +2691,9 @@ class Device:
         Returns True if removed, else False.
         """
         if node_id in self._nodes:
+            self._nodes.pop(node_id, None)
             with self._reconfiguration():
-                self._nodes.pop(node_id, None)
+                pass
             return True
         else:
             return False
@@ -2650,14 +2719,13 @@ class Device:
             logger.warning(f"reason=deviceDeleteNodeNotFound,deviceId={self._id},nodeId={node_id}")
             return False
         node = self._nodes[node_id]
+        # The description that drops the node is published when the reconfiguration
+        # scope closes, after its property topics are cleared.
+        del self._nodes[node_id]
         with self._reconfiguration():
-            # Clear all property topics first
-            # Note: This explicitly clears each property's retained message from MQTT
-            # to avoid leaving orphaned topics in the broker
+            # Clear each published property's retained message so no orphaned
+            # topics are left in the broker.
             node.clear_all_properties()
-            # Remove node from device's internal structure; the description that
-            # drops it is published when the reconfiguration scope closes.
-            del self._nodes[node_id]
         logger.info(f"reason=deviceDeletedNode,deviceId={self._id},nodeId={node_id}")
         return True
 
@@ -2880,23 +2948,38 @@ class Device:
         # or sleeping, and publishes it directly otherwise.
         self.publish_description()
 
+    def _description_changed(self) -> bool:
+        """Whether ``$description`` now differs from the one last published."""
+        try:
+            return self._description_content_hash(self.description()) != self._last_description_content_hash
+        except Exception:
+            # publish_description() logs the compose failure.
+            return True
+
     @contextlib.contextmanager
     def _reconfiguration(self):
-        """Scope a structural change made outside an explicit ``state_transition()``.
+        """Publish a structural change made outside an explicit ``state_transition()``.
+
+        The caller applies the change to the in-memory tree first, without
+        publishing, then publishes inside this scope what the change requires (new
+        values included).
 
         Homie 5 reconfiguration (convention.md:207, :279, :611): a ``ready`` or
-        ``sleeping`` device goes to ``init``, changes and publishes what it changes
-        (new values included), publishes the new ``$description``, and only then
+        ``sleeping`` device whose ``$description`` the change alters goes to
+        ``init``, runs the body, publishes the new ``$description``, and only then
         returns to the state it was in, so ``ready`` is never announced ahead of the
-        values it vouches for. Inside an open transition the change joins it. In any
-        other state (not yet announced, ``init``, ``disconnected``, ``lost``) the
-        change and the new ``$description`` are published directly.
+        values it vouches for. A change that leaves the ``$description`` as last
+        published (a node not attached to the device, an identical re-declaration)
+        runs the body with no ``init``/``ready`` flap (convention.md:616). Inside an
+        open transition the change joins it. In any other state (not yet announced,
+        ``init``, ``disconnected``, ``lost``) the body and the new ``$description``
+        are published directly.
         """
         if self._transition_depth > 0:
             yield
             return
         prior = self._state
-        if prior not in (DeviceState.READY, DeviceState.SLEEPING):
+        if prior not in (DeviceState.READY, DeviceState.SLEEPING) or not self._description_changed():
             yield
             self.publish_description()
             return
@@ -2966,6 +3049,11 @@ class Device:
         # finishes makes the refresh one atomic commit, flipped by one publish.
         # This narrows a producer-side window; it is NOT a guarantee a consumer
         # may build on (see doc/consuming-a-homie-tree.md). Message set unchanged.
+        # A document that differs from the last one published (its memo was
+        # invalidated, or never stored) is a change, so a ready or sleeping device
+        # announces init first (convention.md:207); the state publish below ends it.
+        if self._state in (DeviceState.READY, DeviceState.SLEEPING) and self._description_changed():
+            self.publish_state(DeviceState.INIT)
         self.publish_description(republish=True)
         self.publish_nodes(force=force)
         for alert_id, message in list(self._alerts.items()):
@@ -3136,7 +3224,10 @@ class Device:
         Unchanged content is skipped. ``version`` is derived from the content
         (see ``description()``), so ``republish=True`` (the reconnect path) puts
         the same document back on the broker, which is not a change and needs no
-        ``init``. ``republish=True`` is also exempt from the in-transition defer.
+        ``init``. ``republish=True`` publishes the document without the wrap even
+        when it changed: ``refresh_tree()`` publishes ``init`` ahead of it and the
+        device's state after everything the document names. ``republish=True`` is
+        also exempt from the in-transition defer.
         """
         # SDK-9ps: while a state_transition() is open, defer interim $description
         # publishes to the single consolidated publish at _end_state_transition().
@@ -3162,7 +3253,7 @@ class Device:
             logger.debug(f"reason=publishDescriptionUnchanged,deviceId={self._id}")
             return
         prior = self._state
-        if changed and prior in (DeviceState.READY, DeviceState.SLEEPING):
+        if changed and not republish and prior in (DeviceState.READY, DeviceState.SLEEPING):
             self.publish_state(DeviceState.INIT)
             self.publish("$description", description)
             self.publish_state(prior)
