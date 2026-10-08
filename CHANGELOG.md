@@ -12,6 +12,17 @@ Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com
 - `Device.stop(announce=False)` no longer disconnects cleanly. On an SDK-owned client it ends the connection without an MQTT DISCONNECT, so the broker publishes the Last Will. A clean disconnect must be preceded by `disconnected` (:281), and `lost` is the state of a bad disconnect (:284). After `declare_lost()` the will re-asserts the same retained `lost`; unpaired, it replaces the stale `ready` the clean disconnect used to leave.
 - `child.delete()` updates the parent first (`init`, `$description` without the child, `ready`) and only then clears the child's topics, starting with `$state` (:635-641). The order was reversed.
 - `Device.will()` carries `qos` (the tree's) and `retain: True`, so the Last Will is no longer sent at QoS 0 while every other `$state` uses the tree QoS (:45, :689-691).
+- `$description` `version` is the top 52 bits of the SHA-256 of the document without `version` (the content hash the publish gate already used), replacing epoch milliseconds. Every change gets a new version, two documents published in one millisecond no longer share one, and an unchanged document keeps its version, so a reconnect republishes a byte-identical document (:215).
+- A `$description` change on a `sleeping` device is wrapped in `init` and returns to `sleeping`, as a change on a `ready` device already was (:207). A reconnect republish of unchanged content is not a change and publishes no `init`.
+- `Node.add_property()`, `Device.add_node()`, `Node.delete_property()`, `Device.remove_node()` and `Device.delete_node()` called outside a `state_transition()` on a `ready` or `sleeping` device publish `init`, the changed values, the new `$description`, then the prior state. `ready` was announced before a new property's value existed (:279, :611).
+- `$description` omits `type` for a device or node that has none instead of publishing `"type": null` (:218, :305), and a property's `retained` is always a boolean.
+- A `json` property whose `format` is a dict publishes it as a JSON string, not a nested object (:395).
+- Invalid producer input is warned about, once per object, and still published; it will raise in the next minor release: a property with no `datatype` (published without one, :340), `retained=None` (published as `false`, the non-retained behavior it always had, :343), an `enum` or `color` with no `format`, an enum format with an empty or duplicate value (:392-393), and a `color` format listing anything but `rgb`, `hsv`, `xyz`.
+- `description_extras` keys that are Homie core `$description` fields (`homie`, `version`, `nodes`, `name`, `type`, `children`, `root`, `parent`, `extensions`) are dropped with a warning. An extra could add `root` and `parent` to a root device (:220).
+
+### Added
+
+- `Device.invalidate_description_cache()`, the `$description` counterpart of `Property.invalidate_publish_cache()`. `clear_retained_topic()` aimed at the device's own `$description` and `delete_all_from_mqtt()` call it, so a later `publish_description()` is no longer suppressed after the topic was cleared.
 
 ### Fixed
 

@@ -93,6 +93,20 @@ def _log_missing_client(message: str, *, by_design: bool, level: int = logging.W
     logger.log(logging.DEBUG if by_design else level, message)
 
 
+def _warn_invalid_once(owner: Any, problem: str, message: str) -> None:
+    """Warn about invalid producer input once per object and problem.
+
+    The policy for invalid producer input (#91): warn in this release, still
+    publish, and raise in the next minor release. Once per object keeps a tree
+    rebuilt on every reconnect from repeating itself.
+    """
+    warned = owner.__dict__.setdefault("_invalid_input_warned", set())
+    if problem in warned:
+        return
+    warned.add(problem)
+    logger.warning(f"{message},hint=invalid Homie 5 input; this will raise in the next minor release")
+
+
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
 _jsonschema_warned = False
 
@@ -169,6 +183,15 @@ if EBUS_HOMIE_MQTT_QOS < 1:
 # sole character is 0x00; a device needing that must escape it at the
 # application level (see module header).
 HOMIE_EMPTY_STRING_PAYLOAD = "\x00"
+
+# The color formats a `color` property's $format may list (convention.md:393).
+_COLOR_FORMATS = frozenset({"rgb", "hsv", "xyz"})
+
+# The Homie 5 core $description fields (convention.md:212-222). description_extras
+# may add extension fields, never one of these.
+_DESCRIPTION_CORE_FIELDS = frozenset(
+    {"homie", "version", "nodes", "name", "type", "children", "root", "parent", "extensions"}
+)
 
 
 @dataclass(frozen=True)
@@ -512,13 +535,17 @@ class Property:
             self._name = id
         self._datatype = datatype
         self._format = format
-        self._settable = settable
+        self._settable = bool(settable)
         # Don't assign set_callback unless this property is settable
         if settable:
             self._set_callback = set_callback
         else:
             self._set_callback = None
-        self._retained = retained
+        if retained is None:
+            # `retained` is a non-nullable boolean in $description (convention.md:343).
+            # The publish path always treated None as non-retained, so keep that.
+            _warn_invalid_once(self, "retainedNull", f"reason=propertyRetainedNull,propertyID={id},treatedAs=false")
+        self._retained = bool(retained)
         self._unit = unit
         self._supports_target = supports_target
         self._node = node
@@ -572,6 +599,43 @@ class Property:
         self._initial_value_was_none = value is None
         # Check for skip_initial_publish flag from dict
         self._skip_initial_publish = from_dict.get("skip_initial_publish", False) if from_dict else False
+        self._check_description_fields()
+
+    def _check_description_fields(self) -> None:
+        """Warn (once per problem) about $description fields Homie 5 rejects.
+
+        ``datatype`` is required (convention.md:340); ``enum`` and ``color`` require
+        a ``format``; an enum format lists at least one value, none empty and none
+        duplicated (:392); a color format lists only ``rgb``, ``hsv`` and ``xyz``
+        (:393).
+        """
+        pid = self._id
+        datatype = self._datatype
+        if datatype is None:
+            _warn_invalid_once(self, "datatypeMissing", f"reason=propertyDatatypeMissing,propertyID={pid}")
+            return
+        if datatype not in PropertyDatatype._value2member_map_:
+            _warn_invalid_once(
+                self, "datatypeUnknown", f"reason=propertyDatatypeUnknown,propertyID={pid},datatype={datatype}"
+            )
+            return
+        fmt = self._format
+        if datatype in (PropertyDatatype.ENUM, PropertyDatatype.COLOR) and not fmt:
+            _warn_invalid_once(
+                self, "formatMissing", f"reason=propertyFormatMissing,propertyID={pid},datatype={datatype}"
+            )
+            return
+        if datatype == PropertyDatatype.ENUM and isinstance(fmt, str):
+            values = fmt.split(",")
+            if "" in values:
+                _warn_invalid_once(self, "enumEmptyValue", f"reason=propertyEnumFormatEmptyValue,propertyID={pid}")
+            if len(set(values)) != len(values):
+                _warn_invalid_once(self, "enumDuplicate", f"reason=propertyEnumFormatDuplicate,propertyID={pid}")
+        if datatype == PropertyDatatype.COLOR and isinstance(fmt, str):
+            if not set(fmt.split(",")) <= _COLOR_FORMATS:
+                _warn_invalid_once(
+                    self, "colorFormatInvalid", f"reason=propertyColorFormatInvalid,propertyID={pid},format={fmt}"
+                )
 
     def as_dict(self) -> dict:
         return {
@@ -711,6 +775,7 @@ class Property:
         ``_format`` because no setter existed (SDK-6do.2).
         """
         self._format = new_format
+        self._check_description_fields()
 
     def coerced_value(self) -> Optional[str]:
         """
@@ -1050,13 +1115,19 @@ class Property:
         logger.debug(f"reason=propertyDescriptionEntered,id={self._id}")
         property = dict()
         property["name"] = self._name
-        property["datatype"] = self.datatype()
+        if self._datatype is not None:
+            # Required (convention.md:340); a missing datatype was warned about at
+            # construction, and null is not a valid value for it.
+            property["datatype"] = self.datatype()
         if self._format:
-            property["format"] = self.format()
+            fmt = self.format()
+            # A json format is a JSONschema carried as a string, NOT a nested
+            # object (convention.md:395).
+            property["format"] = json.dumps(fmt) if isinstance(fmt, dict) else fmt
         if self._settable:
-            property["settable"] = self._settable
+            property["settable"] = True
         if not self._retained:
-            property["retained"] = self._retained
+            property["retained"] = False
         if self._unit:
             property["unit"] = self._unit
         return property
@@ -1288,17 +1359,18 @@ class Node:
             property.async_loop = self._device._async_loop
         # Note set_subscribe() checks if property is settable...
         property.set_subscribe()
-        # Add property to dictionary BEFORE publishing description
-        self._properties.update({property.id(): property})
-        self.device().publish_description()
-        # force: announcing a property is a structural republish, so its value must
-        # land regardless of the GH #50 skip. A fresh property would pass the gate
-        # anyway (it has never published), and so would one re-added after
-        # delete_property() (clear_value() resets both gate conjuncts). What force
-        # actually covers is the property whose retained topic was deleted behind its
-        # back -- clear_retained_topic(), or an operator wiping the broker -- where
-        # the memo still claims the broker holds this payload and it does not.
-        property.publish_value(force=True)
+        # Outside a transition a ready device goes to init first, so the value lands
+        # before the $description that names it and before ready (convention.md:279).
+        with self.device()._reconfiguration():
+            self._properties.update({property.id(): property})
+            # force: announcing a property is a structural republish, so its value must
+            # land regardless of the GH #50 skip. A fresh property would pass the gate
+            # anyway (it has never published), and so would one re-added after
+            # delete_property() (clear_value() resets both gate conjuncts). What force
+            # actually covers is the property whose retained topic was deleted behind its
+            # back -- clear_retained_topic(), or an operator wiping the broker -- where
+            # the memo still claims the broker holds this payload and it does not.
+            property.publish_value(force=True)
         return property
 
     def add_property_from_dict(self, property_dict: dict) -> Property:
@@ -1341,13 +1413,16 @@ class Node:
             logger.warning(f"reason=nodeDeletePropertyNotFound,nodeId={self._id},propertyId={property_id}")
             return False
         property = self._properties[property_id]
-        property.clear_value()
-        del self._properties[property_id]
-        # Delete from the dict BEFORE republishing, so the new $description
-        # reflects the removal (add_property() has the same ordering rule).
         device = self.device()
         if device:
-            device.publish_description()
+            # The description that drops the property is published when the
+            # reconfiguration scope closes, after the removal.
+            with device._reconfiguration():
+                property.clear_value()
+                del self._properties[property_id]
+        else:
+            property.clear_value()
+            del self._properties[property_id]
         logger.info(f"reason=nodeDeletedProperty,nodeId={self._id},propertyId={property_id}")
         return True
 
@@ -1381,7 +1456,9 @@ class Node:
         logger.debug(f"reason=nodeDescriptionEntered,id={self._id}")
         description = dict()
         description["name"] = self._name
-        description["type"] = self._type
+        if self._type is not None:
+            # Optional and not nullable (convention.md:305): omitted when unset.
+            description["type"] = self._type
         properties = dict()
         properties_snapshot = dict(self._properties)
         for property_id, attributes in properties_snapshot.items():
@@ -1692,6 +1769,14 @@ class Device:
         # description fields (convention §Forward compatibility), so these are
         # safe; core fields always take precedence over an extra of the same key.
         self._description_extras = dict(description_extras) if description_extras else {}
+        for key in sorted(self._description_extras.keys() & _DESCRIPTION_CORE_FIELDS):
+            # A core field is the SDK's to compute: an extra could otherwise add
+            # `root`/`parent` to a root device (convention.md:220) or a `type` the
+            # SDK omits. Dropped, with a warning per the invalid-input policy.
+            del self._description_extras[key]
+            _warn_invalid_once(
+                self, f"extrasCoreField:{key}", f"reason=deviceDescriptionExtrasCoreFieldDropped,id={id},field={key}"
+            )
         # Counter of how many state_transition() / delete() scopes are currently active
         # on this device. >0 means "a transition is in progress" — suppresses child-induced
         # parent flaps and makes nested state_transition()s reentrant (only the outermost
@@ -1701,8 +1786,8 @@ class Device:
         # Set by delete(): the device no longer exists on the broker, so nothing may
         # republish its $state (stop(), a reconnect's refresh_tree(), the will).
         self._deleted = False
-        # SDK-n83: hash of the last $description we actually published, with the
-        # always-fresh `version` timestamp removed. publish_description() uses it
+        # SDK-n83: hash of the last $description we actually published, with
+        # `version` removed. publish_description() uses it
         # to skip a republish whose content has not changed (saves the ~KB
         # payload and the gratuitous INIT→READY flap). Maintained in publish().
         self._last_description_content_hash = None
@@ -2080,9 +2165,12 @@ class Device:
         logger.debug(f"reason=deviceDescriptionEntered,id={self._id}")
         description = dict()
         description["homie"] = f"{EBUS_HOMIE_VERSION_MAJOR}.{EBUS_HOMIE_VERSION_MINOR}"
-        # Version should be changed any time the description document is changed
-        description["version"] = Device.now_ems()
-        description["type"] = self._type
+        # Placeholder keeps `version` second in the document; filled in below from
+        # the content, which the hash computes without it.
+        description["version"] = 0
+        if self._type is not None:
+            # Optional and not nullable (convention.md:218): omitted when unset.
+            description["type"] = self._type
         description["name"] = self._name
         nodes_descriptions = dict()
         nodes_snapshot = dict(self._nodes)
@@ -2096,9 +2184,15 @@ class Device:
             # Required if the parent is NOT the root device. Defaults to the value of the root property.
             description["parent"] = self._parent.id()
         description["extensions"] = self._extensions
-        # Merge extension-defined device attributes, never clobbering a core field.
+        # Merge extension-defined device attributes (core fields were dropped from
+        # the extras at construction).
         for key, value in self._description_extras.items():
             description.setdefault(key, value)
+        # A new version whenever the document changes (convention.md:215), and the
+        # same version while it does not, so a reconnect republishes an identical
+        # document: the top 52 bits of the content hash, an integer below 2^53 that
+        # every JSON consumer reads exactly.
+        description["version"] = int(self._description_content_hash(description)[:13], 16)
         return description
 
     def set_state(self, state: DeviceState) -> bool:
@@ -2133,12 +2227,14 @@ class Device:
             if self._async_loop is not None:
                 prop.async_loop = self._async_loop
         node_id = node.id()
-        self._nodes.update({node_id: node})
-        # Explicit force (also Node.publish's default): adopting a node is a
-        # structural republish, so every property lands on the broker under this
-        # device regardless of the GH #50 unchanged-payload skip.
-        node.publish(force=True)
-        self.publish_description()
+        # Outside a transition a ready device goes to init first, so the node's
+        # values land before the $description that names them and before ready.
+        with self._reconfiguration():
+            self._nodes.update({node_id: node})
+            # Explicit force (also Node.publish's default): adopting a node is a
+            # structural republish, so every property lands on the broker under this
+            # device regardless of the GH #50 unchanged-payload skip.
+            node.publish(force=True)
         return node
 
     def add_node_from_dict(self, node_dict: dict) -> Node:
@@ -2168,8 +2264,8 @@ class Device:
         Returns True if removed, else False.
         """
         if node_id in self._nodes:
-            self._nodes.pop(node_id, None)
-            self.publish_description()
+            with self._reconfiguration():
+                self._nodes.pop(node_id, None)
             return True
         else:
             return False
@@ -2195,14 +2291,14 @@ class Device:
             logger.warning(f"reason=deviceDeleteNodeNotFound,deviceId={self._id},nodeId={node_id}")
             return False
         node = self._nodes[node_id]
-        # Clear all property topics first
-        # Note: This explicitly clears each property's retained message from MQTT
-        # to avoid leaving orphaned topics in the broker
-        node.clear_all_properties()
-        # Remove node from device's internal structure
-        del self._nodes[node_id]
-        # Update device description (which removes the node from the schema)
-        self.publish_description()
+        with self._reconfiguration():
+            # Clear all property topics first
+            # Note: This explicitly clears each property's retained message from MQTT
+            # to avoid leaving orphaned topics in the broker
+            node.clear_all_properties()
+            # Remove node from device's internal structure; the description that
+            # drops it is published when the reconfiguration scope closes.
+            del self._nodes[node_id]
         logger.info(f"reason=deviceDeletedNode,deviceId={self._id},nodeId={node_id}")
         return True
 
@@ -2265,6 +2361,7 @@ class Device:
         description_topic = f"{base_topic}/$description"
         try:
             mqttc.publish(description_topic, "", retain=True, qos=self._qos)
+            self.invalidate_description_cache()
             logger.info(f"reason=deviceClearedDescription,deviceId={self._id},topic={description_topic}")
         except Exception as e:
             logger.warning(f"reason=deviceClearDescriptionFailed,deviceId={self._id},error={e}")
@@ -2322,6 +2419,18 @@ class Device:
             device._children = []
         self._parent = None
 
+    def invalidate_description_cache(self) -> None:
+        """Forget which ``$description`` this device last published.
+
+        ``publish_description()`` skips a document identical to the last one it
+        published, on the assumption that the broker still holds it. Anything that
+        deletes the retained ``$description`` behind the device's back must call
+        this, or the next ``publish_description()`` is skipped and the device stays
+        without a description. ``clear_retained_topic()`` aimed at this device's
+        ``$description`` and ``delete_all_from_mqtt()`` call it themselves.
+        """
+        self._last_description_content_hash = None
+
     def clear_retained_topic(self, topic_path: str) -> bool:
         """
         Publish empty string to clear retained message on topic
@@ -2342,6 +2451,9 @@ class Device:
         try:
             mqttc.publish(topic_path, "", retain=True, qos=self._qos)
             logger.info(f"reason=deviceClearedTopic,topic={topic_path}")
+            if topic_path == f"{self.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{self._id}/$description":
+                # The broker no longer holds the document the hash describes.
+                self.invalidate_description_cache()
             return True
         except Exception as e:
             logger.warning(f"reason=deviceClearTopicException,topic={topic_path},e={e}")
@@ -2384,7 +2496,7 @@ class Device:
         """
         Republish this device's $description after a structural change
         (a child was added or removed). Performs INIT → publish description
-        → READY unless this device is already inside a state_transition() —
+        → READY (or back to sleeping) unless this device is already inside a state_transition() —
         in which case the in-progress transition will publish on exit and
         we suppress the per-change flap (S1: many children, one parent cycle).
 
@@ -2397,13 +2509,38 @@ class Device:
                 f"reason=deviceStructuralChangeSuppressed,deviceId={self._id},transitionDepth={self._transition_depth}"
             )
             return
-        if self._state != DeviceState.READY:
-            self.publish_description(republish=True)
+        # publish_description() wraps the change in INIT when the device is ready
+        # or sleeping, and publishes it directly otherwise.
+        self.publish_description()
+
+    @contextlib.contextmanager
+    def _reconfiguration(self):
+        """Scope a structural change made outside an explicit ``state_transition()``.
+
+        Homie 5 reconfiguration (convention.md:207, :279, :611): a ``ready`` or
+        ``sleeping`` device goes to ``init``, changes and publishes what it changes
+        (new values included), publishes the new ``$description``, and only then
+        returns to the state it was in, so ``ready`` is never announced ahead of the
+        values it vouches for. Inside an open transition the change joins it. In any
+        other state (not yet announced, ``init``, ``disconnected``, ``lost``) the
+        change and the new ``$description`` are published directly.
+        """
+        if self._transition_depth > 0:
+            yield
             return
-        # Steady-state structural change: full INIT → desc → READY cycle.
+        prior = self._state
+        if prior not in (DeviceState.READY, DeviceState.SLEEPING):
+            yield
+            self.publish_description()
+            return
+        self._transition_depth += 1
         self.set_state(DeviceState.INIT)
-        self.publish("$description")
-        self.set_state(DeviceState.READY)
+        try:
+            yield
+        finally:
+            self._transition_depth -= 1
+            self.publish_description()
+            self.set_state(prior)
 
     def state_transition(self) -> StateTransitionContext:
         """
@@ -2521,8 +2658,8 @@ class Device:
             if payload:
                 mqttc.publish(topic, payload, retain=True, qos=self._qos)
                 if attribute == "$description":
-                    # SDK-n83: remember what we just put on the wire (sans the
-                    # version timestamp) so a later unchanged republish no-ops.
+                    # SDK-n83: remember what we just put on the wire (sans
+                    # version) so a later unchanged republish no-ops.
                     # Updated here — the single $description chokepoint — so every
                     # caller (publish_description, _notify_structural_change,
                     # reconnect) keeps the hash current.
@@ -2543,51 +2680,56 @@ class Device:
     @staticmethod
     def _description_content_hash(description: dict) -> str:
         """
-        SHA-256 of a $description dict with the always-fresh `version` timestamp
-        removed, so two structurally-identical descriptions hash equal even
-        though description() stamps a new version on every call.
+        SHA-256 of a $description dict with `version` removed. ``description()``
+        derives ``version`` from this hash, and the publish gate compares it to
+        decide whether the document changed.
         """
         content = {k: v for k, v in description.items() if k != "version"}
         return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
     def publish_description(self, republish: bool = False) -> None:
+        """Publish this device's ``$description`` if its content changed.
+
+        Homie 5 lets ``$description`` change only while ``$state`` is ``init``,
+        ``disconnected`` or ``lost`` (convention.md:207). A change made while the
+        device is ``ready`` or ``sleeping`` is therefore wrapped: ``init``, the new
+        document, then the state the device was in.
+
+        Unchanged content is skipped. ``version`` is derived from the content
+        (see ``description()``), so ``republish=True`` (the reconnect path) puts
+        the same document back on the broker, which is not a change and needs no
+        ``init``. ``republish=True`` is also exempt from the in-transition defer.
+        """
         # SDK-9ps: while a state_transition() is open, defer interim $description
         # publishes to the single consolidated publish at _end_state_transition().
         # Adding N nodes inside one transition then puts 1 description on the wire,
-        # not N+1. A forced republish (reconnect / not-yet-READY) is exempt — it
-        # must reach the broker now. (_end_state_transition leaves the transition
-        # scope before its own call so that consolidated publish isn't deferred.)
+        # not N+1. (_end_state_transition leaves the transition scope before its own
+        # call so that consolidated publish isn't deferred.)
         if self._transition_depth > 0 and not republish:
             logger.debug(
                 f"reason=publishDescriptionDeferredInTransition,deviceId={self._id},depth={self._transition_depth}"
             )
             return
 
-        # SDK-n83: defensive no-op when the description content (ignoring the
-        # always-fresh `version` timestamp) is byte-identical to what we last
-        # published — avoids the redundant ~KB republish and the gratuitous
-        # INIT→READY flap that forces every subscriber to resync. A forced
-        # republish is exempt so reconnect always restores the retained topic.
-        if not republish:
-            if self._description_content_hash(self.description()) == self._last_description_content_hash:
-                logger.debug(f"reason=publishDescriptionUnchanged,deviceId={self._id}")
-                return
-
-        if republish:
-            self.publish("$description")
+        try:
+            description = self.description()
+            changed = self._description_content_hash(description) != self._last_description_content_hash
+        except Exception as e:
+            # Best-effort, like every Device.publish(): one unserializable entry must
+            # not abort a tree-wide refresh.
+            logger.exception(f"reason=publishDescriptionComposeFailed,deviceId={self._id},e={e}")
+            return
+        if not changed and not republish:
+            # SDK-n83: nothing to announce; skip the ~KB republish and the INIT flap.
+            logger.debug(f"reason=publishDescriptionUnchanged,deviceId={self._id}")
+            return
+        prior = self._state
+        if changed and prior in (DeviceState.READY, DeviceState.SLEEPING):
+            self.publish_state(DeviceState.INIT)
+            self.publish("$description", description)
+            self.publish_state(prior)
         else:
-            if self._state == DeviceState.READY:
-                # Need to transition first to INIT
-                self.publish_state(DeviceState.INIT)
-                self.publish("$description")
-                # Now that we've republished, restore $state to ready
-                self.publish_state(DeviceState.READY)
-            else:
-                # TODO: should we be able to publish if DISCONNECTED, SLEEPING, or LOST?
-                # If not in READY state, then we don't need to transition to INIT...
-                logger.info(f"reason=publishDescriptionNotRepublishNotReady,state={self._state.name}")
-                # Just publish description
-                self.publish("$description")
+            self.publish("$description", description)
 
     def publish_nodes(self, *, force: bool = True) -> None:
         # Snapshot — invoked from on_connect() on the MQTT loop thread while

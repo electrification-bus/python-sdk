@@ -4,6 +4,7 @@ Line numbers in docstrings refer to homieiot/convention@7edc221 convention.md.
 """
 
 import json
+import logging
 import socket
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,9 @@ from ebus_sdk.homie import (
     EBUS_HOMIE_VERSION_MAJOR,
     Device,
     DeviceState,
+    Node,
+    Property,
+    PropertyDatatype,
 )
 
 BASE = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}"
@@ -213,3 +217,214 @@ class TestDeletedDeviceStaysDeleted:
         root.on_connect()
 
         assert client.publish.call_args_list == []
+
+
+# ── B. $description ──────────────────────────────────────────────────────
+
+
+def _descriptions(client, device_id):
+    return [json.loads(p) for t, p in _publishes(client) if t == f"{BASE}/{device_id}/$description" and p]
+
+
+def _states(client, device_id):
+    return [p for t, p in _publishes(client) if t == f"{BASE}/{device_id}/$state"]
+
+
+def _invalid_input_warnings(caplog):
+    return [r for r in caplog.records if "next minor release" in r.getMessage()]
+
+
+class TestDescriptionVersion:
+    """:215: a new version whenever the document changes, and only then."""
+
+    def test_version_is_a_52_bit_integer(self):
+        root, _ = _make_root()
+        version = root.description()["version"]
+        assert isinstance(version, int)
+        assert 0 <= version < 2**52
+
+    def test_equal_content_has_equal_version(self):
+        a = Device(id="same")
+        b = Device(id="same")
+        assert a.description()["version"] == b.description()["version"]
+
+    def test_a_content_change_changes_the_version(self):
+        root, _ = _make_root()
+        before = root.description()["version"]
+        root.add_node(root.new_node("n"))
+        assert root.description()["version"] != before
+
+    def test_reconnect_republishes_the_same_document_without_init(self):
+        root, client = _make_root()
+        root.add_node(root.new_node("n"))
+        published = _descriptions(client, "root")[-1]
+        client.publish.reset_mock()
+
+        root.on_connect()
+
+        assert _descriptions(client, "root") == [published]
+        assert _states(client, "root") == ["ready"]
+
+
+class TestDescriptionChangesOnlyInPermittedStates:
+    """:207: `$description` may change only in `init`, `disconnected` or `lost`."""
+
+    def test_a_change_while_sleeping_is_wrapped_in_init_and_returns_to_sleeping(self):
+        root, client = _make_root()
+        root.set_state(DeviceState.SLEEPING)
+        client.publish.reset_mock()
+
+        root.add_node(root.new_node("n"))
+
+        events = [(t.rsplit("/", 1)[1], p) for t, p in _publishes(client)]
+        assert events[0] == ("$state", "init")
+        assert [e for e in events if e[0] == "$description"]
+        assert events[-1] == ("$state", "sleeping")
+        assert root.state() == DeviceState.SLEEPING
+
+    def test_a_child_added_to_a_sleeping_parent_wraps_the_parent(self):
+        root, client = _make_root()
+        root.set_state(DeviceState.SLEEPING)
+        client.publish.reset_mock()
+
+        Device(id="child", parent=root)
+
+        assert _states(client, "root") == ["init", "sleeping"]
+
+    def test_publish_description_while_ready_wraps_only_a_change(self):
+        root, client = _make_root()
+        client.publish.reset_mock()
+        root.publish_description()
+        assert client.publish.call_args_list == []
+
+
+class TestDescriptionFields:
+    def test_unset_device_and_node_type_are_omitted(self):
+        """:218 and :305: `type` is not nullable."""
+        device = Device(id="d")
+        device.add_node(Node(id="n"))
+        description = device.description()
+        assert "type" not in description
+        assert "type" not in description["nodes"]["n"]
+
+    def test_set_types_are_kept(self):
+        device = Device(id="d", type="t")
+        device.add_node(Node(id="n", type="nt"))
+        assert device.description()["type"] == "t"
+        assert device.description()["nodes"]["n"]["type"] == "nt"
+
+    def test_missing_datatype_warns_and_is_omitted(self, caplog):
+        """:340: `datatype` is required."""
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            prop = Property(id="p")
+        assert "datatype" not in prop.description()
+        assert len(_invalid_input_warnings(caplog)) == 1
+
+    def test_null_retained_warns_and_is_published_as_false(self, caplog):
+        """:343: `retained` is a non-null boolean; None always published non-retained."""
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            prop = Property(id="p", datatype=PropertyDatatype.FLOAT, retained=None)
+        assert prop.description()["retained"] is False
+        assert prop.retained() is False
+        assert len(_invalid_input_warnings(caplog)) == 1
+
+    def test_json_format_dict_is_published_as_a_string(self):
+        """:395: the JSONschema is a string, not a nested object."""
+        schema = {"type": "object"}
+        prop = Property(id="j", datatype=PropertyDatatype.JSON, format=schema)
+        assert prop.description()["format"] == json.dumps(schema)
+
+    def test_enum_and_color_without_format_warn(self, caplog):
+        """:392-393: `enum` and `color` require a format."""
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            Property(id="e", datatype=PropertyDatatype.ENUM)
+            Property(id="c", datatype=PropertyDatatype.COLOR)
+        assert len(_invalid_input_warnings(caplog)) == 2
+
+    def test_enum_format_with_empty_or_duplicate_values_warns(self, caplog):
+        """:392: at least one value, none empty, no duplicates."""
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            Property(id="e1", datatype=PropertyDatatype.ENUM, format="a,,b")
+            Property(id="e2", datatype=PropertyDatatype.ENUM, format="a,b,a")
+            Property(id="ok", datatype=PropertyDatatype.ENUM, format="a,b")
+        reasons = [r.getMessage() for r in _invalid_input_warnings(caplog)]
+        assert len(reasons) == 2
+        assert "propertyID=e1" in reasons[0] and "propertyID=e2" in reasons[1]
+
+    def test_the_warning_is_once_per_object(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            prop = Property(id="e", datatype=PropertyDatatype.ENUM)
+            prop.set_format(None)
+            prop.set_format("")
+        assert len(_invalid_input_warnings(caplog)) == 1
+
+    def test_set_format_checks_the_new_format(self, caplog):
+        prop = Property(id="e", datatype=PropertyDatatype.ENUM, format="a,b")
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            prop.set_format("a,a")
+        assert len(_invalid_input_warnings(caplog)) == 1
+
+    def test_extras_cannot_add_root_or_parent_to_a_root(self, caplog):
+        """:220: `root` MUST be omitted on the root device."""
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            device = Device(id="r", description_extras={"root": "x", "parent": "y", "imported-from": "z"})
+        description = device.description()
+        assert "root" not in description and "parent" not in description
+        assert description["imported-from"] == "z"
+        assert len(_invalid_input_warnings(caplog)) == 2
+
+    def test_extras_cannot_override_core_fields(self):
+        device = Device(id="r", description_extras={"version": 1, "type": "x", "homie": "4.0"})
+        description = device.description()
+        assert description["homie"] == "5.0"
+        assert description["version"] != 1
+        assert "type" not in description
+
+
+class TestNewValuesPrecedeReady:
+    """:279: `ready` follows every value it vouches for."""
+
+    def test_add_property_on_a_ready_device(self):
+        root, client = _make_root()
+        node = root.new_node("n")
+        root.add_node(node)
+        client.publish.reset_mock()
+
+        node.add_property(Property(id="p", value=5, datatype=PropertyDatatype.INTEGER))
+
+        events = [(t.rsplit("/", 1)[1], p) for t, p in _publishes(client)]
+        kinds = [e[0] if e[0].startswith("$") else "value" for e in events]
+        assert kinds == ["$state", "value", "$description", "$state"]
+        assert events[0][1] == "init" and events[-1][1] == "ready"
+
+    def test_add_node_on_a_ready_device(self):
+        root, client = _make_root()
+        node = Node(id="n")
+        node._properties["p"] = Property(id="p", value=1.5, datatype=PropertyDatatype.FLOAT, node=node)
+        client.publish.reset_mock()
+
+        root.add_node(node)
+
+        events = [(t.rsplit("/", 1)[1], p) for t, p in _publishes(client)]
+        kinds = [e[0] if e[0].startswith("$") else "value" for e in events]
+        assert kinds == ["$state", "value", "$description", "$state"]
+
+    def test_inside_a_transition_nothing_extra_is_published(self):
+        root, client = _make_root()
+        client.publish.reset_mock()
+        with root.state_transition():
+            root.add_node(root.new_node("a"))
+            root.add_node(root.new_node("b"))
+        assert _states(client, "root") == ["init", "ready"]
+        assert len(_descriptions(client, "root")) == 1
+
+
+class TestDescriptionCacheInvalidation:
+    def test_clearing_the_description_topic_lets_the_next_publish_through(self):
+        root, client = _make_root()
+        root.clear_retained_topic(f"{BASE}/root/$description")
+        client.publish.reset_mock()
+
+        root.publish_description()
+
+        assert len(_descriptions(client, "root")) == 1
