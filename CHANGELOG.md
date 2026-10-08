@@ -23,6 +23,10 @@ Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com
 - The `0x00` empty-string encoding applies only to `string` properties (:65-67); `""` on another datatype is refused.
 - A non-retained (event) property publishes non-retained at QoS 0 (:50). The reconnect and structural-change republish walks skip it, so the last event is no longer replayed (:695), and clearing it publishes nothing instead of a retained empty message on the event topic.
 - `Device.publish("$alert", ...)` publishes nothing and warns: an alert needs an id (:517). Use `publish_alert()`.
+- An inbound `/set` is validated for the property's datatype before the callback runs, and an invalid one is dropped with a `reason=propertySetRejected` warning: `json` must be an array or object, `integer` and `float` must follow the payload grammar, a number is rounded to the format's step and then checked against min/max (:399), an `enum` value must be in `format`, and a `boolean` must be `true` or `false`. A number that rounding changed reaches the callback in its rounded form. `0x00` decodes to `""` only for `string`.
+- A `/set` delivered with the retain flag is ignored with a warning: it is a stale command replayed at subscribe time (:48, :483). This uses `subscribe(..., with_retain=True)` from ebus-mqtt-client 0.7.0 ([electrification-bus/ebus-mqtt-client#24](https://github.com/electrification-bus/ebus-mqtt-client/issues/24)); with an older client, or an injected transport without that parameter, the check is skipped and a debug line says so. The dependency floor is unchanged.
+- `supports_target=True` is inert: one warning at construction, and `/set` no longer calls the `$target` stub, which ran before the payload was accepted (:466, :470).
+- `.ebus-spec.json` no longer lists `mdns-discovery` under `supports`; the library has no mDNS code.
 
 ### Added
 

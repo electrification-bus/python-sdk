@@ -224,7 +224,7 @@ If you build the tree by hand instead of via `build_from_declarations`, wire the
 
 ### Settable `json` properties and `$format` validation
 
-For a settable `json` property (a compound command like `flex/request`), give the `PropertySpec` a `format` that is the JSON Schema of the command surface your device accepts. An inbound `/set` payload is then `json.loads`ed to a `dict`/`list` and validated against that schema before your `entity_setter` runs, so your `entity_setter` receives a parsed, schema-valid object and a malformed or out-of-surface command is rejected for you:
+For a settable `json` property (a compound command like `flex/request`), give the `PropertySpec` a `format` that is the JSON Schema of the command surface your device accepts. An inbound `/set` payload is then `json.loads`ed, required to be a `dict`/`list` (Homie 5 allows only an array or object), and validated against that schema before your `entity_setter` runs, so your `entity_setter` receives a parsed, schema-valid object and a malformed or out-of-surface command is rejected for you:
 
 ```python
 PropertySpec(

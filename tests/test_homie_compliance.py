@@ -5,10 +5,13 @@ Line numbers in docstrings refer to homieiot/convention@7edc221 convention.md.
 
 import datetime
 import enum
+import inspect
 import json
 import logging
 import socket
 from unittest.mock import MagicMock, patch
+
+from ebus_mqtt_client import MqttClient
 
 from ebus_sdk.homie import (
     EBUS_HOMIE_DOMAIN,
@@ -435,7 +438,7 @@ class TestDescriptionCacheInvalidation:
 # ── C. Property values ───────────────────────────────────────────────────
 
 
-def _wired(datatype, value=None, **kwargs):
+def _wired(datatype, **kwargs):
     """A property on a node on a READY root with a mock client."""
     root, client = _make_root()
     node = root.new_node("n")
@@ -640,3 +643,181 @@ class TestAlerts:
         assert root.publish_alert("", "x") is False
         assert root.publish_alert("battery", "") is False
         assert client.publish.call_args_list == []
+
+
+# ── D. /set on the device ────────────────────────────────────────────────
+
+
+def _settable(datatype, **kwargs):
+    """A settable property with a recording callback, on a root with a mock client."""
+    received = []
+    prop, client, root = _wired(datatype, settable=True, set_callback=received.append, **kwargs)
+    return prop, received
+
+
+def _send(prop, payload, retained=None):
+    topic = f"{BASE}/root/n/p/set"
+    data = payload.encode() if isinstance(payload, str) else payload
+    if retained is None:
+        prop._settable_callback(topic, data)
+    else:
+        prop._settable_callback(topic, data, retained)
+
+
+def _accepts(datatype, payload, **kwargs):
+    """What the set callback receives for ``payload``, or the string REJECTED."""
+    prop, received = _settable(datatype, **kwargs)
+    _send(prop, payload)
+    return received[0] if received else "REJECTED"
+
+
+class TestInboundValidation:
+    """Invalid /set payloads are dropped before the callback."""
+
+    def test_integer_grammar_and_range(self):
+        assert _accepts(PropertyDatatype.INTEGER, "42") == "42"
+        assert _accepts(PropertyDatatype.INTEGER, "-7") == "-7"
+        for bad in ("1.5", "abc", "-", "", " 1", "\x00", str(2**63)):
+            assert _accepts(PropertyDatatype.INTEGER, bad) == "REJECTED", bad
+
+    def test_float_grammar(self):
+        assert _accepts(PropertyDatatype.FLOAT, "21.5") == "21.5"
+        assert _accepts(PropertyDatatype.FLOAT, "1e5") == "1e5"
+        for bad in ("NaN", "Infinity", "1e+5", "1,5", "", "1e999"):
+            assert _accepts(PropertyDatatype.FLOAT, bad) == "REJECTED", bad
+
+    def test_numbers_round_to_the_step_then_check_min_max(self):
+        """:397-413, with floor(x + 0.5) rounding."""
+        assert _accepts(PropertyDatatype.INTEGER, "5", format="0:10:2") == "6"
+        assert _accepts(PropertyDatatype.INTEGER, "5", format=":10:2") == "6"
+        assert _accepts(PropertyDatatype.INTEGER, "4", format="0:10:2") == "4"
+        # 11 rounds to 12, which is outside the range: checked after rounding.
+        assert _accepts(PropertyDatatype.INTEGER, "11", format="0:10:2") == "REJECTED"
+        assert _accepts(PropertyDatatype.FLOAT, "0.25", format="0:1:0.1") == "0.3"
+        assert _accepts(PropertyDatatype.FLOAT, "101", format="0:100") == "REJECTED"
+        assert _accepts(PropertyDatatype.FLOAT, "-0.5", format="0:") == "REJECTED"
+
+    def test_the_current_value_is_the_step_base_without_min_or_max(self):
+        assert _accepts(PropertyDatatype.INTEGER, "6", format="::4", value=1) == "5"
+
+    def test_boolean_is_case_sensitive(self):
+        assert _accepts(PropertyDatatype.BOOLEAN, "true") == "true"
+        for bad in ("TRUE", "1", "yes", ""):
+            assert _accepts(PropertyDatatype.BOOLEAN, bad) == "REJECTED", bad
+
+    def test_enum_membership(self):
+        assert _accepts(PropertyDatatype.ENUM, "auto", format="auto,off") == "auto"
+        assert _accepts(PropertyDatatype.ENUM, "Auto", format="auto,off") == "REJECTED"
+
+    def test_json_must_be_an_array_or_object(self):
+        assert _accepts(PropertyDatatype.JSON, "[1, 2]") == [1, 2]
+        for bad in ("5", '"s"', "null", "{", '{"a": NaN}'):
+            assert _accepts(PropertyDatatype.JSON, bad) == "REJECTED", bad
+
+    def test_empty_string_decoding_is_for_string_only(self):
+        assert _accepts(PropertyDatatype.STRING, "\x00") == ""
+        assert _accepts(PropertyDatatype.ENUM, "\x00", format="a,b") == "REJECTED"
+
+    def test_a_rejection_is_a_warning(self, caplog):
+        prop, _ = _settable(PropertyDatatype.INTEGER)
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            _send(prop, "1.5")
+        assert any("propertySetRejected" in r.getMessage() for r in caplog.records)
+
+
+class TestRetainedSetIsIgnored:
+    """:48 and :483: a retained /set is a stale command replayed at subscribe."""
+
+    def test_a_retained_set_is_ignored_with_a_warning(self, caplog):
+        prop, received = _settable(PropertyDatatype.INTEGER)
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            _send(prop, "5", retained=True)
+        assert received == []
+        assert any("propertySetRetainedIgnored" in r.getMessage() for r in caplog.records)
+
+    def test_a_live_set_runs(self):
+        prop, received = _settable(PropertyDatatype.INTEGER)
+        _send(prop, "5", retained=False)
+        assert received == ["5"]
+
+    def test_subscribes_with_retain_when_the_transport_supports_it(self):
+        class RetainAwareClient:
+            is_running = True
+
+            def __init__(self):
+                self.subscriptions = []
+
+            def is_connected(self):
+                return True
+
+            def publish(self, topic, data, qos=1, retain=False):
+                return None
+
+            def subscribe(self, sub, param, qos=1, *, with_retain=False):
+                self.subscriptions.append((sub, with_retain))
+
+        client = RetainAwareClient()
+        root = Device(id="root", mqttc=client)
+        node = root.new_node("n")
+        root.add_node(node)
+        node.add_property(Property(id="p", datatype=PropertyDatatype.INTEGER, settable=True, set_callback=print))
+        assert client.subscriptions == [(f"{BASE}/root/n/p/set", True)]
+
+    def test_an_older_transport_subscribes_without_it(self, caplog):
+        class OlderClient:
+            is_running = True
+
+            def __init__(self):
+                self.subscriptions = []
+
+            def is_connected(self):
+                return True
+
+            def publish(self, topic, data, qos=1, retain=False):
+                return None
+
+            def subscribe(self, sub, param, qos=1):
+                self.subscriptions.append(sub)
+
+        client = OlderClient()
+        root = Device(id="root", mqttc=client)
+        node = root.new_node("n")
+        root.add_node(node)
+        with caplog.at_level(logging.DEBUG, logger="homie"):
+            node.add_property(Property(id="p", datatype=PropertyDatatype.INTEGER, settable=True, set_callback=print))
+        assert client.subscriptions == [f"{BASE}/root/n/p/set"]
+        assert any("propertySetSubscribeNoRetainFlag" in r.getMessage() for r in caplog.records)
+
+    def test_end_to_end_through_ebus_mqtt_client(self, mock_paho):
+        """The installed ebus-mqtt-client, whichever it is, delivers or omits the flag consistently."""
+        received = []
+        root = Device(id="root", mqtt_cfg={"host": "localhost", "port": 1883})
+        root.start_mqtt_client()
+        node = root.new_node("n")
+        root.add_node(node)
+        node.add_property(
+            Property(id="p", datatype=PropertyDatatype.INTEGER, settable=True, set_callback=received.append)
+        )
+        supported = "with_retain" in inspect.signature(MqttClient.subscribe).parameters
+        on_message = mock_paho.on_message
+        for retain in (True, False):
+            msg = MagicMock(topic=f"{BASE}/root/n/p/set", payload=b"5", retain=retain)
+            on_message(mock_paho, None, msg)
+        assert received == (["5"] if supported else ["5", "5"])
+        root.stop()
+
+
+class TestSupportsTargetIsInert:
+    """:466 and :470: the `$target` stub must not run before the acceptance decision."""
+
+    def test_one_warning_at_construction(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            Property(id="p", datatype=PropertyDatatype.INTEGER, supports_target=True)
+        assert sum("propertySupportsTargetInert" in r.getMessage() for r in caplog.records) == 1
+
+    def test_set_does_not_call_the_target_stub(self):
+        prop, received = _settable(PropertyDatatype.INTEGER, supports_target=True)
+        with patch.object(Property, "publish_target_value") as stub:
+            _send(prop, "5")
+        stub.assert_not_called()
+        assert received == ["5"]

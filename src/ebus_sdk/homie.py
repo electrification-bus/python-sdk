@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import datetime
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -62,6 +63,7 @@ except ImportError:
 
 
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import partial
 from threading import RLock
 
@@ -588,6 +590,111 @@ def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tu
     return (str(value.value) if isinstance(value, Enum) else str(value)), None
 
 
+def _numeric_format(format_: Any) -> tuple:
+    """``(min, max, step)`` as Fractions (each may be None) from ``[min]:[max][:step]``.
+
+    A format that does not parse imposes no constraint. A step that is not > 0 is
+    ignored (convention.md:390-391).
+    """
+    if not isinstance(format_, str) or not format_:
+        return None, None, None
+    parts = format_.split(":")
+    if len(parts) not in (2, 3):
+        return None, None, None
+
+    def bound(text: str) -> Optional[Fraction]:
+        if not _FLOAT_PAYLOAD.fullmatch(text):
+            return None
+        return Fraction(text)
+
+    low, high = bound(parts[0]), bound(parts[1])
+    step = bound(parts[2]) if len(parts) == 3 else None
+    if step is not None and step <= 0:
+        step = None
+    return low, high, step
+
+
+def _round_and_range_check(number: Fraction, format_: Any, current: Any) -> tuple:
+    """Round to the format's step, then check min/max (convention.md:397-413).
+
+    The step base is ``min``, else ``max``, else the property's current value;
+    with none of them there is nothing to round against and the value stands.
+    Rounding is ``floor(x + 0.5)`` so it always goes up, as :408-413 recommend.
+    Returns ``(rounded, problem)``.
+    """
+    low, high, step = _numeric_format(format_)
+    if step is not None:
+        base = low if low is not None else high
+        if base is None and isinstance(current, numbers.Real) and not isinstance(current, bool):
+            if math.isfinite(current):
+                base = Fraction(current)
+        if base is not None:
+            number = math.floor((number - base) / step + Fraction(1, 2)) * step + base
+    if low is not None and number < low:
+        return None, "belowMin"
+    if high is not None and number > high:
+        return None, "aboveMax"
+    return number, None
+
+
+def _parse_set_payload(text: str, datatype: Any, format_: Any, current: Any) -> tuple:
+    """Validate an inbound ``/set`` payload for ``datatype``.
+
+    Returns ``(value, None)`` with the value to hand the set callback, or
+    ``(None, problem)``. The value is the payload text for every datatype but
+    ``json`` (the decoded array or object) and ``string`` (with ``0x00`` decoded
+    to ``""``). A number that step rounding changed is handed over in its
+    rounded payload form.
+    """
+    if datatype == PropertyDatatype.JSON:
+        return _decode_json_container(text)
+    if datatype == PropertyDatatype.INTEGER:
+        if not _INTEGER_PAYLOAD.fullmatch(text) or not _INT64_MIN <= int(text) <= _INT64_MAX:
+            return None, "integerGrammar"
+        rounded, problem = _round_and_range_check(Fraction(int(text)), format_, current)
+        if problem:
+            return None, problem
+        if rounded.denominator != 1:
+            return None, "integerStepNotWhole"
+        return (text if rounded == int(text) else str(int(rounded))), None
+    if datatype == PropertyDatatype.FLOAT:
+        if not _FLOAT_PAYLOAD.fullmatch(text) or not math.isfinite(float(text)):
+            return None, "floatGrammar"
+        number = Fraction(text)
+        rounded, problem = _round_and_range_check(number, format_, current)
+        if problem:
+            return None, problem
+        return (text if rounded == number else _format_float(float(rounded))), None
+    if datatype == PropertyDatatype.BOOLEAN:
+        return (text, None) if text in ("true", "false") else (None, "booleanGrammar")
+    if datatype == PropertyDatatype.ENUM:
+        allowed = _enum_values(format_)
+        if text == "" or (allowed is not None and text not in allowed):
+            return None, "enumNotInFormat"
+        return text, None
+    if datatype == PropertyDatatype.COLOR:
+        problem = _check_color_payload(text, format_)
+        return (None, problem) if problem else (text, None)
+    if datatype == PropertyDatatype.DURATION:
+        return _encode_duration(text)
+    if datatype == PropertyDatatype.DATETIME:
+        return (text, None) if text else (None, "datetimeEmpty")
+    # string, and a missing or unknown datatype (already warned about).
+    return decode_empty_string(text), None
+
+
+def _subscribe_supports_with_retain(mqttc: Any) -> bool:
+    """Whether ``mqttc.subscribe`` takes ``with_retain`` (ebus-mqtt-client with #24).
+
+    Only a parameter of that name counts: a transport taking ``**kwargs`` may not
+    deliver the flag.
+    """
+    try:
+        return "with_retain" in inspect.signature(mqttc.subscribe).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def sanitize_homie_id(value: Optional[str]) -> str:
     """Coerce an arbitrary string to a Homie-legal id segment (a-z, 0-9, -).
 
@@ -759,6 +866,10 @@ class Property:
         self._retained = bool(retained)
         self._unit = unit
         self._supports_target = supports_target
+        if supports_target:
+            # $target is not implemented (publish_target_value() is a stub), so a
+            # property must never use it (convention.md:333).
+            logger.warning(f"reason=propertySupportsTargetInert,propertyID={id},hint=$target is not implemented")
         self._node = node
         self._device = device
         self.async_loop = async_loop
@@ -1114,6 +1225,7 @@ class Property:
         """
         The $target attribute must either be used for every value update (including the initial one), or it must never be used.
         TODO: Currently unimplemented, TBD how $target gets set on initial property value set...
+        Nothing in the SDK calls this; ``supports_target=True`` is inert.
         """
         logger.info(f"reason=propertyPublishTargetValue,propertyID={self._id},value={payload}")
         logger.warning(f"reason=propertyPublishTargetValueNotImplemented,propertyID={self._id},value={payload}")
@@ -1343,13 +1455,27 @@ class Property:
             property["unit"] = self._unit
         return property
 
-    def _settable_callback(self, topic: str, payload: Union[bytes, bytearray]) -> None:
+    def _settable_callback(self, topic: str, payload: Union[bytes, bytearray], retained: Optional[bool] = None) -> None:
         """
         For each settable property, there is a property/set topic that can be published to
         This is the callback for the subscription to each such property/set topic
         Examples:
         [homieDomain]/[homieVerson]/[deviceID]/[nodeID]/mode/set
         [homieDomain]/[homieVerion]/[deviceID]/[nodeID]/setpoint/set
+
+        ``retained`` is the MQTT retain flag, delivered when the transport supports
+        ``subscribe(..., with_retain=True)``. A retained ``/set`` is a stale command
+        the broker replays at subscribe time (controllers publish ``/set``
+        non-retained only, convention.md:48, :483), so it is ignored.
+
+        The payload is validated for the datatype before the callback runs, and an
+        invalid one is dropped with a ``reason=propertySetRejected`` warning: json
+        must be an array or object (and match a ``$format`` JSONschema when one can
+        be checked), integer and float must follow the payload grammar, a number is
+        rounded to the format's step and then checked against min/max
+        (convention.md:399), an enum must be in ``$format``, a boolean must be
+        ``true`` or ``false``. The ``0x00`` empty-string decoding applies to string
+        properties only.
         """
         logger.debug(f"reason=propertySetCallback,topic={topic}")
         try:
@@ -1370,6 +1496,9 @@ class Property:
         ):
             logger.debug(f"reason=nodeSetCallbackInvalidTopic,topic={topic}")
             return
+        if retained:
+            logger.warning(f"reason=propertySetRetainedIgnored,propertyID={property_id},topic={topic}")
+            return
         # It is possible that we have a valid property/set
         set_callback = self.get_set_callback()
         if not self.settable():
@@ -1379,28 +1508,26 @@ class Property:
             logger.info(f"reason=propertySetCallbackPropertyNoSetCallback,propertyID={property_id}")
             return
         try:
-            decoded_payload = payload.decode("utf-8")  # do we need to str() this?
-            # Homie 5: a single 0x00 byte on /set denotes an empty-string value.
-            decoded_payload = decode_empty_string(decoded_payload)
-            if self.is_json_datatype():
-                payload = json.loads(decoded_payload)
+            decoded_payload = payload.decode("utf-8")
+            value, problem = _parse_set_payload(decoded_payload, self._datatype, self._format, self._value)
+            if problem is None and self.is_json_datatype():
                 # Validate the decoded command against the property's $format
-                # JSONSchema (its advertised control surface). Reject an invalid
-                # command rather than acting on it. Graceful: skipped if there is
-                # no $format or the jsonschema package is not installed.
-                error = validate_json_format(payload, self._format)
+                # JSONSchema (its advertised control surface). Graceful: skipped if
+                # there is no $format or the jsonschema package is not installed.
+                error = validate_json_format(value, self._format)
                 if error is not None:
-                    logger.warning(f"reason=propertySetRejectedSchemaInvalid,propertyID={property_id},error={error}")
-                    return
-            else:
-                payload = decoded_payload
+                    problem = f"schemaInvalid:{error}"
+            if problem is not None:
+                logger.warning(
+                    f"reason=propertySetRejected,propertyID={property_id},datatype={self._datatype},"
+                    f"problem={problem},payload={decoded_payload!r}"
+                )
+                return
+            payload = value
             # We have the payload
             logger.debug(
                 f"reason=propertySetCallbackValue,propertyID={property_id},payload={payload},callback={set_callback}"
             )
-            if self.supports_target():
-                # Property supports_target, publish that!
-                self.publish_target_value(payload)
             # Call the property's set_callback function
             # Run the callback: a sync callback runs inline here (on the transport's
             # network thread, as before); an async (coroutine) callback is scheduled onto
@@ -1454,7 +1581,12 @@ class Property:
             return
         topic = f"{self._homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{self._id}/set"
         try:
-            mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos)
+            if _subscribe_supports_with_retain(mqttc):
+                # Deliver the retain flag so a stale retained /set is ignored.
+                mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos, with_retain=True)
+            else:
+                logger.debug(f"reason=propertySetSubscribeNoRetainFlag,id={self._id},hint=retained /set not detected")
+                mqttc.subscribe(topic, param=partial(self._settable_callback), qos=self._qos)
         except Exception as e:
             logger.warning(f"reason=propertySetSubscribeSubscribeException,e={e}")
         # Start the MQTT client loop() thread
