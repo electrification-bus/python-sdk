@@ -457,6 +457,11 @@ class UtilityMeterAdapter:
         self._homie_device: Optional[homie.Device] = None
         self._create_device_and_nodes()
 
+    def stop(self) -> None:
+        """Announce `disconnected` for the meter and disconnect cleanly."""
+        if self._homie_device is not None:
+            self._homie_device.stop()
+
     @staticmethod
     def load_broker_config(config_file: str) -> Dict[str, Any]:
         with open(config_file, "r") as fp:
@@ -832,10 +837,9 @@ def main():
         sys.exit(2)
 
     # Wire it up. Constructing the adapter creates the Homie device, its
-    # capability nodes, and starts the MQTT client (side effects we rely on);
-    # nothing else references it, so we don't bind the instance.
+    # capability nodes, and starts the MQTT client.
     meter = UtilityMeter(meter_cfg, logger=_make_logger("UtilityMeter"))
-    UtilityMeterAdapter(
+    adapter = UtilityMeterAdapter(
         meter,
         device_id=device_id,
         device_name=device_name,
@@ -851,8 +855,13 @@ def main():
         DEVICE_TYPE,
     )
 
-    # Wait forever for an event that will never come
-    threading.Event().wait()
+    # Wait until Ctrl-C, then shut down cleanly: stop() publishes
+    # $state=disconnected before disconnecting.
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        adapter.stop()
+        raise
 
 
 if __name__ == "__main__":

@@ -138,14 +138,20 @@ def main() -> None:
     logger = logging.getLogger("simple-tree-device")
 
     mqtt_cfg = load_broker_config(config_file)
-    build_tree(mqtt_cfg, logger)
+    panel = build_tree(mqtt_cfg, logger)
 
     if args.check:
         logger.info("check mode: tree built, exiting")
         return
 
     logger.info("tree is live; Ctrl-C to exit. Watch it with: mosquitto_sub -t 'ebus/5/#' -v")
-    threading.Event().wait()
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        # stop() is tree-level: every device announces `disconnected`, children
+        # first and the root last, before the clean disconnect.
+        panel.stop()
+        raise
 
 
 if __name__ == "__main__":

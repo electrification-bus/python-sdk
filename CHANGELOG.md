@@ -27,6 +27,7 @@ Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com
 - A `/set` delivered with the retain flag is ignored with a warning: it is a stale command replayed at subscribe time (:48, :483). This uses `subscribe(..., with_retain=True)` from ebus-mqtt-client 0.7.0 ([electrification-bus/ebus-mqtt-client#24](https://github.com/electrification-bus/ebus-mqtt-client/issues/24)); with an older client, or an injected transport without that parameter, the check is skipped and a debug line says so. The dependency floor is unchanged.
 - `supports_target=True` is inert: one warning at construction, and `/set` no longer calls the `$target` stub, which ran before the payload was accepted (:466, :470).
 - `.ebus-spec.json` no longer lists `mdns-discovery` under `supports`; the library has no mDNS code.
+- `examples/simple-device`, `simple-tree-device` and `utility-meter` call `stop()` on Ctrl-C. They exited without it, so the broker published the Last Will and the tree was left with its root `lost` and its children `ready`.
 
 ### Added
 
@@ -36,7 +37,7 @@ Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com
 
 ### Fixed
 
-- `delete()` followed by `stop()` re-created the deleted device as a bare `$state=disconnected` with no `$description` (:272, :288). After `delete()` the root's `stop()` announces nothing and disconnects cleanly in either mode, and a reconnect's `refresh_tree()` republishes nothing.
+- `delete()` followed by `stop()` re-created the deleted device as a bare `$state=disconnected` with no `$description` (:272, :288). After `delete()` the root's `stop()` announces nothing, flushes `delete()`'s retained clears and disconnects cleanly in either mode, and a reconnect's `refresh_tree()` republishes nothing.
 
 ## [0.24.0] — 2026-10-03
 

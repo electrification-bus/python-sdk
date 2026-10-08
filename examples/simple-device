@@ -193,6 +193,10 @@ class ExampleDeviceAdapter:
             )
         return homie_node
 
+    def stop(self) -> None:
+        """Announce `disconnected` for the device and disconnect cleanly."""
+        self._homie_device.stop()
+
     def create_device_and_nodes(self):
         self._homie_device = self.create_homie_device()
         self.add_homie_environment_node()
@@ -238,9 +242,14 @@ def main():
     example_device_logger.info(f"\n{pformat(example_device.as_dict())}")
     example_device_adapter = ExampleDeviceAdapter(example_device, mqtt_cfg, logger=example_device_adapter_logger)
     example_device_adapter_logger.info(f"\n{pformat(example_device_adapter.as_dict())}")
-    # Wait forever for event that will never come
-    event = threading.Event()
-    event.wait()
+    # Wait until Ctrl-C, then shut down cleanly: stop() publishes
+    # $state=disconnected before disconnecting, where an exit without it leaves
+    # the broker to publish the Last Will (`lost`).
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        example_device_adapter.stop()
+        raise
 
 
 if __name__ == "__main__":
