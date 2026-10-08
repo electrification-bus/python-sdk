@@ -4,7 +4,9 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
-Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com/electrification-bus/python-sdk/issues/95), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)). Line numbers refer to [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md).
+## [0.25.0] — 2026-10-08
+
+Homie 5 compliance, phase 1: producer wire correctness ([#95](https://github.com/electrification-bus/python-sdk/issues/95), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)); and a `Controller` that paces its subscriptions so the broker no longer drops retained messages ([#97](https://github.com/electrification-bus/python-sdk/issues/97)). Line numbers refer to [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md).
 
 ### Changed
 
@@ -453,7 +455,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.25.0
 [0.24.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.24.0
 [0.23.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.1
 [0.23.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.0
