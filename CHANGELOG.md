@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- `utility-meter` adds `homie_domain`, `homie_version` and `homie_roles` to its `_ebus._tcp` advertisement, from the domain its Homie device publishes under. The `mdns` extra requires `ebus-service-discovery[zeroconf]>=0.5.1`, which added those keys (electrification-bus/python-service-discovery#8).
+
 ## [0.26.0] — 2026-10-09
 
 Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.5.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)); requires ebus-mqtt-client 0.8.0.

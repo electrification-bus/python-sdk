@@ -37,7 +37,7 @@ Add `--discover` to find the broker over mDNS, with [`ebus-service-discovery`](h
 ./utility-meter --config ./utility-meter-cfg.example.json --broker-config /path/to/broker-cfg.json --discover
 ```
 
-With the `mdns` extra installed, the meter also advertises `_ebus._tcp` and `_device-info._tcp` (role `device`; manufacturer, model, serial number and firmware version from the config's `info`), as the eBus framework requires of every entity. `--no-advertise` turns this off. On a host with several network interfaces, see [electrification-bus/python-service-discovery#3](https://github.com/electrification-bus/python-service-discovery/issues/3).
+With the `mdns` extra installed, the meter also advertises `_ebus._tcp` and `_device-info._tcp` (role `device`; manufacturer, model, serial number and firmware version from the config's `info`; `homie_domain`, `homie_version` and `homie_roles` from its Homie device), as the eBus framework requires of every entity. `--no-advertise` turns this off. On a host with several interfaces on one subnet, the advertisement uses one of them and moves to another if that one goes down (ebus-service-discovery's default `interfaces="one-per-subnet"`).
 
 Set a DOE envelope at runtime. The body is a single envelope object or an array of them (the retained schedule); it is set atomically as one `json` value:
 

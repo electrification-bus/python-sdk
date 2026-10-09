@@ -72,7 +72,7 @@ dependencies = [
 [project.optional-dependencies]
 # mDNS broker discovery and _ebus._tcp advertising for the examples, through
 # ebus-service-discovery (which brings zeroconf).
-mdns = ["ebus-service-discovery[zeroconf]>=0.5.0"]
+mdns = ["ebus-service-discovery[zeroconf]>=0.5.1"]
 # Optional: JSONSchema validation of `json`-datatype property `$format`. Absent
 # it, the SDK still runs and $format validation is gracefully skipped (with a
 # one-time warning). Kept optional so a constrained build (e.g. Yocto) can omit
