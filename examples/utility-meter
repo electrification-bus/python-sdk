@@ -463,6 +463,10 @@ class UtilityMeterAdapter:
         if self._homie_device is not None:
             self._homie_device.stop()
 
+    def homie_domain(self) -> str:
+        """The Homie domain the meter publishes under."""
+        return self._homie_device.homie_domain()
+
     @staticmethod
     def load_broker_config(config_file: str) -> Dict[str, Any]:
         with open(config_file, "r") as fp:
@@ -752,8 +756,11 @@ def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logg
     return None
 
 
-def _identity_from_info(device_id: str, info: Dict[str, Any]):
-    """The `_ebus._tcp` / `_device-info._tcp` identity from the meter's `info` config."""
+def _identity_from_info(device_id: str, info: Dict[str, Any], homie_domain: str):
+    """The `_ebus._tcp` / `_device-info._tcp` identity from the meter's `info` config.
+
+    `homie_domain` adds the `homie_domain`, `homie_version` and `homie_roles` TXT keys.
+    """
     from ebus_service_discovery.ebus import Identity
 
     return Identity(
@@ -764,10 +771,11 @@ def _identity_from_info(device_id: str, info: Dict[str, Any]):
         serial_number=str(info.get("serial-number") or device_id),
         fw_version=str(info["firmware-version"]) if info.get("firmware-version") else None,
         device_type=DEVICE_TYPE,
+        homie_domain=homie_domain,
     )
 
 
-def _start_advertiser(device_id: str, info: Dict[str, Any], log: logging.Logger):
+def _start_advertiser(device_id: str, info: Dict[str, Any], homie_domain: str, log: logging.Logger):
     """Advertise `_ebus._tcp` and `_device-info._tcp` (framework.md requirement 6).
 
     Returns the running `mdns.Advertiser`, or None when the `mdns` extra is not
@@ -779,9 +787,7 @@ def _start_advertiser(device_id: str, info: Dict[str, Any], log: logging.Logger)
         log.warning("reason=advertiseSkipped,detail=mdns extra not installed (pip install 'ebus-sdk[mdns]')")
         return None
     try:
-        # Named for the device: on macOS the OS already advertises a
-        # `_device-info._tcp` instance under the host label, the default name.
-        advertiser = mdns.Advertiser(_identity_from_info(device_id, info), instance_name=device_id).start()
+        advertiser = mdns.Advertiser(_identity_from_info(device_id, info, homie_domain)).start()
     except Exception as exc:
         log.warning("reason=advertiseFailed,error=%s", exc)
         return None
@@ -894,7 +900,11 @@ def main():
     )
     start_doe_endpoint(meter, args.doe_port)
     start_tick_thread(meter, args.tick_interval)
-    advertiser = None if args.no_advertise else _start_advertiser(device_id, meter_cfg.get("info", {}), log)
+    advertiser = (
+        None
+        if args.no_advertise
+        else _start_advertiser(device_id, meter_cfg.get("info", {}), adapter.homie_domain(), log)
+    )
 
     log.info(
         "reason=utilityMeterReady,deviceId=%s,deviceType=%s",
