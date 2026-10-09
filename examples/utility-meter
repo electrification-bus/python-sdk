@@ -714,8 +714,10 @@ def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logg
     `use_tls` (the host is the advertised `broker` TXT value, the name the
     broker's certificate covers, else the SRV target), or None when no broker
     is found within `timeout` seconds. A TLS config accepts only
-    `_secure-mqtt._tcp`. When the config names a `host`, a discovered broker
-    with that host is preferred among several. Requires the `mdns` extra.
+    `_secure-mqtt._tcp`. When the config names a `host`, only a discovered
+    broker that is that host is used (another broker never receives this
+    config's credentials); otherwise the first ranked broker. Requires the
+    `mdns` extra.
     """
     try:
         from ebus_service_discovery import mdns
@@ -723,8 +725,8 @@ def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logg
             SECURE_MQTT_SERVICE,
             TCP_BROKER_TYPES,
             BrokerEndpoint,
+            match_configured,
             rank_brokers,
-            select_broker,
         )
     except ImportError:
         log.error("discovery needs the 'mdns' extra: pip install 'ebus-sdk[mdns]'")
@@ -740,8 +742,11 @@ def _discover_broker(mqtt_cfg: Dict[str, Any], timeout: float, log: logging.Logg
         while (remaining := deadline - time.monotonic()) > 0:
             found = mdns.browse_many(accept, min(3.0, remaining), zc)
             usable = rank_brokers((BrokerEndpoint.from_instance(i) for i in found), accept=accept)
-            if usable:
-                return select_broker("discovery-with-fallback", configured, usable).mqtt_cfg(mqtt_cfg)
+            chosen = usable[0] if configured is None and usable else None
+            if configured is not None:
+                chosen = match_configured(configured, usable)
+            if chosen is not None:
+                return chosen.mqtt_cfg(mqtt_cfg)
     finally:
         zc.close()
     return None

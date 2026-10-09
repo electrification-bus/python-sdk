@@ -4,7 +4,7 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
-Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.4.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)).
+Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.5.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)).
 
 ### Added
 
@@ -12,8 +12,8 @@ Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-
 
 ### Changed
 
-- The `mdns` extra installs `ebus-service-discovery[zeroconf]>=0.4.0` in place of `zeroconf>=0.131.0`. zeroconf still comes with it, as a dependency of that package.
-- `utility-meter --discover` finds the broker with `ebus-service-discovery` (`mdns.browse_many()`, `ebus.rank_brokers()`, `ebus.select_broker()`). A plain (non-TLS) broker config now also accepts `_mqtt._tcp`; a TLS config still accepts only `_secure-mqtt._tcp`. `use_tls` follows the discovered service type, and when the config names a `host`, a discovered broker with that host is preferred among several. The fallback to the config's `host` after `--discover-timeout` seconds is unchanged.
+- The `mdns` extra installs `ebus-service-discovery[zeroconf]>=0.5.0` in place of `zeroconf>=0.131.0`. zeroconf still comes with it, as a dependency of that package.
+- `utility-meter --discover` finds the broker with `ebus-service-discovery` (`mdns.browse_many()`, `ebus.rank_brokers()`, `ebus.match_configured()`). A plain (non-TLS) broker config now also accepts `_mqtt._tcp`; a TLS config still accepts only `_secure-mqtt._tcp`. `use_tls` follows the discovered service type, and when the config names a `host`, only a discovered broker that is that host is used, so another broker never receives the config's credentials. The fallback to the config's `host` after `--discover-timeout` seconds is unchanged.
 - `simple-span-controller` accepts only the `_secure-mqtt._tcp` advertisement whose SRV target is `span-<serial>.local` (it matched a substring of the target before, and also browsed `_mqtt._tcp`), and connects by that host name instead of the first IPv4 address. When this host cannot resolve `.local` names, it connects to the panel's most-preferred advertised address.
 
 ## [0.25.0] — 2026-10-08
