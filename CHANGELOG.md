@@ -4,7 +4,9 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
-Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.5.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)).
+## [0.26.0] — 2026-10-09
+
+Adopts [`ebus-service-discovery`](https://github.com/electrification-bus/python-service-discovery) 0.5.0 for mDNS ([#100](https://github.com/electrification-bus/python-sdk/issues/100)); requires ebus-mqtt-client 0.8.0.
 
 ### Added
 
@@ -468,7 +470,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.26.0
 [0.25.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.25.0
 [0.24.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.24.0
 [0.23.1]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.23.1
