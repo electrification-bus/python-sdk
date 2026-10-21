@@ -754,3 +754,38 @@ def test_the_latch_is_dropped_with_the_device(root):
     box["id"] = "bess-2"
     rebuilt = builder.add(spec)
     assert rebuilt.id() == "bess-2"
+
+
+# --- A built device always announces ----------------------------------------
+
+
+def _states_of(mock_paho, device_id):
+    return [
+        c.args[1] for c in mock_paho.publish.call_args_list if c.args and c.args[0].endswith(f"/{device_id}/$state")
+    ]
+
+
+@pytest.mark.parametrize("seed_model", [False, True])
+def test_a_device_with_only_internal_properties_still_announces(root, mock_paho, seed_model):
+    model = GroupedPropertyDict()
+    if seed_model:
+        # The model already holds the property, so nothing is left to create.
+        model.create_group("bess-1")
+        model.add_property("bess-1", ObservableProperty("raw", 0, int))
+    builder = DeviceTreeBuilder(root, model)
+    spec = PropertySpec("info", "raw", PropertyDatatype.INTEGER, internal_only=True)
+
+    bess = builder.add(DeviceSpec("bess", [spec], device_id="bess-1"))
+
+    assert _states_of(mock_paho, "bess-1") == ["init", "ready"]
+    assert bess.nodes() == {}
+    assert "bess-1" in root.description()["children"]
+
+
+def test_a_device_with_no_specs_still_announces(root, mock_paho):
+    builder = DeviceTreeBuilder(root, GroupedPropertyDict())
+
+    builder.add(DeviceSpec("bess", [], device_id="bess-1"))
+
+    assert _states_of(mock_paho, "bess-1") == ["init", "ready"]
+    assert "bess-1" in root.description()["children"]

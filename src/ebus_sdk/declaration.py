@@ -641,15 +641,19 @@ class DeviceTreeBuilder:
         self._created_groups[device_id] = []
 
         group = spec.resolve_model_group(device_id)
-        built = _materialize(
-            device,
-            self._model,
-            spec.specs,
-            node_type=self._node_type,
-            node_name=self._node_name,
-            node_id=self._node_id,
-            default_group=group,
-        )
+        # Always a transition: a device built without nodes publishes nothing until
+        # its first one, and a spec that creates no node (internal-only, or none at
+        # all) must still announce the device, empty.
+        with device.state_transition():
+            built = _materialize(
+                device,
+                self._model,
+                spec.specs,
+                node_type=self._node_type,
+                node_name=self._node_name,
+                node_id=self._node_id,
+                default_group=group,
+            )
         _seed(self._model, built.declared, default_group=group)
 
         self._homie_props[device_id].update(built.homie_props)
