@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-21
+
+A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.
+
 ### Changed
 
 - A `Device` built without `nodes=` publishes nothing until its first `state_transition()` or `add_node()`, so that is its only `init`, values, `$description`, `ready` cycle. It published `init`, a `$description` with no nodes and `ready` at construction, so a caller populating it in its own transition produced two cycles, and `ready` was announced before any value (convention.md:279). A child joins its parent's `children`, and the parent publishes `init`, the new `$description` and `ready`, after the child's first `ready`; the parent did this at construction (:620-629). A child built inside an ancestor's open `state_transition()` and never populated is announced, empty, when that transition closes. Until its first announcement a device is skipped by `refresh_tree()` and the connect republish, gets no `disconnected` from `stop()`, and its `delete()` does not re-announce the parent. A device built with `nodes=` is unchanged. Code that relied on a bare `Device(...)` being `ready` must now open a `state_transition()` on it.
@@ -475,7 +479,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.27.0
 [0.26.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.26.0
 [0.25.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.25.0
 [0.24.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.24.0
