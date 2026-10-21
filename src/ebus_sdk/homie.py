@@ -2017,6 +2017,14 @@ class Device:
     Children share the root's single MQTT connection. Only the root registers
     a Last Will so the entire tree is marked lost on adapter death.
 
+    A device built without ``nodes=`` publishes nothing until its first
+    ``state_transition()`` (or its first ``add_node()``), which is then its only
+    init, values, ``$description``, ready cycle. A child joins its parent's
+    ``children`` after that first ready, and the parent re-announces then. A child
+    built inside an ancestor's open transition and never populated is announced,
+    empty, when that transition closes. A device built with ``nodes=`` announces
+    at construction.
+
     mqtt_cfg is a dict, two examples:
 
         {"host": "127.0.0.1",
@@ -2201,6 +2209,8 @@ class Device:
         # entry/exit publishes INIT/READY). Init→ready transitions force every controller
         # in the wild to resync, so emitting only the minimum is a correctness concern.
         self._transition_depth = 0
+        # True while the outermost open transition is this device's first.
+        self._first_announcement = False
         # Set by delete(): the device no longer exists on the broker, so nothing may
         # republish its $state (stop(), a reconnect's refresh_tree(), the will).
         self._deleted = False
@@ -2221,15 +2231,22 @@ class Device:
                 self.connect_broker()
         else:
             parent._children.append(self)
-        # Child's own INIT → publish description+nodes → READY (Homie add-child steps 1-3).
-        with self.state_transition():
-            for node in nodes or []:
-                self.add_node(node)
-        # Homie add-child steps 4-6: parent INIT → publish description (now includes self in
-        # `children`) → READY. Skipped if parent is mid-transition — in that case the parent's
-        # own state_transition will publish the updated description on exit (S1: 32 adds → 1 flap).
-        if parent is not None:
-            parent._notify_structural_change()
+        # A device built inside an ancestor's open state_transition() and never
+        # populated is announced, empty, when that ancestor's transition closes.
+        self._announce_with_parent = False
+        ancestor = parent
+        while ancestor is not None and not self._announce_with_parent:
+            self._announce_with_parent = ancestor._transition_depth > 0
+            ancestor = ancestor.parent()
+        # Without nodes the device publishes nothing until the caller's first
+        # transition, so that transition is its only init -> values ->
+        # $description -> ready cycle (convention.md:279). With nodes it announces
+        # now, and on its first ready a child triggers the parent's add-child
+        # update (convention.md:620-629; see _end_state_transition).
+        if nodes:
+            with self.state_transition():
+                for node in nodes:
+                    self.add_node(node)
 
     def as_dict(self) -> dict:
         nodes = {}
@@ -2410,7 +2427,8 @@ class Device:
         """Gracefully and promptly tear down this device tree's MQTT connection.
 
         Publishes a final ``$state=disconnected`` for EVERY device in the tree
-        (best-effort), descendants first and the root last, then stops the root's
+        that has announced itself (best-effort), descendants first and the root
+        last, then stops the root's
         MQTT client with a clean disconnect. Homie 5 requires a device to send
         ``disconnected`` before it cleanly disconnects (convention.md:280-281), and
         children share the root's connection, so each of them disconnects too; the
@@ -2475,6 +2493,9 @@ class Device:
             # moves live inside this branch, so announce=False cannot overwrite a
             # $state a caller just declared.
             for device in root._tree_post_order():
+                if device._state is None:
+                    # Never announced: a `disconnected` would create it bare.
+                    continue
                 device._state = DeviceState.DISCONNECTED
                 state_topic = f"{root.homie_domain()}/{EBUS_HOMIE_VERSION_MAJOR}/{device._id}/$state"
                 if device is root and owned:
@@ -2604,7 +2625,8 @@ class Device:
         for node_id, node in nodes_snapshot.items():
             nodes_descriptions[node_id] = node.description()
         description["nodes"] = nodes_descriptions
-        description["children"] = self.children_ids()
+        # A child joins `children` once it has announced itself (convention.md:620-629).
+        description["children"] = [child.id() for child in self._children if child._state is not None]
         if self._parent is not None:
             # Required if the device is NOT the root device, MUST be omitted otherwise.
             description["root"] = self.root().id()
@@ -2842,7 +2864,8 @@ class Device:
             # The child keeps its _parent link until its topics are cleared: the
             # topic domain and the MQTT client are both resolved through the root.
             parent._children.remove(self)
-            parent._notify_structural_change()
+            if self._state is not None:
+                parent._notify_structural_change()
         # Step 2: clear the subtree leaves first, so no device is seen whose parent
         # is already gone. Each device's $state goes before its other topics, so it
         # ceases to exist first (convention.md:287-289).
@@ -2905,6 +2928,7 @@ class Device:
         self._transition_depth += 1
         logger.info(f"reason=deviceBeginStateTransition,deviceId={self._id},depth={self._transition_depth}")
         if self._transition_depth == 1:
+            self._first_announcement = self._state is None
             self.set_state(DeviceState.INIT)
 
     def _end_state_transition(self) -> None:
@@ -2918,12 +2942,24 @@ class Device:
         """
         logger.info(f"reason=deviceEndStateTransition,deviceId={self._id},depth={self._transition_depth}")
         if self._transition_depth == 1:
+            # Still inside the scope, so each child's first ready does not
+            # re-announce this device; the description below names them.
+            for child in list(self._children):
+                if child._state is None and child._announce_with_parent and not child._deleted:
+                    with child.state_transition():
+                        pass
             # Leave the transition scope BEFORE the consolidated publish so that
             # final, intended $description is not suppressed by the in-transition
             # defer guard in publish_description() (SDK-9ps).
             self._transition_depth = 0
             self.publish_description()
             self.set_state(DeviceState.READY)
+            first, self._first_announcement = self._first_announcement, False
+            if first and self._parent is not None:
+                # Homie add-child steps 4-6 (convention.md:620-629): parent init,
+                # $description now naming this device, ready. Deferred to the
+                # parent's own exit when it is mid-transition.
+                self._parent._notify_structural_change()
         else:
             self._transition_depth -= 1
 
@@ -2935,14 +2971,17 @@ class Device:
         in which case the in-progress transition will publish on exit and
         we suppress the per-change flap (S1: many children, one parent cycle).
 
-        Safe to call before the device has been transitioned to READY at all
-        (state is None) — in that case we just publish the description with
-        no state flap.
+        On a device that has not announced itself yet (state None), the change
+        is its first announcement: init, $description, ready.
         """
         if self._transition_depth > 0:
             logger.debug(
                 f"reason=deviceStructuralChangeSuppressed,deviceId={self._id},transitionDepth={self._transition_depth}"
             )
+            return
+        if self._state is None and not self._deleted:
+            with self.state_transition():
+                pass
             return
         # publish_description() wraps the change in INIT when the device is ready
         # or sleeping, and publishes it directly otherwise.
@@ -2971,12 +3010,23 @@ class Device:
         values it vouches for. A change that leaves the ``$description`` as last
         published (a node not attached to the device, an identical re-declaration)
         runs the body with no ``init``/``ready`` flap (convention.md:616). Inside an
-        open transition the change joins it. In any other state (not yet announced,
-        ``init``, ``disconnected``, ``lost``) the body and the new ``$description``
-        are published directly.
+        open transition the change joins it. On a device not yet announced (state
+        None) a change that leaves it with nodes runs as its first
+        ``state_transition()``. In any other state (``init``, ``disconnected``,
+        ``lost``) the body and the new ``$description`` are published directly.
         """
         if self._transition_depth > 0:
             yield
+            return
+        if self._state is None and not self._deleted:
+            # Not announced yet: a change that gives the device nodes is its first
+            # announcement, and one that leaves it without nodes publishes nothing
+            # for it.
+            if self._nodes:
+                with self.state_transition():
+                    yield
+            else:
+                yield
             return
         prior = self._state
         if prior not in (DeviceState.READY, DeviceState.SLEEPING) or not self._description_changed():
@@ -3033,6 +3083,11 @@ class Device:
         if self._deleted:
             # delete() removed this device; republishing would re-create it.
             logger.info(f"reason=deviceRefreshTreeDeletedSkipped,deviceId={self._id}")
+            return
+        if self._state is None:
+            # Not announced yet: there is nothing of this device to restore, and a
+            # republish would put a $description with no $state on the broker.
+            logger.info(f"reason=deviceRefreshTreeUnannouncedSkipped,deviceId={self._id}")
             return
         logger.info(
             f"reason=deviceRefreshTree,deviceId={self._id},"
@@ -3281,9 +3336,10 @@ class Device:
 
         The initial connect must be as complete as a reconnect because the
         broker connection is asynchronous (ebus-mqtt-client connect_async): a
-        root Device can be constructed while the broker is briefly unavailable,
-        in which case the construction-time state_transition publishes
+        root Device can be built and populated while the broker is briefly
+        unavailable, in which case its first state_transition's publishes
         ($state=init -> $description -> $state=ready) never reached the broker.
+        A tree that has not announced itself yet publishes nothing here.
         Publishing only node values here (the earlier behavior) would then leave
         a HALF-PUBLISHED device — nodes present but $state/$description missing —
         which a Homie consumer sees as broken. refresh_tree() also recurses to

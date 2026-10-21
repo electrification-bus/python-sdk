@@ -49,7 +49,17 @@ def _make_device(mock_paho, device_id="test-device", **kwargs):
             mqtt_cfg={"host": "localhost", "port": 1883},
             **kwargs,
         )
+        # A device built without nodes publishes nothing until its first transition.
+        with device.state_transition():
+            pass
         return device, mock_client
+
+
+def _announced(device):
+    """Run the device's first transition, as a caller populating it does."""
+    with device.state_transition():
+        pass
+    return device
 
 
 def _make_wired_property(mock_client, device_id="dev1", node_id="node1", **prop_kwargs):
@@ -1340,7 +1350,7 @@ class TestChildLifecycleProtocol:
         assert panel.state() == DeviceState.READY
         mock_client.publish.reset_mock()
 
-        Device(id="circuit-1", parent=panel)
+        _announced(Device(id="circuit-1", parent=panel))
 
         # Child completed its own INIT→READY
         circuit_states = _state_payloads_for(mock_client, "circuit-1")
@@ -1382,10 +1392,10 @@ class TestChildLifecycleProtocol:
     def test_add_grandchild_flaps_only_immediate_parent(self, mock_paho):
         """A grandchild add changes the immediate parent's children list, not the root's."""
         panel, mock_client = _make_device(mock_paho, device_id="panel-1")
-        bess = Device(id="bess-1", parent=panel)
+        bess = _announced(Device(id="bess-1", parent=panel))
         mock_client.publish.reset_mock()
 
-        Device(id="mid-1", parent=bess)
+        _announced(Device(id="mid-1", parent=bess))
 
         # bess flaps INIT→READY (its description gained mid-1)
         bess_states = _state_payloads_for(mock_client, "bess-1")
@@ -1398,7 +1408,7 @@ class TestChildLifecycleProtocol:
     def test_delete_child_runs_remove_protocol(self, mock_paho):
         """Deleting a child clears its retained data and flaps the parent."""
         panel, mock_client = _make_device(mock_paho, device_id="panel-1")
-        circuit = Device(id="circuit-1", parent=panel)
+        circuit = _announced(Device(id="circuit-1", parent=panel))
         mock_client.publish.reset_mock()
 
         circuit.delete()
@@ -1503,14 +1513,14 @@ class TestCrossDeviceTransitionCoordination:
     def test_sibling_subtree_transitions_are_independent(self, mock_paho):
         """A transition on one subtree must not flap an unrelated sibling subtree."""
         panel, mock_client = _make_device(mock_paho, device_id="panel-1")
-        bess = Device(id="bess-1", parent=panel)
-        evse = Device(id="evse-1", parent=panel)
+        bess = _announced(Device(id="bess-1", parent=panel))
+        evse = _announced(Device(id="evse-1", parent=panel))
         mock_client.publish.reset_mock()
 
         # Adding a grandchild under bess should flap bess (its description changed)
         # but NOT evse and NOT panel (their children lists are unchanged).
         with bess.state_transition():
-            Device(id="mid-1", parent=bess)
+            _announced(Device(id="mid-1", parent=bess))
 
         bess_states = _state_payloads_for(mock_client, "bess-1")
         assert bess_states == [DeviceState.INIT, DeviceState.READY]
@@ -1817,8 +1827,8 @@ class TestDeviceDescription:
 
     def test_description_parent_lists_child(self, mock_paho):
         root, _ = _make_device(mock_paho, device_id="root-1")
-        Device(id="child-a", parent=root)
-        Device(id="child-b", parent=root)
+        _announced(Device(id="child-a", parent=root))
+        _announced(Device(id="child-b", parent=root))
         desc = root.description()
         assert desc["children"] == ["child-a", "child-b"]
 
@@ -1935,12 +1945,12 @@ class TestDeviceOnConnect:
         assert value_payloads == ["72.5"]
 
     def test_initial_connection_cascades_to_children(self, mock_paho):
-        """A child constructed before the first connect (possible when the
-        broker was down at construction time) must also be fully published when
+        """A child announced before the first connect (possible when the
+        broker was down at that time) must also be fully published when
         that first connect finally arrives — the initial path cascades the whole
         tree exactly like a reconnect."""
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        Device(id="circuit-a", parent=root)
+        _announced(Device(id="circuit-a", parent=root))
         root.initial_broker_connection = True
         mock_client.publish.reset_mock()
 
@@ -2135,8 +2145,8 @@ class TestDeviceRefreshTree:
     def test_refresh_tree_cascades_to_children(self, mock_paho):
         """S6: reconnect republish must touch every device in the tree."""
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        Device(id="circuit-a", parent=root)
-        Device(id="circuit-b", parent=root)
+        _announced(Device(id="circuit-a", parent=root))
+        _announced(Device(id="circuit-b", parent=root))
         mock_client.publish.reset_mock()
 
         root.refresh_tree()
@@ -2163,8 +2173,8 @@ class TestDeviceRefreshTree:
         ``test_refresh_tree_cascades_to_children`` already pins.
         """
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        Device(id="circuit-a", parent=root)
-        Device(id="circuit-b", parent=root)
+        _announced(Device(id="circuit-a", parent=root))
+        _announced(Device(id="circuit-b", parent=root))
         mock_client.publish.reset_mock()
 
         root.refresh_tree()
@@ -2217,8 +2227,8 @@ class TestDeviceRefreshTree:
     def test_refresh_tree_three_levels(self, mock_paho):
         """S2 + S6: grandchildren also republish on reconnect."""
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        bess = Device(id="bess-1", parent=root)
-        Device(id="mid-1", parent=bess)
+        bess = _announced(Device(id="bess-1", parent=root))
+        _announced(Device(id="mid-1", parent=bess))
         mock_client.publish.reset_mock()
 
         root.refresh_tree()
@@ -2242,9 +2252,9 @@ class TestDeviceRefreshTree:
         the cascade is best-effort: the failure is logged and the walk goes on.
         """
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        Device(id="circuit-a", parent=root)
-        bad = Device(id="circuit-bad", parent=root)
-        Device(id="circuit-z", parent=root)
+        _announced(Device(id="circuit-a", parent=root))
+        bad = _announced(Device(id="circuit-bad", parent=root))
+        _announced(Device(id="circuit-z", parent=root))
         bad.refresh_tree = MagicMock(side_effect=RuntimeError("transport exploded"))
         mock_client.publish.reset_mock()
 
@@ -2279,7 +2289,7 @@ class TestDeviceRefreshTree:
     def test_on_connect_reconnect_cascades(self, mock_paho):
         """On reconnect, root.on_connect() walks the whole tree."""
         root, mock_client = _make_device(mock_paho, device_id="panel-1")
-        Device(id="circuit-a", parent=root)
+        _announced(Device(id="circuit-a", parent=root))
         # Flip from initial to reconnect path
         root.initial_broker_connection = False
         mock_client.publish.reset_mock()
@@ -2574,7 +2584,7 @@ class TestDeviceBYOTransport:
     def test_stop_injected_publishes_disconnected_without_flush_or_close(self, mock_paho):
         client = _mock_mqtt_client()
         client.is_connected.return_value = True
-        device = Device(id="panel-1", mqttc=client)
+        device = _announced(Device(id="panel-1", mqttc=client))
 
         client.reset_mock()  # ignore construction-time publishes
         device.stop()

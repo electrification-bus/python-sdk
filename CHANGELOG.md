@@ -6,6 +6,7 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ### Changed
 
+- A `Device` built without `nodes=` publishes nothing until its first `state_transition()` or `add_node()`, so that is its only `init`, values, `$description`, `ready` cycle. It published `init`, a `$description` with no nodes and `ready` at construction, so a caller populating it in its own transition produced two cycles, and `ready` was announced before any value (convention.md:279). A child joins its parent's `children`, and the parent publishes `init`, the new `$description` and `ready`, after the child's first `ready`; the parent did this at construction (:620-629). A child built inside an ancestor's open `state_transition()` and never populated is announced, empty, when that transition closes. Until its first announcement a device is skipped by `refresh_tree()` and the connect republish, gets no `disconnected` from `stop()`, and its `delete()` does not re-announce the parent. A device built with `nodes=` is unchanged. Code that relied on a bare `Device(...)` being `ready` must now open a `state_transition()` on it.
 - `utility-meter` adds `homie_domain`, `homie_version` and `homie_roles` to its `_ebus._tcp` advertisement, from the domain its Homie device publishes under. The `mdns` extra requires `ebus-service-discovery[zeroconf]>=0.5.1`, which added those keys (electrification-bus/python-service-discovery#8).
 
 ## [0.26.0] — 2026-10-09

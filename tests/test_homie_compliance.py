@@ -42,7 +42,17 @@ def _make_root(device_id="root", **kwargs):
         client = _mock_mqtt_client()
         from_config.return_value = client
         device = Device(id=device_id, mqtt_cfg={"host": "localhost", "port": 1883}, **kwargs)
+        # A device built without nodes publishes nothing until its first transition.
+        with device.state_transition():
+            pass
         return device, client
+
+
+def _announced(device):
+    """Run the device's first transition, as a caller populating it does."""
+    with device.state_transition():
+        pass
+    return device
 
 
 def _publishes(client):
@@ -58,8 +68,8 @@ class TestStopAnnouncesEveryDevice:
 
     def test_owned_stop_publishes_disconnected_descendants_first_root_last(self):
         root, client = _make_root()
-        child = Device(id="child", parent=root)
-        Device(id="grandchild", parent=child)
+        child = _announced(Device(id="child", parent=root))
+        _announced(Device(id="grandchild", parent=child))
         client.publish.reset_mock()
 
         root.stop()
@@ -77,7 +87,7 @@ class TestStopAnnouncesEveryDevice:
 
     def test_stop_from_a_child_announces_the_whole_tree(self):
         root, client = _make_root()
-        child = Device(id="child", parent=root)
+        child = _announced(Device(id="child", parent=root))
         client.publish.reset_mock()
 
         child.stop()
@@ -87,8 +97,8 @@ class TestStopAnnouncesEveryDevice:
 
     def test_injected_stop_publishes_disconnected_for_every_device(self):
         client = _mock_mqtt_client()
-        root = Device(id="root", mqttc=client)
-        Device(id="child", parent=root)
+        root = _announced(Device(id="root", mqttc=client))
+        _announced(Device(id="child", parent=root))
         client.reset_mock()
 
         root.stop()
@@ -229,6 +239,172 @@ class TestDeletedDeviceStaysDeleted:
         assert client.publish.call_args_list == []
 
 
+def _populate(device, value=1.5):
+    node = device.new_node("n")
+    device.add_node(node)
+    node.add_property(Property(id="p", value=value, datatype=PropertyDatatype.FLOAT))
+    return node
+
+
+def _wire(client):
+    """Each publish as (topic, payload), with a $description reduced to its `children`."""
+    out = []
+    for topic, payload in _publishes(client):
+        topic = topic[len(BASE) + 1 :]
+        if topic.endswith("/$description") and payload:
+            payload = ("children", json.loads(payload)["children"])
+        out.append((topic, payload))
+    return out
+
+
+class TestConstructionWithoutNodes:
+    """:279 and :620-629: a device announces itself once, in the caller's first transition,
+    and its parent's add-child update follows the child's first `ready`."""
+
+    def test_a_child_populated_in_one_transition_announces_once_then_the_parent(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        client.reset_mock()
+
+        child = Device(id="child", parent=root)
+        assert _publishes(client) == []
+        assert root.description()["children"] == []
+
+        with child.state_transition():
+            _populate(child)
+
+        assert _wire(client) == [
+            ("child/$state", "init"),
+            ("child/n/p", "1.5"),
+            ("child/$description", ("children", [])),
+            ("child/$state", "ready"),
+            ("root/$state", "init"),
+            ("root/$description", ("children", ["child"])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_a_root_built_without_nodes_publishes_nothing_until_populated(self):
+        client = _mock_mqtt_client()
+        root = Device(id="root", mqttc=client)
+        assert _publishes(client) == []
+        assert root.state() is None
+
+        with root.state_transition():
+            _populate(root)
+
+        assert _wire(client) == [
+            ("root/$state", "init"),
+            ("root/n/p", "1.5"),
+            ("root/$description", ("children", [])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_an_owned_root_on_connect_before_populating_publishes_nothing(self):
+        with patch("ebus_sdk.homie.MqttClient.from_config") as from_config:
+            client = _mock_mqtt_client()
+            from_config.return_value = client
+            root = Device(id="root", mqtt_cfg={"host": "localhost", "port": 1883})
+
+        root.on_connect()
+
+        assert _publishes(client) == []
+
+    def test_add_node_outside_a_transition_is_the_first_announcement(self):
+        client = _mock_mqtt_client()
+        root = Device(id="root", mqttc=client)
+
+        root.add_node(root.new_node("n"))
+
+        assert _wire(client) == [
+            ("root/$state", "init"),
+            ("root/$description", ("children", [])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_a_device_built_with_nodes_announces_at_construction(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        client.reset_mock()
+        prop = Property(id="p", value=1.5, datatype=PropertyDatatype.FLOAT)
+        node = Node(id="n", properties={"p": prop})
+        prop.set_node(node)
+
+        Device(id="child", parent=root, nodes=[node])
+
+        assert _wire(client) == [
+            ("child/$state", "init"),
+            ("child/n/p", "1.5"),
+            ("child/$description", ("children", [])),
+            ("child/$state", "ready"),
+            ("root/$state", "init"),
+            ("root/$description", ("children", ["child"])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_refresh_tree_before_the_first_transition_publishes_nothing(self):
+        client = _mock_mqtt_client()
+        root = Device(id="root", mqttc=client)
+        Device(id="child", parent=root)
+
+        root.refresh_tree()
+
+        assert _publishes(client) == []
+
+    def test_refresh_tree_skips_a_child_not_yet_announced(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        Device(id="child", parent=root)
+        client.reset_mock()
+
+        root.refresh_tree()
+
+        assert _wire(client) == [
+            ("root/$description", ("children", [])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_a_childless_child_built_inside_the_parent_transition_is_announced_at_its_exit(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        client.reset_mock()
+
+        with root.state_transition():
+            bess = Device(id="bess", parent=root)
+            Device(id="mid", parent=bess)
+
+        assert _wire(client) == [
+            ("root/$state", "init"),
+            ("bess/$state", "init"),
+            ("mid/$state", "init"),
+            ("mid/$description", ("children", [])),
+            ("mid/$state", "ready"),
+            ("bess/$description", ("children", ["mid"])),
+            ("bess/$state", "ready"),
+            ("root/$description", ("children", ["bess"])),
+            ("root/$state", "ready"),
+        ]
+
+    def test_stop_announces_nothing_for_a_device_never_announced(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        Device(id="child", parent=root)
+        client.reset_mock()
+
+        root.stop()
+
+        assert _wire(client) == [("root/$state", "disconnected")]
+
+    def test_deleting_a_child_never_announced_leaves_the_parent_alone(self):
+        client = _mock_mqtt_client()
+        root = _announced(Device(id="root", mqttc=client))
+        child = Device(id="child", parent=root)
+        client.reset_mock()
+
+        child.delete()
+
+        assert not [t for t, _ in _publishes(client) if t.startswith(f"{BASE}/root/")]
+
+
 # ── B. $description ──────────────────────────────────────────────────────
 
 
@@ -297,7 +473,7 @@ class TestDescriptionChangesOnlyInPermittedStates:
         root.set_state(DeviceState.SLEEPING)
         client.publish.reset_mock()
 
-        Device(id="child", parent=root)
+        _announced(Device(id="child", parent=root))
 
         assert _states(client, "root") == ["init", "sleeping"]
 
@@ -470,7 +646,7 @@ class TestDescriptionCacheInvalidation:
         node = root.new_node("n")
         root.add_node(node)
         node.add_property(Property(id="p", value=1.5, datatype=PropertyDatatype.FLOAT))
-        Device(id="kid", parent=root)
+        _announced(Device(id="kid", parent=root))
         root.clear_retained_topic(f"{BASE}/root/$description")
         client.publish.reset_mock()
 
