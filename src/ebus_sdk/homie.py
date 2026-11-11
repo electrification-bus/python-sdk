@@ -115,6 +115,29 @@ def _warn_invalid_once(owner: Any, problem: str, message: str) -> None:
     logger.warning(f"{message},hint=invalid Homie 5 input; this will raise in the next minor release")
 
 
+# A topic level id: lowercase a-z, 0-9 and hyphen only (convention.md:39). `$` is
+# reserved for attributes (:41), so it is outside the set.
+_HOMIE_ID = re.compile(r"[a-z0-9-]+", re.ASCII)
+
+
+def _homie_id_problem(value: Any) -> Optional[str]:
+    """Why ``value`` is not a valid Homie topic id, or None when it is."""
+    if not isinstance(value, str) or not value:
+        return "empty"
+    if value.startswith("$"):
+        return "reservedDollar"
+    if not _HOMIE_ID.fullmatch(value):
+        return "invalidCharacter"
+    return None
+
+
+def _warn_invalid_id(owner: Any, kind: str, value: Any) -> None:
+    """Warn once when a device, node or property id is not a Homie topic id (:39, :41)."""
+    problem = _homie_id_problem(value)
+    if problem is not None:
+        _warn_invalid_once(owner, "idInvalid", f"reason={kind}IdInvalid,{kind}ID={value},problem={problem}")
+
+
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
 _jsonschema_warned = False
 
@@ -919,6 +942,11 @@ def sanitize_homie_id(value: Optional[str]) -> str:
     on the resulting Homie-legal id. Composing first and sanitizing the
     composite is not equivalent — a hyphen-joiner can be collapsed if an
     adjacent segment ends/begins with characters that drop out.
+
+    The mapping is many-to-one: distinct inputs can produce the same id
+    (``"Meter_1"``, ``"meter.1"`` and ``"meter--1"`` all become ``meter-1``).
+    Two such inputs collide where ids must be unique (devices in a tree,
+    nodes in a device, properties in a node).
     """
     if not value:
         return ""
@@ -1035,6 +1063,7 @@ class Property:
             async_loop = from_dict.get("async_loop", None)
         # Regardless of how we got this info, construct it
         # AKA, the "business logic" of the constructor
+        _warn_invalid_id(self, "property", id)
         self._id = id
         self._round = round_to
         self._value = value
@@ -1839,6 +1868,7 @@ class Node:
             self._type = type
             self._properties = properties if properties is not None else {}
             self._device = device
+        _warn_invalid_id(self, "node", self._id)
 
     def as_dict(self) -> dict:
         returned_dict = {"id": self.id(), "name": self.name(), "type": self.type()}
@@ -1913,6 +1943,16 @@ class Node:
         # before the $description that names it and before ready (convention.md:279).
         # A node not yet attached to its device, or a re-declaration with identical
         # content, leaves the $description unchanged and publishes only the value.
+        # Property ids are unique per node (convention.md:326). A second property with
+        # an existing id and a different $description still replaces the first; an
+        # identical re-declaration is not a duplicate.
+        existing = self._properties.get(property.id())
+        if existing is not None and existing is not property and existing.description() != property.description():
+            _warn_invalid_once(
+                self,
+                f"duplicateProperty:{property.id()}",
+                f"reason=nodeDuplicatePropertyId,nodeID={self._id},propertyID={property.id()}",
+            )
         self._properties.update({property.id(): property})
         with self.device()._reconfiguration():
             # force: announcing a property is a structural republish, so its value must
@@ -2320,6 +2360,16 @@ class Device:
         # homie_domain(). Defaults to the eBus domain, so a publisher that never
         # mentions it is unaffected.
         self._homie_domain = (homie_domain or EBUS_HOMIE_DOMAIN) if parent is None else None
+        _warn_invalid_id(self, "device", id)
+        # The domain is a single topic segment (convention.md:157) that the `+`
+        # discovery wildcard can match, so it may not start with '$' (:161). ""
+        # still falls back to the eBus domain; anything else is published as given.
+        if homie_domain is not None and (
+            homie_domain == "" or homie_domain.startswith("$") or any(c in homie_domain for c in "/+#")
+        ):
+            _warn_invalid_once(
+                self, "homieDomainInvalid", f"reason=deviceHomieDomainInvalid,id={id},domain={homie_domain}"
+            )
         self._name = name if name else id
         self._type = type
         self._parent: Optional[Device] = parent
@@ -2371,6 +2421,14 @@ class Device:
             if mqtt_cfg is not None:
                 self.connect_broker()
         else:
+            # Device ids are unique across the tree (convention.md:194). An ancestor or
+            # sibling with this id was refused above; one on another branch publishes to
+            # the same topics too, so the root warns once per id.
+            root = parent.root()
+            if any(device._id == id for device in root._tree_pre_order()):
+                _warn_invalid_once(
+                    root, f"duplicateDevice:{id}", f"reason=deviceDuplicateIdInTree,rootID={root._id},id={id}"
+                )
             parent._children.append(self)
         # A device built inside an ancestor's open state_transition() and never
         # populated is announced, empty, when that ancestor's transition closes.
@@ -2817,6 +2875,14 @@ class Device:
             if self._async_loop is not None:
                 prop.async_loop = self._async_loop
         node_id = node.id()
+        # Node ids are unique per device (convention.md:294). A second node with an
+        # existing id and a different $description still replaces the first; an
+        # identical re-declaration is not a duplicate.
+        existing = self._nodes.get(node_id)
+        if existing is not None and existing is not node and existing.description() != node.description():
+            _warn_invalid_once(
+                self, f"duplicateNode:{node_id}", f"reason=deviceDuplicateNodeId,id={self._id},nodeID={node_id}"
+            )
         # Outside a transition a ready device goes to init first, so the node's
         # values land before the $description that names them and before ready.
         self._nodes.update({node_id: node})
@@ -5081,6 +5147,11 @@ class Controller:
             return False
 
         effective_qos = qos if qos is not None else self._qos
+        # Each subtopic segment follows the id format (convention.md:533). Still sent.
+        if any(_homie_id_problem(segment) is not None for segment in str(subtopic).split("/")):
+            _warn_invalid_once(
+                self, f"broadcastSubtopic:{subtopic}", f"reason=broadcastSubtopicInvalid,subtopic={subtopic}"
+            )
         broadcast_topic = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/$broadcast/{subtopic}"
 
         logger.info(f"reason=broadcasting,topic={broadcast_topic}")
