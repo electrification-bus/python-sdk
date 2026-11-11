@@ -134,6 +134,10 @@ temp.set_value(None)     # retracts the retained topic (subscribers see nothing)
 label.set_value("")      # publishes an empty-string VALUE (0x00 on the wire)
 ```
 
+#### Invalid declarations raise
+
+A property or device declaration that Homie 5 rejects raises `ValueError` before anything is published, with a `reason=` naming the problem: a property with no `datatype` or an unknown one, `retained=None`, an `enum` or `color` with no `format`, an enum `format` with an empty or duplicate value, a `color` `format` listing anything but `rgb`, `hsv`, `xyz`, and `description_extras` that set a core `$description` field. This applies to `homie.Property(...)`, `add_property_from_dict()`, `Property.set_format()`, `PropertySpec` and `Device(description_extras=...)`.
+
 #### Values the datatype cannot represent are refused
 
 A value is encoded for its property's datatype before it is published (convention.md:74-150 at [homieiot/convention@7edc221](https://github.com/homieiot/convention/blob/7edc221336f1644a9f04445cbc50c5af695bb047/convention.md)). A value the datatype cannot represent is refused: nothing is published, the retained topic keeps the last good value, `set_value()` returns `False`, and a `reason=propertyValueRefused` warning names the problem. Refused: NaN and infinities on `float`, a `bool` on `integer` or `float`, an `integer` that is not whole or does not fit in 64 bits, an `enum` value not in its `format`, a `float` beyond the 64-bit float range, a `json` value that is not an array or object or contains NaN, and `""` on anything but `string`. Floats are written without `+` in the exponent (`1e20`, not `1e+20`).
@@ -146,7 +150,7 @@ A property with `retained=False` publishes non-retained at QoS 0, as Homie 5 req
 
 #### Alerts
 
-`device.publish_alert("battery", "Battery is low, at 8%")` raises a retained alert at `$alert/battery`; `device.clear_alert("battery")` deletes it. Alerts are republished on reconnect and cleared by `delete()`. `publish("$alert", ...)` without an alert id publishes nothing and logs a warning.
+`device.publish_alert("battery", "Battery is low, at 8%")` raises a retained alert at `$alert/battery`; `device.clear_alert("battery")` deletes it. Alerts are republished on reconnect and cleared by `delete()`. `publish("$alert", ...)` without an alert id publishes nothing and logs a warning. An alert id outside `a-z`, `0-9`, `-`, or an empty message, raises `ValueError`.
 
 #### Inbound `/set` is validated
 

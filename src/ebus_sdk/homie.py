@@ -239,6 +239,37 @@ _DESCRIPTION_CORE_FIELDS = frozenset(
 )
 
 
+def _check_property_description(pid: Any, datatype: Any, fmt: Any, retained: Any = True) -> None:
+    """Raise ``ValueError`` for property ``$description`` fields Homie 5 rejects (#91).
+
+    ``retained`` is a non-null boolean (convention.md:343); ``datatype`` is
+    required (:340) and must be a Homie 5 datatype; ``enum`` and ``color`` require
+    a ``format``; an enum format lists at least one value, none empty and none
+    duplicated (:392); a color format lists only ``rgb``, ``hsv`` and ``xyz`` (:393).
+    """
+    if retained is None:
+        raise ValueError(f"reason=propertyRetainedNull,propertyID={pid},hint=retained must be True or False")
+    if datatype is None:
+        raise ValueError(f"reason=propertyDatatypeMissing,propertyID={pid},hint=datatype is required")
+    if datatype not in PropertyDatatype._value2member_map_:
+        raise ValueError(f"reason=propertyDatatypeUnknown,propertyID={pid},datatype={datatype}")
+    if datatype in (PropertyDatatype.ENUM, PropertyDatatype.COLOR) and not fmt:
+        raise ValueError(
+            f"reason=propertyFormatMissing,propertyID={pid},datatype={datatype},hint={datatype} requires a format"
+        )
+    if datatype == PropertyDatatype.ENUM and isinstance(fmt, str):
+        values = fmt.split(",")
+        if "" in values:
+            raise ValueError(f"reason=propertyEnumFormatEmptyValue,propertyID={pid},format={fmt}")
+        if len(set(values)) != len(values):
+            raise ValueError(f"reason=propertyEnumFormatDuplicate,propertyID={pid},format={fmt}")
+    if datatype == PropertyDatatype.COLOR and isinstance(fmt, str):
+        if not set(fmt.split(",")) <= _COLOR_FORMATS:
+            raise ValueError(
+                f"reason=propertyColorFormatInvalid,propertyID={pid},format={fmt},hint=allowed: rgb, hsv, xyz"
+            )
+
+
 @dataclass(frozen=True)
 class JsonFieldConstraint:
     """The control-surface constraint on one field of a ``json`` ``$format`` schema.
@@ -753,7 +784,7 @@ def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tu
         return _encode_duration(value)
     if datatype == PropertyDatatype.JSON:
         return _encode_json(value)
-    # string, and a missing or unknown datatype (already warned about).
+    # string, and a missing or unknown datatype.
     return (str(value.value) if isinstance(value, Enum) else str(value)), None
 
 
@@ -895,7 +926,7 @@ def _parse_set_payload(text: str, datatype: Any, format_: Any, current: Any) -> 
         return _encode_duration(text)
     if datatype == PropertyDatatype.DATETIME:
         return _encode_datetime(text)
-    # string, and a missing or unknown datatype (already warned about).
+    # string, and a missing or unknown datatype.
     return decode_empty_string(text), None
 
 
@@ -1061,6 +1092,8 @@ class Property:
             device = from_dict.get("device", None)
             set_callback = from_dict.get("set_callback", None)
             async_loop = from_dict.get("async_loop", None)
+        # Invalid Homie 5 input raises before anything is assigned or published (#91).
+        _check_property_description(id, datatype, format, retained)
         # Regardless of how we got this info, construct it
         # AKA, the "business logic" of the constructor
         _warn_invalid_id(self, "property", id)
@@ -1079,10 +1112,6 @@ class Property:
             self._set_callback = set_callback
         else:
             self._set_callback = None
-        if retained is None:
-            # `retained` is a non-nullable boolean in $description (convention.md:343).
-            # The publish path always treated None as non-retained, so keep that.
-            _warn_invalid_once(self, "retainedNull", f"reason=propertyRetainedNull,propertyID={id},treatedAs=false")
         self._retained = bool(retained)
         self._unit = unit
         self._supports_target = supports_target
@@ -1141,43 +1170,6 @@ class Property:
         self._initial_value_was_none = value is None
         # Check for skip_initial_publish flag from dict
         self._skip_initial_publish = from_dict.get("skip_initial_publish", False) if from_dict else False
-        self._check_description_fields()
-
-    def _check_description_fields(self) -> None:
-        """Warn (once per problem) about $description fields Homie 5 rejects.
-
-        ``datatype`` is required (convention.md:340); ``enum`` and ``color`` require
-        a ``format``; an enum format lists at least one value, none empty and none
-        duplicated (:392); a color format lists only ``rgb``, ``hsv`` and ``xyz``
-        (:393).
-        """
-        pid = self._id
-        datatype = self._datatype
-        if datatype is None:
-            _warn_invalid_once(self, "datatypeMissing", f"reason=propertyDatatypeMissing,propertyID={pid}")
-            return
-        if datatype not in PropertyDatatype._value2member_map_:
-            _warn_invalid_once(
-                self, "datatypeUnknown", f"reason=propertyDatatypeUnknown,propertyID={pid},datatype={datatype}"
-            )
-            return
-        fmt = self._format
-        if datatype in (PropertyDatatype.ENUM, PropertyDatatype.COLOR) and not fmt:
-            _warn_invalid_once(
-                self, "formatMissing", f"reason=propertyFormatMissing,propertyID={pid},datatype={datatype}"
-            )
-            return
-        if datatype == PropertyDatatype.ENUM and isinstance(fmt, str):
-            values = fmt.split(",")
-            if "" in values:
-                _warn_invalid_once(self, "enumEmptyValue", f"reason=propertyEnumFormatEmptyValue,propertyID={pid}")
-            if len(set(values)) != len(values):
-                _warn_invalid_once(self, "enumDuplicate", f"reason=propertyEnumFormatDuplicate,propertyID={pid}")
-        if datatype == PropertyDatatype.COLOR and isinstance(fmt, str):
-            if not set(fmt.split(",")) <= _COLOR_FORMATS:
-                _warn_invalid_once(
-                    self, "colorFormatInvalid", f"reason=propertyColorFormatInvalid,propertyID={pid},format={fmt}"
-                )
 
     def as_dict(self) -> dict:
         return {
@@ -1315,9 +1307,12 @@ class Property:
         it; the SDK does not republish a single property attribute on its own. This
         is the public replacement for adapters that previously assigned the private
         ``_format`` because no setter existed (SDK-6do.2).
+
+        A format Homie 5 rejects for this datatype raises ``ValueError`` and the
+        format is left unchanged.
         """
+        _check_property_description(self._id, self._datatype, new_format)
         self._format = new_format
-        self._check_description_fields()
 
     def coerced_value(self) -> Optional[str]:
         """
@@ -1524,8 +1519,7 @@ class Property:
                 # Encode an empty-string value as a single 0x00 byte so the broker
                 # does not mistake it for a zero-length "clear retained" payload. Only
                 # for string (convention.md:65-67); another datatype never encodes to
-                # "" because its encoder refuses an empty value. A missing datatype was
-                # warned about at construction and keeps the string behavior.
+                # "" because its encoder refuses an empty value.
                 payload = encode_empty_string(value)
                 # GH #50: skip a republish whose final wire payload is byte-identical to
                 # the one already sitting on this topic. Compared AFTER coercion and
@@ -1667,8 +1661,7 @@ class Property:
         property = dict()
         property["name"] = self._name
         if self._datatype is not None:
-            # Required (convention.md:340); a missing datatype was warned about at
-            # construction, and null is not a valid value for it.
+            # Required (convention.md:340); the constructor refuses a missing one.
             property["datatype"] = self.datatype()
         if self._format:
             fmt = self.format()
@@ -2311,6 +2304,15 @@ class Device:
                 f"Device id={id}: cannot pass both mqtt_cfg= and mqttc=; pass mqtt_cfg to have the SDK "
                 "build and own a client, or mqttc to inject one whose lifecycle you own"
             )
+        # A core field is the SDK's to compute: an extra could otherwise add
+        # `root`/`parent` to a root device (convention.md:220) or a `type` the SDK
+        # omits (#91).
+        core_extras = sorted((description_extras or {}).keys() & _DESCRIPTION_CORE_FIELDS)
+        if core_extras:
+            raise ValueError(
+                f"reason=deviceDescriptionExtrasCoreFieldDropped,id={id},field={','.join(core_extras)},"
+                "hint=description_extras cannot set a Homie core $description field"
+            )
         # The `_mqtt_cfg` term separates "root never started" (an error) from "root built
         # transport-free" (mqtt_cfg=None), which must still take children. Drop it and the
         # transport-free tree can only ever be a single node.
@@ -2384,16 +2386,8 @@ class Device:
         # `imported-from` attribute of the `energy.ebus.imported` extension).
         # Homie 5 forward-compat requires controllers to ignore unknown
         # description fields (convention §Forward compatibility), so these are
-        # safe; core fields always take precedence over an extra of the same key.
+        # safe; an extra naming a core field was refused above.
         self._description_extras = dict(description_extras) if description_extras else {}
-        for key in sorted(self._description_extras.keys() & _DESCRIPTION_CORE_FIELDS):
-            # A core field is the SDK's to compute: an extra could otherwise add
-            # `root`/`parent` to a root device (convention.md:220) or a `type` the
-            # SDK omits. Dropped, with a warning per the invalid-input policy.
-            del self._description_extras[key]
-            _warn_invalid_once(
-                self, f"extrasCoreField:{key}", f"reason=deviceDescriptionExtrasCoreFieldDropped,id={id},field={key}"
-            )
         # Counter of how many state_transition() / delete() scopes are currently active
         # on this device. >0 means "a transition is in progress" — suppresses child-induced
         # parent flaps and makes nested state_transition()s reentrant (only the outermost
@@ -2832,8 +2826,8 @@ class Device:
             # Required if the parent is NOT the root device. Defaults to the value of the root property.
             description["parent"] = self._parent.id()
         description["extensions"] = self._extensions
-        # Merge extension-defined device attributes (core fields were dropped from
-        # the extras at construction).
+        # Merge extension-defined device attributes (an extra naming a core field
+        # was refused at construction).
         for key, value in self._description_extras.items():
             description.setdefault(key, value)
         # A new version whenever the document changes (convention.md:215), and the
@@ -3412,20 +3406,22 @@ class Device:
 
         ``alert_id`` must be a single topic level; one containing ``/``, ``+`` or
         ``#``, or an empty one, is refused. An id outside the Homie ID format
-        (``a-z``, ``0-9``, ``-``) is warned about and still published. ``message``
-        must be a non-empty string: an empty payload deletes the topic, so clear an
-        alert with ``clear_alert()``. Returns True if published.
+        (``a-z``, ``0-9``, ``-``) raises ``ValueError``, and so does a ``message``
+        that is not a non-empty string: an empty payload deletes the topic, so clear
+        an alert with ``clear_alert()``. Returns True if published.
         """
         if not alert_id or not isinstance(alert_id, str) or any(c in alert_id for c in "/+#"):
             logger.warning(f"reason=devicePublishAlertInvalidId,id={self._id},alertId={alert_id!r}")
             return False
         if not re.fullmatch(r"[a-z0-9-]+", alert_id):
-            _warn_invalid_once(
-                self, f"alertId:{alert_id}", f"reason=devicePublishAlertIdFormat,id={self._id},alertId={alert_id}"
+            raise ValueError(
+                f"reason=devicePublishAlertIdFormat,id={self._id},alertId={alert_id},hint=use a-z, 0-9 and -"
             )
         if not isinstance(message, str) or message == "":
-            logger.warning(f"reason=devicePublishAlertEmptyMessage,id={self._id},alertId={alert_id}")
-            return False
+            raise ValueError(
+                f"reason=devicePublishAlertEmptyMessage,id={self._id},alertId={alert_id},"
+                "hint=message must be a non-empty string; use clear_alert() to remove an alert"
+            )
         self._alerts[alert_id] = message
         return self._publish_alert_topic(alert_id, message)
 

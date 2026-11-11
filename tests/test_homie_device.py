@@ -195,7 +195,7 @@ class TestHomieProperty:
         assert p.retained() is True
 
     def test_name_defaults_to_id(self):
-        p = Property(id="temp")
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT)
         assert p.name() == "temp"
 
     def test_from_dict(self):
@@ -225,16 +225,16 @@ class TestHomieProperty:
 
     def test_set_callback_ignored_when_not_settable(self):
         cb = MagicMock()
-        p = Property(id="temp", settable=False, set_callback=cb)
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT, settable=False, set_callback=cb)
         assert p.get_set_callback() is None
 
     def test_set_callback_stored_when_settable(self):
         cb = MagicMock()
-        p = Property(id="temp", settable=True, set_callback=cb)
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT, settable=True, set_callback=cb)
         assert p.get_set_callback() is cb
 
     def test_set_set_callback(self):
-        p = Property(id="temp", settable=True)
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT, settable=True)
         cb = MagicMock()
         p.set_set_callback(cb)
         assert p.get_set_callback() is cb
@@ -245,19 +245,19 @@ class TestHomieProperty:
         assert p.round() == 1
 
     def test_no_round(self):
-        p = Property(id="temp", value=72.456)
+        p = Property(id="temp", value=72.456, datatype=PropertyDatatype.FLOAT)
         assert p.value() == 72.456
 
     def test_ever_published_initially_false(self):
-        p = Property(id="temp", value=72)
+        p = Property(id="temp", value=72, datatype=PropertyDatatype.INTEGER)
         assert p.was_ever_published() is False
 
     def test_skip_initial_publish_from_dict(self):
-        p = Property(from_dict={"id": "temp", "skip_initial_publish": True})
+        p = Property(from_dict={"id": "temp", "datatype": PropertyDatatype.FLOAT, "skip_initial_publish": True})
         assert p._skip_initial_publish is True
 
     def test_supports_target(self):
-        p = Property(id="temp", supports_target=True)
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT, supports_target=True)
         assert p.supports_target() is True
 
     def test_is_json_datatype(self):
@@ -274,7 +274,7 @@ class TestHomieProperty:
         assert prop.settable() is True
 
     def test_set_settable_noop_same_value(self):
-        p = Property(id="temp", settable=False)
+        p = Property(id="temp", datatype=PropertyDatatype.FLOAT, settable=False)
         p.set_settable(False)
         assert p.settable() is False
 
@@ -341,7 +341,7 @@ class TestHomiePropertyCoercion:
         class Color(Enum):
             RED = "red"
 
-        p = Property(id="color", value=Color.RED, datatype=PropertyDatatype.ENUM)
+        p = Property(id="color", value=Color.RED, datatype=PropertyDatatype.ENUM, format="red")
         assert p.coerced_value() == "red"
 
     def test_coerced_value_json_dict(self):
@@ -576,16 +576,12 @@ class TestHomiePropertyPublishSuppression:
 
         assert mock_client.publish.call_count == 3
 
-    def test_retained_none_is_never_deduped(self):
-        # retained is Optional[bool] and reachable as None; the publish call already
-        # treats that as non-retained, so the gate must too (truthiness, not `is True`).
+    def test_retained_none_is_refused(self):
+        # retained is a non-null boolean (convention.md:343), so None never reaches the gate.
         mock_client = _mock_mqtt_client()
-        prop = _make_wired_property(mock_client, retained=None)
-
-        prop.set_value(99.0)
-        prop.set_value(99.0)
-
-        assert mock_client.publish.call_count == 2
+        with pytest.raises(ValueError, match="reason=propertyRetainedNull"):
+            _make_wired_property(mock_client, retained=None)
+        mock_client.publish.assert_not_called()
 
     def test_clear_then_the_same_value_republishes(self):
         # publish x -> retract -> set x again. Without a memo reset in clear_value()
@@ -1010,7 +1006,7 @@ class TestNode:
 
     def test_get_property(self):
         n = Node(id="core")
-        p = Property(id="temp", value=72)
+        p = Property(id="temp", value=72, datatype=PropertyDatatype.INTEGER)
         n._properties["temp"] = p
         assert n.get_property("temp") is p
 
@@ -2395,11 +2391,9 @@ class TestDeviceDescriptionExtras:
         d, _ = _make_device(mock_paho, description_extras={"imported-from": "ha"})
         assert d.description()["imported-from"] == "ha"
 
-    def test_description_extras_never_clobber_core_fields(self, mock_paho):
-        d, _ = _make_device(mock_paho, description_extras={"name": "HACKED", "nodes": {"x": {}}})
-        desc = d.description()
-        assert desc["name"] != "HACKED"  # core name wins over an extra of the same key
-        assert desc["nodes"] == {}  # core nodes win
+    def test_description_extras_cannot_set_core_fields(self, mock_paho):
+        with pytest.raises(ValueError, match="reason=deviceDescriptionExtrasCoreFieldDropped.*field=name,nodes"):
+            _make_device(mock_paho, description_extras={"name": "HACKED", "nodes": {"x": {}}})
 
 
 class TestDeviceStop:
@@ -2814,7 +2808,7 @@ class TestInboundAsyncLoop:
 
     def test_async_loop_default_is_none(self):
         # Was `Optional[...] = False` (a bool against the loop annotation); now None.
-        assert Property(id="mode").async_loop is None
+        assert Property(id="mode", datatype=PropertyDatatype.STRING).async_loop is None
 
     def test_device_async_loop_propagates_via_add_node(self):
         loop = MagicMock()
@@ -2851,7 +2845,7 @@ class TestInboundAsyncLoop:
             return None
 
         loop = MagicMock()
-        prop = Property(id="mode", settable=True, set_callback=cb)
+        prop = Property(id="mode", datatype=PropertyDatatype.STRING, settable=True, set_callback=cb)
         prop.async_loop = loop
         with patch("asyncio.run_coroutine_threadsafe") as rct, patch("asyncio.ensure_future") as ef:
             prop._settable_callback("ebus/5/dev/node/mode/set", b"LOAD_UP")
@@ -2862,7 +2856,9 @@ class TestInboundAsyncLoop:
 
     def test_sync_dispatch_when_no_loop(self):
         seen = []
-        prop = Property(id="mode", settable=True, set_callback=lambda v: seen.append(v))
+        prop = Property(
+            id="mode", datatype=PropertyDatatype.STRING, settable=True, set_callback=lambda v: seen.append(v)
+        )
         assert prop.async_loop is None
         with patch("asyncio.run_coroutine_threadsafe") as rct:
             prop._settable_callback("ebus/5/dev/node/mode/set", b"LOAD_UP")
@@ -2874,7 +2870,9 @@ class TestInboundAsyncLoop:
         dispatch branches on the callback's return, not on the loop's presence (#15)."""
         loop = MagicMock()
         seen = []
-        prop = Property(id="mode", settable=True, set_callback=lambda v: seen.append(v))
+        prop = Property(
+            id="mode", datatype=PropertyDatatype.STRING, settable=True, set_callback=lambda v: seen.append(v)
+        )
         prop.async_loop = loop  # a device-level loop is propagated to every property
         with patch("asyncio.run_coroutine_threadsafe") as rct:
             prop._settable_callback("ebus/5/dev/node/mode/set", b"ON")
@@ -2899,7 +2897,7 @@ class TestInboundAsyncLoop:
 
     def test_async_set_callback_exception_is_surfaced(self):
         """A raising async /set handler is logged, not swallowed by the discarded Future."""
-        prop = Property(id="mode")
+        prop = Property(id="mode", datatype=PropertyDatatype.STRING)
         future = MagicMock()
         future.cancelled.return_value = False
         future.exception.return_value = ValueError("bad setpoint")
