@@ -4,6 +4,16 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- `Controller`: a zero-length property value removes the stored value from `DiscoveredDevice.properties` and fires the property-changed callback with `new_value=None`; it was stored as `""`. A zero-length `$target` removes the entry from `property_targets`. A single `0x00` byte still decodes to `""` (convention.md:62-63, :613; [#93](https://github.com/electrification-bus/python-sdk/issues/93)).
+- `Controller.set_property()` publishes at QoS 0 when the device's discovered `$description` marks the property `retained: false` (convention.md:49, :695); an explicit `qos=` still wins ([#93](https://github.com/electrification-bus/python-sdk/issues/93)).
+
+### Fixed
+
+- `Controller`: only the five `$state` values create or update a device; any other value is logged and dropped (convention.md:272-274). A `$state`, property value or `$target` payload that is not UTF-8 is logged and dropped instead of raising in the handler ([#93](https://github.com/electrification-bus/python-sdk/issues/93)).
+- `Controller`: `$alert/<id>` and `$log/<level>` messages are no longer stored as properties of a node named `$alert` or `$log` (convention.md:41; [#93](https://github.com/electrification-bus/python-sdk/issues/93)).
+
 ## [0.27.0] — 2026-10-21
 
 A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.
