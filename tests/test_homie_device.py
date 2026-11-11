@@ -2917,7 +2917,7 @@ class TestInboundAsyncLoop:
         thread = threading.Thread(target=loop.run_forever, daemon=True)
         thread.start()
         try:
-            prop = Property(id="mode", settable=True, set_callback=cb)
+            prop = Property(id="mode", datatype=PropertyDatatype.STRING, settable=True, set_callback=cb)
             prop.async_loop = loop
             logged = threading.Event()
             with patch("ebus_sdk.homie.logger") as mock_logger:
