@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- Invalid ids, topics and domains are warned about, once per object, and still published ([#92](https://github.com/electrification-bus/python-sdk/issues/92), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)): a device, node or property id that is empty, starts with `$` or has a character outside `a-z`, `0-9` and `-` (convention.md:39, :41); a second node with an existing id in `Device.add_node()` or property in `Node.add_property()` whose `$description` differs from the first, which it still replaces (:294, :326; an identical re-declaration is not warned about); a device id already used on another branch of the same tree (:194; an ancestor or sibling with the id still raises `ValueError`); a root `homie_domain` that is `""` (still published as `ebus`), starts with `$` or contains `/`, `+` or `#` (:157, :161); and a `Controller.broadcast()` subtopic with a segment that is not a valid id (:533). `sanitize_homie_id()` documents that distinct inputs can map to the same id.
+
 ## [0.27.0] — 2026-10-21
 
 A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.
