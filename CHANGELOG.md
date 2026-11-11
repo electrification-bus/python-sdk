@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `SetRefused`, exported from `ebus_sdk`: a `/set` callback (or the coroutine an async one returns) raises it to refuse a well-formed value it will not apply, and the property logs `reason=propertySetRefused,propertyID=...` at info level instead of `propertySetCallbackException`. `ObservableProperty.set_entity()` re-raises it from its `entity_setter` and still logs and swallows any other exception, so a refusal in an `entity_setter` wired by `build_from_declarations` reaches the Homie layer. Return values keep their meaning ([#102](https://github.com/electrification-bus/python-sdk/issues/102)).
+
 ### Changed
 
 - `jsonschema` is imported on the first `$format` validation instead of when `ebus_sdk.homie` loads, so a process that never validates a `json` property's `$format` does not load it ([#113](https://github.com/electrification-bus/python-sdk/issues/113)). Validation, and the one-time warning when `jsonschema` is not installed, are unchanged.

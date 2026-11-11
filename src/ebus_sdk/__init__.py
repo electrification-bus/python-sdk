@@ -48,6 +48,7 @@ from .property import (
     PropertyDict,
     ChangeEvent,
     BulkUpdateContext,
+    SetRefused,
 )
 
 # Proxy / adapter helpers (see doc/building-a-proxy.md)
@@ -117,6 +118,7 @@ __all__ = [
     "PropertyDict",
     "ChangeEvent",
     "BulkUpdateContext",
+    "SetRefused",
     # Proxy / adapter helpers
     "set_homie_property_from_python_property",
     "bind_property_to_homie",

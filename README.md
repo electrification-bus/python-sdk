@@ -152,6 +152,8 @@ A property with `retained=False` publishes non-retained at QoS 0, as Homie 5 req
 
 A `/set` payload is checked against the property's datatype before its `set_callback` runs, and an invalid one is dropped with a `reason=propertySetRejected` warning: `json` must be an array or object (and match a `$format` JSONschema when one can be checked), `integer` and `float` must follow the payload grammar, `boolean` must be `true` or `false`, an `enum` value must be in its `format`, and a `datetime` must be ISO 8601. A number is rounded to its format's step and then checked against min/max (convention.md:397-413): the callback receives the payload as sent, or its rounded form if rounding changed it (`5` on `0:10:2` arrives as `6`).
 
+A `set_callback` refuses a valid value by raising `ebus_sdk.SetRefused` (from the callback, or from the coroutine an async callback returns); it is logged as `reason=propertySetRefused` at info level, not as a callback exception. Its return value is not a refusal.
+
 A `/set` the broker delivers with the retain flag set is a stale command replayed at subscribe time, since controllers publish `/set` non-retained only; it is ignored with a `reason=propertySetRetainedIgnored` warning. That needs ebus-mqtt-client 0.7.0 or later, whose `subscribe(..., with_retain=True)` delivers the flag. With an older client, or an injected transport whose `subscribe` has no `with_retain` parameter, the check is skipped and a debug line says so.
 
 `supports_target=True` is inert: `$target` is not implemented, so the property logs one warning at construction and never publishes `$target`.
