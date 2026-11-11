@@ -3665,6 +3665,17 @@ def ebus_cfg_add_auth(cfg, username, password):
     return cfg
 
 
+def _pop_nested(table: dict, node_id: str, property_id: str) -> Optional[str]:
+    """Pop table[node_id][property_id], dropping the node's dict once it is empty."""
+    values = table.get(node_id)
+    if values is None:
+        return None
+    value = values.pop(property_id, None)
+    if not values:
+        del table[node_id]
+    return value
+
+
 class DiscoveredDevice:
     """
     Represents a device discovered by a Controller.
@@ -3706,6 +3717,16 @@ class DiscoveredDevice:
             self.property_targets[node_id] = {}
         self.property_targets[node_id][property_id] = target
         self.last_seen = time.time()
+
+    def remove_property(self, node_id: str, property_id: str) -> Optional[str]:
+        """Forget a property value whose retained topic was removed; return the value it had."""
+        self.last_seen = time.time()
+        return _pop_nested(self.properties, node_id, property_id)
+
+    def remove_property_target(self, node_id: str, property_id: str) -> Optional[str]:
+        """Forget a property $target whose retained topic was removed; return the target it had."""
+        self.last_seen = time.time()
+        return _pop_nested(self.property_targets, node_id, property_id)
 
     def get_property(self, node_id: str, property_id: str) -> Optional[str]:
         """Get current value of a property (raw string as received)"""
@@ -3842,6 +3863,19 @@ _WILDCARD_ATTRIBUTE_FILTERS = ("$description",)
 _PROPERTY_FILTERS = ("+/+", "+/+/$target")
 # Controller._property_coverage value for a device whose whole-device property filters are subscribed.
 _ALL_NODES = "*"
+# The only $state values that create or update a discovered device (convention.md:272-274).
+_DEVICE_STATES = frozenset(state.value for state in DeviceState)
+
+
+def _decode_payload(topic: str, payload: Union[bytes, str]) -> Optional[str]:
+    """Decode an inbound payload as UTF-8 (convention.md:76), or log and return None."""
+    if not isinstance(payload, bytes):
+        return payload
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning(f"reason=payloadNotUtf8,topic={topic}")
+        return None
 
 
 class _DefaultBatchSize:
@@ -4709,8 +4743,9 @@ class Controller:
         homie_domain = parts[0]
         device_id = parts[2]
 
-        # Decode payload
-        payload_str = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+        payload_str = _decode_payload(topic, payload)
+        if payload_str is None:
+            return
 
         # Empty payload indicates device removal
         if not payload_str or len(payload_str) == 0:
@@ -4726,6 +4761,11 @@ class Controller:
                 del self.devices[device_id]
                 if self._on_device_removed:
                     self._on_device_removed(removed_device)
+            return
+
+        # Any other value neither creates nor updates a device (convention.md:272-274).
+        if payload_str not in _DEVICE_STATES:
+            logger.warning(f"reason=invalidStateValue,deviceID={device_id},state={payload_str!r}")
             return
 
         # Tree-rooted mode tracks only what the tree declares. A device that cleared its
@@ -4976,18 +5016,31 @@ class Controller:
         node_id = parts[3]
         property_id = parts[4]
 
-        # Skip attribute topics (starting with $)
-        if property_id.startswith("$"):
+        # Skip attribute topics (starting with $): a property's own attributes, and
+        # device attributes two levels deep such as $alert/<id> and $log/<level>.
+        if node_id.startswith("$") or property_id.startswith("$"):
             return
 
         if device_id not in self.devices:
             return
 
-        payload_str = payload.decode("utf-8") if isinstance(payload, bytes) else payload
-        # Homie 5: a single 0x00 byte denotes an empty-string value (a truly
-        # zero-length payload would instead be a retained-topic clear).
-        payload_str = decode_empty_string(payload_str)
+        payload_str = _decode_payload(topic, payload)
+        if payload_str is None:
+            return
         device = self.devices[device_id]
+
+        # A zero-length payload removes the retained value (convention.md:62-63, :613).
+        if not payload_str:
+            old_value = device.remove_property(node_id, property_id)
+            if old_value is None:
+                return
+            logger.debug(f"reason=propertyRemoved,deviceID={device_id},node={node_id},property={property_id}")
+            if self._on_property_changed:
+                self._on_property_changed(device_id, node_id, property_id, None, old_value)
+            return
+
+        # Homie 5: a single 0x00 byte denotes an empty-string value.
+        payload_str = decode_empty_string(payload_str)
         old_value = device.get_property(node_id, property_id)
         device.update_property(node_id, property_id, payload_str)
 
@@ -5035,9 +5088,18 @@ class Controller:
         if device_id not in self.devices:
             return
 
-        payload_str = payload.decode("utf-8") if isinstance(payload, bytes) else payload
-        payload_str = decode_empty_string(payload_str)
+        payload_str = _decode_payload(topic, payload)
+        if payload_str is None:
+            return
         device = self.devices[device_id]
+
+        # A zero-length payload removes the retained $target.
+        if not payload_str:
+            device.remove_property_target(node_id, property_id)
+            logger.debug(f"reason=targetRemoved,deviceID={device_id},node={node_id},property={property_id}")
+            return
+
+        payload_str = decode_empty_string(payload_str)
         device.update_property_target(node_id, property_id, payload_str)
         self._note_burst_message(device_id, (node_id, property_id, "$target"))
 
@@ -5064,7 +5126,8 @@ class Controller:
             node_id: Target node ID
             property_id: Target property ID
             value: Value to set (as string)
-            qos: MQTT QoS level (default: controller's QoS)
+            qos: MQTT QoS level (default: 0 when the discovered $description marks
+                the property non-retained, else the controller's QoS)
 
         Returns:
             True if message was sent successfully, False otherwise
@@ -5073,7 +5136,13 @@ class Controller:
             logger.error("reason=setPropertyFailedNoConnection")
             return False
 
-        effective_qos = qos if qos is not None else self._qos
+        if qos is not None:
+            effective_qos = qos
+        elif self._is_non_retained(device_id, node_id, property_id):
+            # A /set to a non-retained property goes at QoS 0 (convention.md:49, :695).
+            effective_qos = 0
+        else:
+            effective_qos = self._qos
         set_topic = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/{device_id}/{node_id}/{property_id}/set"
 
         logger.info(f"reason=settingProperty,topic={set_topic},value={value}")
@@ -5087,6 +5156,16 @@ class Controller:
         except Exception as e:
             logger.error(f"reason=setPropertyException,error={e}")
             return False
+
+    def _is_non_retained(self, device_id: str, node_id: str, property_id: str) -> bool:
+        """True when the device's discovered $description marks the property retained=false."""
+        device = self.devices.get(device_id)
+        node: Any = device.description if device is not None else None
+        for key in ("nodes", node_id, "properties", property_id):
+            if not isinstance(node, dict):
+                return False
+            node = node.get(key)
+        return isinstance(node, dict) and node.get("retained") is False
 
     def set_property_json(
         self,
@@ -5372,8 +5451,13 @@ class Controller:
         """Set callback for when a device is removed"""
         self._on_device_removed = callback
 
-    def set_on_property_changed_callback(self, callback: Callable[[str, str, str, str, Optional[str]], None]) -> None:
-        """Set callback for property changes (device_id, node_id, property_id, new_value, old_value)"""
+    def set_on_property_changed_callback(
+        self, callback: Callable[[str, str, str, Optional[str], Optional[str]], None]
+    ) -> None:
+        """Set callback for property changes (device_id, node_id, property_id, new_value, old_value).
+
+        new_value is None when the property's retained value was removed (a zero-length payload).
+        """
         self._on_property_changed = callback
 
     def set_on_tree_ready_callback(self, callback: Callable[[DiscoveredDevice], None]) -> None:

@@ -2496,3 +2496,188 @@ class TestReconnectPacing:
         client.reset_mock()
         ctrl.resync()
         client.subscribe.assert_not_called()
+
+
+class TestControllerInboundRobustness:
+    """GH #93: $state values, non-UTF-8 payloads, $alert/$log, zero-length values."""
+
+    def _discovered(self, mock_paho):
+        ctrl, client = _make_controller(mock_paho)
+        ctrl.start_discovery()
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"ready")
+        return ctrl, client
+
+    @pytest.mark.parametrize("state", [s.value for s in DeviceState])
+    def test_each_valid_state_creates_device(self, mock_paho, state):
+        ctrl, _ = _make_controller(mock_paho)
+        ctrl.start_discovery()
+        ctrl._on_state_message(_topic("panel-1", "$state"), state.encode())
+        assert ctrl.devices["panel-1"].state == state
+
+    def test_invalid_state_does_not_create_device(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho)
+        discovered = []
+        ctrl.set_on_device_discovered_callback(discovered.append)
+        ctrl.start_discovery()
+
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"banana")
+
+        assert "panel-1" not in ctrl.devices
+        assert discovered == []
+
+    def test_invalid_state_does_not_update_device(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        changes = []
+        ctrl.set_on_device_state_changed_callback(lambda dev, old, new: changes.append((old, new)))
+
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"READY")
+
+        assert ctrl.devices["panel-1"].state == "ready"
+        assert changes == []
+
+    def test_invalid_state_does_not_complete_pre_created_device(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho, device_id="panel-1")
+        ctrl.start_discovery()
+
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"banana")
+
+        assert ctrl.devices["panel-1"].state is None
+
+    def test_non_utf8_state_is_dropped(self, mock_paho):
+        ctrl, _ = _make_controller(mock_paho)
+        ctrl.start_discovery()
+
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"\xff\xfe")
+
+        assert "panel-1" not in ctrl.devices
+
+    def test_non_utf8_property_is_dropped(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        changes = []
+        ctrl.set_on_property_changed_callback(lambda *args: changes.append(args))
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"1")
+
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"\xff")
+
+        assert ctrl.devices["panel-1"].get_property("core", "p") == "1"
+        assert len(changes) == 1
+
+    def test_non_utf8_target_is_dropped(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        ctrl._on_target_message("panel-1", _topic("panel-1", "core/p/$target"), b"1")
+
+        ctrl._on_target_message("panel-1", _topic("panel-1", "core/p/$target"), b"\xff")
+
+        assert ctrl.devices["panel-1"].get_property_target("core", "p") == "1"
+
+    @pytest.mark.parametrize("suffix", ["$alert/battery-low", "$log/warn"])
+    def test_alert_and_log_are_not_properties(self, mock_paho, suffix):
+        ctrl, _ = self._discovered(mock_paho)
+        changes = []
+        ctrl.set_on_property_changed_callback(lambda *args: changes.append(args))
+
+        ctrl._on_property_message("panel-1", _topic("panel-1", suffix), b"Battery is low")
+
+        assert ctrl.devices["panel-1"].properties == {}
+        assert changes == []
+
+    def test_zero_length_value_removes_property(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        changes = []
+        ctrl.set_on_property_changed_callback(lambda *args: changes.append(args))
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"42")
+
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"")
+
+        dev = ctrl.devices["panel-1"]
+        assert dev.get_property("core", "p") is None
+        assert dev.properties == {}
+        assert changes[-1] == ("panel-1", "core", "p", None, "42")
+
+    def test_zero_length_value_for_unknown_property_is_silent(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        changes = []
+        ctrl.set_on_property_changed_callback(lambda *args: changes.append(args))
+
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"")
+
+        assert ctrl.devices["panel-1"].properties == {}
+        assert changes == []
+
+    def test_null_byte_value_is_still_empty_string(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        ctrl._on_property_message("panel-1", _topic("panel-1", "core/p"), b"\x00")
+        assert ctrl.devices["panel-1"].get_property("core", "p") == ""
+
+    def test_zero_length_target_removes_target(self, mock_paho):
+        ctrl, _ = self._discovered(mock_paho)
+        ctrl._on_target_message("panel-1", _topic("panel-1", "core/p/$target"), b"on")
+        ctrl._on_target_message("panel-1", _topic("panel-1", "core/q/$target"), b"off")
+
+        ctrl._on_target_message("panel-1", _topic("panel-1", "core/p/$target"), b"")
+
+        dev = ctrl.devices["panel-1"]
+        assert dev.get_property_target("core", "p") is None
+        assert dev.property_targets == {"core": {"q": "off"}}
+
+
+class TestControllerSetPropertyNonRetained:
+    """GH #93: a /set to a non-retained property goes at QoS 0 (convention.md:49)."""
+
+    def _described(self, mock_paho, retained):
+        ctrl, client = _make_controller_with_qos(mock_paho, qos=2)
+        ctrl.start_discovery()
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"ready")
+        spec = {"datatype": "string", "settable": True}
+        if retained is not None:
+            spec["retained"] = retained
+        desc = {"homie": "5.0", "version": 1, "nodes": {"core": {"properties": {"cmd": spec}}}}
+        ctrl._on_description_message("panel-1", _topic("panel-1", "$description"), json.dumps(desc).encode())
+        return ctrl, client
+
+    @pytest.mark.parametrize("retained, expected_qos", [(False, 0), (True, 2), (None, 2)])
+    def test_qos_follows_retained(self, mock_paho, retained, expected_qos):
+        ctrl, client = self._described(mock_paho, retained)
+
+        assert ctrl.set_property("panel-1", "core", "cmd", "go") is True
+
+        _, kwargs = client.publish.call_args
+        assert kwargs["qos"] == expected_qos
+        assert kwargs["retain"] is False
+
+    def test_explicit_qos_wins(self, mock_paho):
+        ctrl, client = self._described(mock_paho, retained=False)
+
+        ctrl.set_property("panel-1", "core", "cmd", "go", qos=1)
+
+        _, kwargs = client.publish.call_args
+        assert kwargs["qos"] == 1
+
+    @pytest.mark.parametrize(
+        "desc",
+        [
+            {"homie": "5.0", "nodes": {"core": "x"}},
+            {"homie": "5.0", "nodes": {"core": {"properties": "x"}}},
+            {"homie": "5.0", "nodes": {"core": {"properties": {"cmd": "x"}}}},
+            {"homie": "5.0", "nodes": "core"},
+            ["not", "a", "dict"],
+        ],
+    )
+    def test_malformed_description_uses_controller_qos(self, mock_paho, desc):
+        ctrl, client = _make_controller_with_qos(mock_paho, qos=2)
+        ctrl.start_discovery()
+        ctrl._on_state_message(_topic("panel-1", "$state"), b"ready")
+        ctrl._on_description_message("panel-1", _topic("panel-1", "$description"), json.dumps(desc).encode())
+
+        assert ctrl.set_property("panel-1", "core", "cmd", "go") is True
+
+        _, kwargs = client.publish.call_args
+        assert kwargs["qos"] == 2
+
+    def test_undiscovered_device_uses_controller_qos(self, mock_paho):
+        ctrl, client = _make_controller_with_qos(mock_paho, qos=2)
+
+        ctrl.set_property("other", "core", "cmd", "go")
+
+        _, kwargs = client.publish.call_args
+        assert kwargs["qos"] == 2
