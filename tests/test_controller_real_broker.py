@@ -307,8 +307,10 @@ class _RestartableBroker:
             f"listener {port} 127.0.0.1\nallow_anonymous true\n"
             f"persistence true\npersistence_location {self.dir}/\npersistence_file mosquitto.db\n"
         )
-        self.proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _wait_for_port(port, self.proc)
+        log = self.dir / "mosquitto.log"
+        with log.open("ab") as out:
+            self.proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=out, stderr=subprocess.STDOUT)
+        _wait_for_port(port, self.proc, log)
 
     def stop(self):
         if self.proc is not None:
