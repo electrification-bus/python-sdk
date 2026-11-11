@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-11-11
+
+Homie 5 conformance and stricter producer input. Breaking: the invalid producer input 0.25.0 warned about now raises `ValueError`; a child's effective state follows its root only when the root is `lost`; and the `Controller` drops invalid `$state` values and reports a removed value as `None`. `jsonschema` is imported only when a `$format` is first validated.
+
 ### Added
 
 - `SetRefused`, exported from `ebus_sdk`: a `/set` callback (or the coroutine an async one returns) raises it to refuse a well-formed value it will not apply, and the property logs `reason=propertySetRefused,propertyID=...` at info level instead of `propertySetCallbackException`. `ObservableProperty.set_entity()` re-raises it from its `entity_setter` and still logs and swallows any other exception, so a refusal in an `entity_setter` wired by `build_from_declarations` reaches the Homie layer. Return values keep their meaning ([#102](https://github.com/electrification-bus/python-sdk/issues/102)).
@@ -498,7 +502,8 @@ The 0.2.0 release introduces first-class parent/child device trees on both the d
 
 Initial public release on PyPI. It predates this repo's tagging convention (the earliest tag is `v0.1.4`), so there is no `v0.1.2` tag to read; the published artifact on PyPI is the record of the surface that shipped.
 
-[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/python-sdk/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.28.0
 [0.27.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.27.0
 [0.26.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.26.0
 [0.25.0]: https://github.com/electrification-bus/python-sdk/releases/tag/v0.25.0
