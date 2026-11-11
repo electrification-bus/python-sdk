@@ -1,5 +1,7 @@
 """Tests for the declarative PropertySpec + build_from_declarations builder."""
 
+from unittest.mock import patch
+
 import pytest
 
 from ebus_sdk import (
@@ -10,6 +12,7 @@ from ebus_sdk import (
     ObservableProperty,
     PropertyDatatype,
     PropertySpec,
+    SetRefused,
     Unit,
     build_from_declarations,
     python_type_for,
@@ -121,6 +124,27 @@ def test_build_from_declarations_wires_settable_entity_setter(mock_paho):
     # The observable side is registered too: model.set_entity invokes the entity_setter.
     model.set_entity("dr", "event", "OTHER")
     assert received[-1] == "OTHER"
+
+
+def test_entity_setter_refusal_reaches_the_homie_layer(mock_paho):
+    """A SetRefused from an entity_setter crosses model.set_entity to the /set handler (#102)."""
+    device = Device("dev-refuse", mqtt_cfg={"host": "localhost", "port": 1883})
+    device.start_mqtt_client()
+    model = GroupedPropertyDict()
+
+    def refuse(value):
+        raise SetRefused("interlocked")
+
+    specs = [PropertySpec("relay", "state", PropertyDatatype.BOOLEAN, settable=True, entity_setter=refuse)]
+    hp = build_from_declarations(device, model, specs)[("relay", "state")]
+
+    with pytest.raises(SetRefused):
+        hp.get_set_callback()(True)
+
+    with patch("ebus_sdk.homie.logger") as mock_logger:
+        hp._settable_callback("ebus/5/dev-refuse/relay/state/set", b"true")
+    assert any("reason=propertySetRefused,propertyID=state" in str(c) for c in mock_logger.info.call_args_list)
+    mock_logger.exception.assert_not_called()
 
 
 def test_build_from_declarations_settable_without_entity_setter_not_auto_wired(mock_paho):

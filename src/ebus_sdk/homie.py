@@ -38,6 +38,7 @@ This is the initial version, there are things to add in the future (as needed):
 """
 
 import asyncio
+import calendar
 import contextlib
 import datetime
 import decimal
@@ -74,14 +75,14 @@ from typing import Any, Callable, List, Optional, Type, Union
 from ebus_mqtt_client import MqttClient
 
 from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport
+from ebus_sdk.property import SetRefused
 
 # Optional: JSONSchema validation of a `json` property's `$format`. Kept optional
 # (see `ebus-sdk[validation]`) so a constrained build can omit it; absent it,
-# validation is gracefully skipped (see `validate_json_format`).
-try:
-    import jsonschema as _jsonschema
-except ImportError:  # pragma: no cover - exercised via the graceful-skip path
-    _jsonschema = None
+# validation is gracefully skipped (see `validate_json_format`). Imported on first
+# use (GH #113), so a process that never validates a `$format` never loads it.
+_JSONSCHEMA_UNLOADED = object()
+_jsonschema: Any = _JSONSCHEMA_UNLOADED
 
 logger = logging.getLogger("homie")
 
@@ -114,8 +115,44 @@ def _warn_invalid_once(owner: Any, problem: str, message: str) -> None:
     logger.warning(f"{message},hint=invalid Homie 5 input; this will raise in the next minor release")
 
 
+# A topic level id: lowercase a-z, 0-9 and hyphen only (convention.md:39). `$` is
+# reserved for attributes (:41), so it is outside the set.
+_HOMIE_ID = re.compile(r"[a-z0-9-]+", re.ASCII)
+
+
+def _homie_id_problem(value: Any) -> Optional[str]:
+    """Why ``value`` is not a valid Homie topic id, or None when it is."""
+    if not isinstance(value, str) or not value:
+        return "empty"
+    if value.startswith("$"):
+        return "reservedDollar"
+    if not _HOMIE_ID.fullmatch(value):
+        return "invalidCharacter"
+    return None
+
+
+def _warn_invalid_id(owner: Any, kind: str, value: Any) -> None:
+    """Warn once when a device, node or property id is not a Homie topic id (:39, :41)."""
+    problem = _homie_id_problem(value)
+    if problem is not None:
+        _warn_invalid_once(owner, "idInvalid", f"reason={kind}IdInvalid,{kind}ID={value},problem={problem}")
+
+
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
 _jsonschema_warned = False
+
+
+def _load_jsonschema() -> Any:
+    """Return the ``jsonschema`` module, importing it on first call; None if not installed."""
+    global _jsonschema
+    if _jsonschema is _JSONSCHEMA_UNLOADED:
+        try:
+            import jsonschema
+        except ImportError:
+            jsonschema = None
+        _jsonschema = jsonschema
+    return _jsonschema
+
 
 # eBus MQTT topic constants
 EBUS_HOMIE_DOMAIN = "ebus"
@@ -145,7 +182,8 @@ def validate_json_format(value: Any, format_schema: Union[str, dict, None]) -> O
     global _jsonschema_warned
     if not format_schema:
         return None
-    if _jsonschema is None:
+    jsonschema = _load_jsonschema()
+    if jsonschema is None:
         if not _jsonschema_warned:
             _jsonschema_warned = True
             logger.warning(
@@ -163,11 +201,11 @@ def validate_json_format(value: Any, format_schema: Union[str, dict, None]) -> O
     if not isinstance(schema, dict):
         return None
     try:
-        _jsonschema.validate(instance=value, schema=schema)
+        jsonschema.validate(instance=value, schema=schema)
         return None
-    except _jsonschema.ValidationError as e:
+    except jsonschema.ValidationError as e:
         return e.message
-    except _jsonschema.SchemaError as e:
+    except jsonschema.SchemaError as e:
         logger.warning(f"reason=jsonSchemaInvalidSchema,error={e}")
         return None
 
@@ -410,7 +448,7 @@ _DATETIME_PAYLOAD = re.compile(
       | -?W(?P<week>\d{2})(?:-?(?P<weekday>\d))?
     )?
     (?:
-        T(?P<hour>\d{2})(?::?(?P<minute>\d{2})(?::?(?P<second>\d{2}))?)?(?:[.,]\d+)?
+        T(?P<hour>\d{2})(?::?(?P<minute>\d{2})(?::?(?P<second>\d{2}))?)?(?:[.,](?P<fraction>\d+))?
         (?:Z|[+-](?P<zhour>\d{2})(?::?(?P<zminute>\d{2}))?)?
     )?
     """,
@@ -422,6 +460,36 @@ _COLOR_RANGES = {"rgb": (255.0, 255.0, 255.0), "hsv": (360.0, 100.0, 100.0), "xy
 
 def _reject_json_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
+
+
+def _finite_json_float(text: str) -> float:
+    # A number outside the float range (`1e400`) would otherwise decode to inf.
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"{text} is not a finite number")
+    return number
+
+
+def _json_has_lone_surrogate(value: Any) -> bool:
+    """Whether any string or key in a decoded JSON value holds a lone surrogate.
+
+    A `\\ud800` escape decodes to a code point that is not a Unicode scalar value
+    and cannot be encoded as UTF-8. Iterative, so nesting depth costs no stack.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+    return False
 
 
 def _format_float(number: float) -> Optional[str]:
@@ -437,7 +505,10 @@ def _encode_integer(value: Any) -> tuple:
     if isinstance(value, str):
         if not _INTEGER_PAYLOAD.fullmatch(value):
             return None, "integerGrammar"
-        number = int(value)
+        try:
+            number = int(value)
+        except ValueError:  # over Python's 4,300-digit int conversion limit
+            return None, "integerOutOf64Bit"
     elif isinstance(value, numbers.Integral):
         number = int(value)
     elif isinstance(value, numbers.Real):
@@ -551,7 +622,8 @@ def _check_datetime_payload(text: str) -> Optional[str]:
     match = _DATETIME_PAYLOAD.fullmatch(text)
     if not match:
         return "datetimeGrammar"
-    fields = {k: int(v) for k, v in match.groupdict().items() if v is not None}
+    fraction = match.group("fraction")
+    fields = {k: int(v) for k, v in match.groupdict().items() if v is not None and k != "fraction"}
     if "hour" in fields and not fields.keys() & {"day", "bday", "ordinal", "weekday"}:
         return "datetimeGrammar"  # a time of day needs a complete date
     try:
@@ -566,7 +638,27 @@ def _check_datetime_payload(text: str) -> Optional[str]:
     for name, (low, high) in limits.items():
         if name in fields and not low <= fields[name] <= high:
             return "datetimeRange"
+    # 24 is only the end-of-day instant 24:00[:00[.0]].
+    if fields.get("hour") == 24 and (fields.get("minute") or fields.get("second") or (fraction or "").strip("0")):
+        return "datetimeRange"
+    if fields.get("ordinal") == 366 and not calendar.isleap(fields["year"]):
+        return "datetimeRange"
+    if fields.get("week") == 53 and not _has_iso_week_53(fields["year"]):
+        return "datetimeRange"
     return None
+
+
+def _has_iso_week_53(year: int) -> bool:
+    """Whether ISO ``year`` has a week 53 (it ends on a Thursday, or its predecessor on a Wednesday).
+
+    Arithmetic rather than ``date(year, 12, 28).isocalendar()``, which cannot
+    represent year 0000.
+    """
+
+    def dec31_weekday(y: int) -> int:  # 0 = Sunday ... 4 = Thursday
+        return (y + y // 4 - y // 100 + y // 400) % 7
+
+    return dec31_weekday(year) == 4 or dec31_weekday(year - 1) == 3
 
 
 def _encode_datetime(value: Any) -> tuple:
@@ -605,13 +697,19 @@ def _encode_duration(value: Any) -> tuple:
 
 
 def _decode_json_container(text: str) -> tuple:
-    """Parse a json payload: an array or object, never NaN/Infinity (convention.md:150)."""
+    """Parse a json payload: an array or object (convention.md:150).
+
+    Rejected as ``jsonInvalid``: NaN/Infinity, a number outside the float range,
+    and a string or key holding a lone surrogate.
+    """
     try:
-        decoded = json.loads(text, parse_constant=_reject_json_constant)
-    except (ValueError, TypeError):
+        decoded = json.loads(text, parse_constant=_reject_json_constant, parse_float=_finite_json_float)
+    except (ValueError, TypeError, RecursionError):
         return None, "jsonInvalid"
     if not isinstance(decoded, (list, dict)):
         return None, "jsonNotArrayOrObject"
+    if _json_has_lone_surrogate(decoded):
+        return None, "jsonInvalid"
     return decoded, None
 
 
@@ -623,9 +721,12 @@ def _encode_json(value: Any) -> tuple:
     if not isinstance(value, (list, tuple, dict)):
         return None, "jsonNotArrayOrObject"
     try:
-        return json.dumps(value, allow_nan=False), None
-    except (TypeError, ValueError):
+        payload = json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
         return None, "jsonInvalid"
+    # The same grammar the /set path applies: no lone surrogates.
+    _, problem = _decode_json_container(payload)
+    return (None, problem) if problem else (payload, None)
 
 
 def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tuple:
@@ -656,6 +757,41 @@ def _encode_property_value(value: Any, datatype: Any, format_: Any = None) -> tu
     return (str(value.value) if isinstance(value, Enum) else str(value)), None
 
 
+# Past float's range both ways (about 1.8e308 down to 4.9e-324).
+_EXACT_MAGNITUDE_LIMIT = 1000
+
+
+def _exact_number(text: str) -> Optional[Fraction]:
+    """The exact value of a ``_FLOAT_PAYLOAD`` text, or None over 4,300 digits.
+
+    A nonzero magnitude past ``10**±_EXACT_MAGNITUDE_LIMIT`` is clamped to it,
+    sign kept, so ``1e-100000000`` costs no ``10**100000000``. Clamping keeps
+    its order against every float-range number.
+    """
+    mantissa, _, exponent = text.lower().partition("e")
+    negative = mantissa.startswith("-")
+    whole, _, fraction = mantissa.lstrip("-").partition(".")
+    try:
+        significand = int(whole + fraction)
+    except ValueError:  # over Python's 4,300-digit int conversion limit
+        return None
+    if significand == 0:
+        return Fraction(0)
+    exponent_digits = exponent.lstrip("-").lstrip("0")
+    if len(exponent_digits) > 6:
+        scale = (-1 if exponent.startswith("-") else 1) * (10 * _EXACT_MAGNITUDE_LIMIT)
+    else:
+        scale = int(exponent or "0") - len(fraction)
+    magnitude = scale + len(str(significand))
+    if magnitude > _EXACT_MAGNITUDE_LIMIT:
+        number = Fraction(10**_EXACT_MAGNITUDE_LIMIT)
+    elif magnitude < -_EXACT_MAGNITUDE_LIMIT:
+        number = Fraction(1, 10**_EXACT_MAGNITUDE_LIMIT)
+    else:
+        number = significand * Fraction(10) ** scale
+    return -number if negative else number
+
+
 def _numeric_format(format_: Any) -> tuple:
     """``(min, max, step)`` as Fractions (each may be None) from ``[min]:[max][:step]``.
 
@@ -669,9 +805,7 @@ def _numeric_format(format_: Any) -> tuple:
         return None, None, None
 
     def bound(text: str) -> Optional[Fraction]:
-        if not _FLOAT_PAYLOAD.fullmatch(text):
-            return None
-        return Fraction(text)
+        return _exact_number(text) if _FLOAT_PAYLOAD.fullmatch(text) else None
 
     low, high = bound(parts[0]), bound(parts[1])
     step = bound(parts[2]) if len(parts) == 3 else None
@@ -715,22 +849,38 @@ def _parse_set_payload(text: str, datatype: Any, format_: Any, current: Any) -> 
     if datatype == PropertyDatatype.JSON:
         return _decode_json_container(text)
     if datatype == PropertyDatatype.INTEGER:
-        if not _INTEGER_PAYLOAD.fullmatch(text) or not _INT64_MIN <= int(text) <= _INT64_MAX:
+        if not _INTEGER_PAYLOAD.fullmatch(text):
             return None, "integerGrammar"
-        rounded, problem = _round_and_range_check(Fraction(int(text)), format_, current)
+        try:
+            number = int(text)
+        except ValueError:  # over Python's 4,300-digit int conversion limit
+            return None, "integerGrammar"
+        if not _INT64_MIN <= number <= _INT64_MAX:
+            return None, "integerGrammar"
+        rounded, problem = _round_and_range_check(Fraction(number), format_, current)
         if problem:
             return None, problem
         if rounded.denominator != 1:
             return None, "integerStepNotWhole"
-        return (text if rounded == int(text) else str(int(rounded))), None
+        # Step rounding can carry an in-range payload past int64 (convention.md:87-88).
+        if not _INT64_MIN <= rounded <= _INT64_MAX:
+            return None, "integerOutOf64Bit"
+        return (text if rounded == number else str(int(rounded))), None
     if datatype == PropertyDatatype.FLOAT:
         if not _FLOAT_PAYLOAD.fullmatch(text) or not math.isfinite(float(text)):
             return None, "floatGrammar"
-        number = Fraction(text)
+        number = _exact_number(text)
+        if number is None:
+            return None, "floatGrammar"
         rounded, problem = _round_and_range_check(number, format_, current)
         if problem:
             return None, problem
-        return (text if rounded == number else _format_float(float(rounded))), None
+        if rounded == number:
+            return text, None
+        try:
+            return _format_float(float(rounded)), None
+        except OverflowError:  # step rounding carried it past the float range
+            return None, "floatOutOfRange"
     if datatype == PropertyDatatype.BOOLEAN:
         return (text, None) if text in ("true", "false") else (None, "booleanGrammar")
     if datatype == PropertyDatatype.ENUM:
@@ -792,6 +942,11 @@ def sanitize_homie_id(value: Optional[str]) -> str:
     on the resulting Homie-legal id. Composing first and sanitizing the
     composite is not equivalent — a hyphen-joiner can be collapsed if an
     adjacent segment ends/begins with characters that drop out.
+
+    The mapping is many-to-one: distinct inputs can produce the same id
+    (``"Meter_1"``, ``"meter.1"`` and ``"meter--1"`` all become ``meter-1``).
+    Two such inputs collide where ids must be unique (devices in a tree,
+    nodes in a device, properties in a node).
     """
     if not value:
         return ""
@@ -845,20 +1000,18 @@ class DeviceState(StrEnum):
     LOST = "lost"
 
 
-# Homie 5 effective-state precedence table (SDK-zt2).
+# Homie 5 effective-state precedence table (convention.md:262-267).
 #
-# A non-root device's effective state is determined by its root's reported state:
-# whenever the root is in a non-ready state, that state propagates down the tree
-# (the root is the gateway to the children, so if it's lost/disconnected/sleeping/
-# init the children are effectively the same). Only when the root is `ready` do
-# the children's own reported states stand.
+# A non-root device's effective state is its own reported `$state`, unless its
+# root is `lost`: the root's Last Will does not update the children, so a lost
+# root makes every descendant lost. A root in any other state overrides nothing.
 #
 # Mapping: root_state -> override_for_children. A None value means "no override,
 # use the child's own state".
 HOMIE_EFFECTIVE_STATE_TABLE: dict = {
-    DeviceState.INIT: DeviceState.INIT,
-    DeviceState.DISCONNECTED: DeviceState.DISCONNECTED,
-    DeviceState.SLEEPING: DeviceState.SLEEPING,
+    DeviceState.INIT: None,
+    DeviceState.DISCONNECTED: None,
+    DeviceState.SLEEPING: None,
     DeviceState.LOST: DeviceState.LOST,
     DeviceState.READY: None,
 }
@@ -910,6 +1063,7 @@ class Property:
             async_loop = from_dict.get("async_loop", None)
         # Regardless of how we got this info, construct it
         # AKA, the "business logic" of the constructor
+        _warn_invalid_id(self, "property", id)
         self._id = id
         self._round = round_to
         self._value = value
@@ -1278,7 +1432,15 @@ class Property:
         return self._set_callback
 
     def set_set_callback(self, callback: Callable) -> None:
-        """Set the callback function for handling /set topic messages."""
+        """Set the callback function for handling /set topic messages.
+
+        The callback receives the validated value. To refuse it (well-formed, but not
+        applicable now: interlocked, busy, out of range for the current mode), raise
+        ``SetRefused``, from the callback or from the coroutine it returns; the refusal
+        is logged as ``reason=propertySetRefused`` at info level. Any other exception is
+        logged as a callback exception. The return value is used only to detect a
+        coroutine.
+        """
         self._set_callback = callback
 
     def supports_target(self) -> bool:
@@ -1542,6 +1704,9 @@ class Property:
         (convention.md:399), an enum must be in ``$format``, a boolean must be
         ``true`` or ``false``. The ``0x00`` empty-string decoding applies to string
         properties only.
+
+        A callback refuses a valid value by raising ``SetRefused``, logged as
+        ``reason=propertySetRefused`` at info level.
         """
         logger.debug(f"reason=propertySetCallback,topic={topic}")
         try:
@@ -1608,6 +1773,8 @@ class Property:
                 # coroutine would vanish silently (the inline path is caught below by the
                 # surrounding try/except). Surface it, matching the sync path's logging.
                 future.add_done_callback(partial(self._log_async_set_result, property_id=property_id))
+        except SetRefused as e:
+            logger.info(f"reason=propertySetRefused,propertyID={property_id},e={e}")
         except Exception as e:
             logger.exception(f"reason=propertySetCallbackException,e={e}")
 
@@ -1616,12 +1783,15 @@ class Property:
 
         The scheduling Future is otherwise discarded, and a discarded concurrent.futures
         Future swallows a stored exception silently (unlike an asyncio.Task). Surface it,
-        matching the synchronous path's ``propertySetCallbackException`` logging.
+        matching the synchronous path's ``propertySetCallbackException`` logging, and
+        its ``propertySetRefused`` logging for a ``SetRefused``.
         """
         if future.cancelled():
             return
         exc = future.exception()
-        if exc is not None:
+        if isinstance(exc, SetRefused):
+            logger.info(f"reason=propertySetRefused,propertyID={property_id},e={exc}")
+        elif exc is not None:
             logger.error(f"reason=propertySetAsyncCallbackException,propertyID={property_id},exc={exc!r}")
 
     def set_subscribe(self) -> None:
@@ -1698,6 +1868,7 @@ class Node:
             self._type = type
             self._properties = properties if properties is not None else {}
             self._device = device
+        _warn_invalid_id(self, "node", self._id)
 
     def as_dict(self) -> dict:
         returned_dict = {"id": self.id(), "name": self.name(), "type": self.type()}
@@ -1772,6 +1943,16 @@ class Node:
         # before the $description that names it and before ready (convention.md:279).
         # A node not yet attached to its device, or a re-declaration with identical
         # content, leaves the $description unchanged and publishes only the value.
+        # Property ids are unique per node (convention.md:326). A second property with
+        # an existing id and a different $description still replaces the first; an
+        # identical re-declaration is not a duplicate.
+        existing = self._properties.get(property.id())
+        if existing is not None and existing is not property and existing.description() != property.description():
+            _warn_invalid_once(
+                self,
+                f"duplicateProperty:{property.id()}",
+                f"reason=nodeDuplicatePropertyId,nodeID={self._id},propertyID={property.id()}",
+            )
         self._properties.update({property.id(): property})
         with self.device()._reconfiguration():
             # force: announcing a property is a structural republish, so its value must
@@ -2179,6 +2360,16 @@ class Device:
         # homie_domain(). Defaults to the eBus domain, so a publisher that never
         # mentions it is unaffected.
         self._homie_domain = (homie_domain or EBUS_HOMIE_DOMAIN) if parent is None else None
+        _warn_invalid_id(self, "device", id)
+        # The domain is a single topic segment (convention.md:157) that the `+`
+        # discovery wildcard can match, so it may not start with '$' (:161). ""
+        # still falls back to the eBus domain; anything else is published as given.
+        if homie_domain is not None and (
+            homie_domain == "" or homie_domain.startswith("$") or any(c in homie_domain for c in "/+#")
+        ):
+            _warn_invalid_once(
+                self, "homieDomainInvalid", f"reason=deviceHomieDomainInvalid,id={id},domain={homie_domain}"
+            )
         self._name = name if name else id
         self._type = type
         self._parent: Optional[Device] = parent
@@ -2230,6 +2421,14 @@ class Device:
             if mqtt_cfg is not None:
                 self.connect_broker()
         else:
+            # Device ids are unique across the tree (convention.md:194). An ancestor or
+            # sibling with this id was refused above; one on another branch publishes to
+            # the same topics too, so the root warns once per id.
+            root = parent.root()
+            if any(device._id == id for device in root._tree_pre_order()):
+                _warn_invalid_once(
+                    root, f"duplicateDevice:{id}", f"reason=deviceDuplicateIdInTree,rootID={root._id},id={id}"
+                )
             parent._children.append(self)
         # A device built inside an ancestor's open state_transition() and never
         # populated is announced, empty, when that ancestor's transition closes.
@@ -2676,6 +2875,14 @@ class Device:
             if self._async_loop is not None:
                 prop.async_loop = self._async_loop
         node_id = node.id()
+        # Node ids are unique per device (convention.md:294). A second node with an
+        # existing id and a different $description still replaces the first; an
+        # identical re-declaration is not a duplicate.
+        existing = self._nodes.get(node_id)
+        if existing is not None and existing is not node and existing.description() != node.description():
+            _warn_invalid_once(
+                self, f"duplicateNode:{node_id}", f"reason=deviceDuplicateNodeId,id={self._id},nodeID={node_id}"
+            )
         # Outside a transition a ready device goes to init first, so the node's
         # values land before the $description that names them and before ready.
         self._nodes.update({node_id: node})
@@ -5019,6 +5226,11 @@ class Controller:
             return False
 
         effective_qos = qos if qos is not None else self._qos
+        # Each subtopic segment follows the id format (convention.md:533). Still sent.
+        if any(_homie_id_problem(segment) is not None for segment in str(subtopic).split("/")):
+            _warn_invalid_once(
+                self, f"broadcastSubtopic:{subtopic}", f"reason=broadcastSubtopicInvalid,subtopic={subtopic}"
+            )
         broadcast_topic = f"{self.homie_domain}/{EBUS_HOMIE_VERSION_MAJOR}/$broadcast/{subtopic}"
 
         logger.info(f"reason=broadcasting,topic={broadcast_topic}")
@@ -5164,13 +5376,12 @@ class Controller:
 
     def get_effective_state(self, device_id: str) -> Optional[str]:
         """
-        Return the device's effective state per the Homie 5 spec (SDK-zt2).
+        Return the device's effective state per the Homie 5 spec (convention.md:262-267).
 
         For a root device: returns its own reported state.
 
-        For a child: applies HOMIE_EFFECTIVE_STATE_TABLE — when the root is in a
-        non-ready state (init/disconnected/sleeping/lost), that state propagates
-        down the tree. Only when the root is ready do children's own states stand.
+        For a child: applies HOMIE_EFFECTIVE_STATE_TABLE: a child is ``lost`` when
+        its root is ``lost``, and otherwise its own reported state stands.
 
         Returns None when the device isn't discovered. Returns the device's own
         state (best-effort) when the device's named root isn't yet discovered —
