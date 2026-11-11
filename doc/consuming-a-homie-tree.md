@@ -40,7 +40,7 @@ It is specifically **not**:
 
 The rollup reading is the common one and it cannot be made true by any producer. Children are commissioned and decommissioned out of band, so at any instant a new child may be mid-publish. **There is no moment at which a producer knows it has published "all" its children.** The strongest guarantee any producer can offer is per-transaction: *within this cascade, my announcement follows the content it announces.* That is a statement about a transaction, not about the world.
 
-The one thing a root's state **is** authoritative for is **effective state**. Homie 5 propagates a non-ready root down the tree: when the root is `init`, `disconnected`, `sleeping`, or `lost`, its descendants are effectively that too, because the root is the gateway. Only when the root is `ready` do a child's own reported states stand. `Controller.get_effective_state(device_id)` implements this. Note it keys on the **root**, not on the immediate parent, so a mid-tree device entering a `state_transition()` does not mask its own children.
+The one thing a root's state **is** authoritative for is **effective state**, and only when it is `lost` (convention.md:262-267). The root's Last Will sets the root `lost` but cannot update its descendants, so a lost root makes every descendant effectively `lost`. In every other root state (`init`, `ready`, `disconnected`, `sleeping`) a child's own reported `$state` stands. `Controller.get_effective_state(device_id)` implements this. Note it keys on the **root**, not on the immediate parent, so a mid-tree device entering a `state_transition()` does not mask its own children.
 
 ## What a consumer MUST do
 

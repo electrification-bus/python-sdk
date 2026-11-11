@@ -47,11 +47,11 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _wait_for_port(port, proc, timeout=10.0):
+def _wait_for_port(port, proc, log, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"mosquitto exited early with code {proc.returncode}")
+            raise RuntimeError(f"mosquitto exited early with code {proc.returncode}: {log.read_text().strip()}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
@@ -66,13 +66,11 @@ def broker(tmp_path):
     port = _free_port()
     conf = tmp_path / "mosquitto.conf"
     conf.write_text(f"listener {port} 127.0.0.1\nallow_anonymous true\npersistence false\n")
-    proc = subprocess.Popen(
-        [MOSQUITTO, "-c", str(conf)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    log = tmp_path / "mosquitto.log"
+    with log.open("wb") as out:
+        proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=out, stderr=subprocess.STDOUT)
     try:
-        _wait_for_port(port, proc)
+        _wait_for_port(port, proc, log)
         yield port
     finally:
         proc.terminate()
@@ -309,8 +307,10 @@ class _RestartableBroker:
             f"listener {port} 127.0.0.1\nallow_anonymous true\n"
             f"persistence true\npersistence_location {self.dir}/\npersistence_file mosquitto.db\n"
         )
-        self.proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _wait_for_port(port, self.proc)
+        log = self.dir / "mosquitto.log"
+        with log.open("ab") as out:
+            self.proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=out, stderr=subprocess.STDOUT)
+        _wait_for_port(port, self.proc, log)
 
     def stop(self):
         if self.proc is not None:

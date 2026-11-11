@@ -3,12 +3,14 @@
 import threading
 from unittest.mock import MagicMock
 
+import pytest
 
 from ebus_sdk.property import (
     Property,
     PropertyDict,
     GroupedPropertyDict,
     ChangeEvent,
+    SetRefused,
 )
 
 
@@ -86,6 +88,16 @@ class TestProperty:
         p = Property(id="mode", value="auto")
         # Should not raise
         p.set_entity("manual")
+
+    def test_set_entity_reraises_set_refused(self):
+        """A refusal reaches the caller (the Homie /set layer); other errors do not (#102)."""
+        p = Property(id="mode", value="auto", entity_setter=MagicMock(side_effect=SetRefused("busy")))
+        with pytest.raises(SetRefused):
+            p.set_entity("manual")
+
+    def test_set_entity_swallows_other_exceptions(self):
+        p = Property(id="mode", value="auto", entity_setter=MagicMock(side_effect=ValueError("boom")))
+        assert p.set_entity("manual") == "manual"
 
     def test_set_entity_setter(self):
         p = Property(id="mode", value="auto")
@@ -361,6 +373,14 @@ class TestGroupedPropertyDict:
 
         gpd.set_entity("ctrl", "mode", "manual")
         setter.assert_called_once_with("manual")
+
+    def test_set_entity_propagates_set_refused(self):
+        setter = MagicMock(side_effect=SetRefused("interlocked"))
+        gpd = GroupedPropertyDict()
+        gpd.add_property("ctrl", Property(id="mode", value="auto", entity_setter=setter))
+
+        with pytest.raises(SetRefused):
+            gpd.set_entity("ctrl", "mode", "manual")
 
     def test_as_dict(self):
         gpd = GroupedPropertyDict()
