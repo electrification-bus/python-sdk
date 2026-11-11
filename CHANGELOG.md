@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: invalid producer input that 0.25.0 warned about raises `ValueError`, before anything is published or attached, with the same `reason=` and id fields the warning carried ([#91](https://github.com/electrification-bus/python-sdk/issues/91)). A `homie.Property` raises from its constructor, so `Property(from_dict=...)`, `Node.add_property_from_dict()` and the declaration builders do too, for `propertyRetainedNull` (`retained=None`, which was published as `false`), `propertyDatatypeMissing`, `propertyDatatypeUnknown`, `propertyFormatMissing` (an `enum` or `color` with no `format`), `propertyEnumFormatEmptyValue`, `propertyEnumFormatDuplicate` and `propertyColorFormatInvalid`; `Property.set_format()` raises for the format checks and keeps the old format. `PropertySpec` raises the same reasons at declaration time, except for an `internal_only` spec, which never becomes a Homie property; `PropertySpec(retained=None)`, which the builder published as non-retained without a warning, also raises. `Device(description_extras=...)` with a Homie core `$description` key raises `deviceDescriptionExtrasCoreFieldDropped` (the key was dropped), and a child that raises is not attached to its parent. `Device.publish_alert()` raises `devicePublishAlertIdFormat` for an id outside `a-z`, `0-9`, `-` (it was published) and `devicePublishAlertEmptyMessage` for an empty or non-string message (it returned `False`); an id containing `/`, `+` or `#`, or an empty one, still returns `False`.
+
 ## [0.27.0] — 2026-10-21
 
 A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.

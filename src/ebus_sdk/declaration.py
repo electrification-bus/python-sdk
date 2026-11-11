@@ -26,7 +26,7 @@ from functools import partial
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
 from .adapter import bind_property_to_homie
-from .homie import Device, PropertyDatatype, Unit
+from .homie import Device, PropertyDatatype, Unit, _check_property_description
 from .property import GroupedPropertyDict
 from .property import Property as ObservableProperty
 
@@ -129,6 +129,10 @@ class PropertySpec:
                 f"{self.capability}/{self.prop_id}: an internal_only property is never published, so it "
                 "has no /set topic and cannot be settable"
             )
+        # The Homie property this spec builds would raise the same ValueError, but
+        # mid-materialization, after earlier nodes and model entries exist (#91).
+        if not self.internal_only:
+            _check_property_description(self.prop_id, self.datatype, self.format, self.retained)
 
     @property
     def model_key(self) -> str:

@@ -393,7 +393,7 @@ def test_extend_gives_a_built_device_a_new_capability(root, mock_paho):
     builder.add(spec)
     assert builder.device_for(spec).get_node("shed") is None
 
-    props = builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    props = builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
 
     device = builder.device_for(spec)
     assert device.get_node("shed") is not None
@@ -408,10 +408,10 @@ def test_extend_is_idempotent(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
 
     quiet = len(mock_paho.publish.call_args_list)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
     assert len(mock_paho.publish.call_args_list) == quiet
 
 
@@ -438,7 +438,7 @@ def test_extend_folds_into_the_bookkeeping_remove_uses(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
 
     builder.remove(spec)
     # Both the original and the extended model entries are gone.
@@ -453,7 +453,7 @@ def test_extend_refuses_a_device_that_is_not_built(root):
     spec = DeviceSpec("bess", INFO, device_id=lambda: None)
     builder.add(spec)  # deferred, so no tree to extend
     with pytest.raises(KeyError, match="not built"):
-        builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+        builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
 
 
 # --- Teardown and bookkeeping robustness (GH #73, #75, #76) ------------------
@@ -566,7 +566,7 @@ def test_remove_capabilities_is_the_inverse_of_extend(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
     device = builder.device_for(spec)
     assert device.get_node("shed") is not None
 
@@ -588,7 +588,7 @@ def test_remove_capabilities_clears_the_retained_topics(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
     model.set_value("bess-1", "shed-state", "SHED")
 
     before = len(mock_paho.publish.call_args_list)
@@ -604,7 +604,7 @@ def test_remove_capabilities_is_idempotent(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
     builder.remove_capabilities(spec, ["shed"])
 
     quiet = len(mock_paho.publish.call_args_list)
@@ -618,7 +618,7 @@ def test_a_capability_can_be_added_removed_and_added_again(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    shed = [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)]
+    shed = [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")]
 
     builder.extend(spec, shed)
     builder.remove_capabilities(spec, ["shed"])
@@ -637,7 +637,7 @@ def test_remove_after_remove_capabilities_stays_consistent(root, mock_paho):
     builder = DeviceTreeBuilder(root, model)
     spec = DeviceSpec("bess", INFO, device_id="bess-1")
     builder.add(spec)
-    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM)])
+    builder.extend(spec, [PropertySpec("shed", "shed-state", PropertyDatatype.ENUM, format="NORMAL,SHED")])
     builder.remove_capabilities(spec, ["shed"])
 
     builder.remove(spec)

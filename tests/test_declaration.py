@@ -307,6 +307,29 @@ def test_contradictory_settability_is_refused_at_declaration_time():
         PropertySpec("control", "limit", PropertyDatatype.FLOAT, conditionally_settable=True, internal_only=True)
 
 
+@pytest.mark.parametrize(
+    ("datatype", "kwargs", "reason"),
+    [
+        (PropertyDatatype.FLOAT, {"retained": None}, "propertyRetainedNull"),
+        (None, {}, "propertyDatatypeMissing"),
+        ("decimal", {}, "propertyDatatypeUnknown"),
+        (PropertyDatatype.ENUM, {}, "propertyFormatMissing"),
+        (PropertyDatatype.COLOR, {}, "propertyFormatMissing"),
+        (PropertyDatatype.ENUM, {"format": "a,,b"}, "propertyEnumFormatEmptyValue"),
+        (PropertyDatatype.ENUM, {"format": "a,b,a"}, "propertyEnumFormatDuplicate"),
+        (PropertyDatatype.COLOR, {"format": "rgb,cmyk"}, "propertyColorFormatInvalid"),
+    ],
+)
+def test_invalid_homie_input_is_refused_at_declaration_time(datatype, kwargs, reason):
+    """The Homie property would raise mid-build, after earlier nodes exist (#91)."""
+    with pytest.raises(ValueError, match=rf"reason={reason},propertyID=mode\b"):
+        PropertySpec("control", "mode", datatype, **kwargs)
+
+
+def test_an_internal_only_spec_is_not_checked_as_a_homie_property():
+    PropertySpec("control", "mode", PropertyDatatype.ENUM, internal_only=True)
+
+
 def test_identity_is_fused_by_default():
     spec = PropertySpec("meter", "active-power", PropertyDatatype.FLOAT)
     assert spec.model_key == "active-power"

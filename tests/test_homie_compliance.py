@@ -23,6 +23,7 @@ from ebus_sdk.homie import (
     Node,
     Property,
     PropertyDatatype,
+    _warn_invalid_once,
 )
 
 BASE = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}"
@@ -420,6 +421,21 @@ def _invalid_input_warnings(caplog):
     return [r for r in caplog.records if "next minor release" in r.getMessage()]
 
 
+class TestWarnInvalidOnce:
+    """The warn-one-release step of the #91 policy, for checks not yet raising."""
+
+    def test_once_per_owner_and_problem_with_the_hint(self, caplog):
+        a, b = Device(id="a"), Device(id="b")
+        with caplog.at_level(logging.WARNING, logger="homie"):
+            _warn_invalid_once(a, "p1", "reason=p1,id=a")
+            _warn_invalid_once(a, "p1", "reason=p1,id=a")
+            _warn_invalid_once(a, "p2", "reason=p2,id=a")
+            _warn_invalid_once(b, "p1", "reason=p1,id=b")
+        messages = [r.getMessage() for r in _invalid_input_warnings(caplog)]
+        assert [m.split(",hint=")[0] for m in messages] == ["reason=p1,id=a", "reason=p2,id=a", "reason=p1,id=b"]
+        assert all(m.endswith("this will raise in the next minor release") for m in messages)
+
+
 class TestDescriptionVersion:
     """:215: a new version whenever the document changes, and only then."""
 
@@ -499,72 +515,91 @@ class TestDescriptionFields:
         assert device.description()["type"] == "t"
         assert device.description()["nodes"]["n"]["type"] == "nt"
 
-    def test_missing_datatype_warns_and_is_omitted(self, caplog):
-        """:340: `datatype` is required."""
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            prop = Property(id="p")
-        assert "datatype" not in prop.description()
-        assert len(_invalid_input_warnings(caplog)) == 1
-
-    def test_null_retained_warns_and_is_published_as_false(self, caplog):
-        """:343: `retained` is a non-null boolean; None always published non-retained."""
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            prop = Property(id="p", datatype=PropertyDatatype.FLOAT, retained=None)
-        assert prop.description()["retained"] is False
-        assert prop.retained() is False
-        assert len(_invalid_input_warnings(caplog)) == 1
-
     def test_json_format_dict_is_published_as_a_string(self):
         """:395: the JSONschema is a string, not a nested object."""
         schema = {"type": "object"}
         prop = Property(id="j", datatype=PropertyDatatype.JSON, format=schema)
         assert prop.description()["format"] == json.dumps(schema)
 
-    def test_enum_and_color_without_format_warn(self, caplog):
-        """:392-393: `enum` and `color` require a format."""
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            Property(id="e", datatype=PropertyDatatype.ENUM)
-            Property(id="c", datatype=PropertyDatatype.COLOR)
-        assert len(_invalid_input_warnings(caplog)) == 2
-
-    def test_enum_format_with_empty_or_duplicate_values_warns(self, caplog):
-        """:392: at least one value, none empty, no duplicates."""
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            Property(id="e1", datatype=PropertyDatatype.ENUM, format="a,,b")
-            Property(id="e2", datatype=PropertyDatatype.ENUM, format="a,b,a")
-            Property(id="ok", datatype=PropertyDatatype.ENUM, format="a,b")
-        reasons = [r.getMessage() for r in _invalid_input_warnings(caplog)]
-        assert len(reasons) == 2
-        assert "propertyID=e1" in reasons[0] and "propertyID=e2" in reasons[1]
-
-    def test_the_warning_is_once_per_object(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            prop = Property(id="e", datatype=PropertyDatatype.ENUM)
-            prop.set_format(None)
-            prop.set_format("")
-        assert len(_invalid_input_warnings(caplog)) == 1
-
-    def test_set_format_checks_the_new_format(self, caplog):
-        prop = Property(id="e", datatype=PropertyDatatype.ENUM, format="a,b")
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            prop.set_format("a,a")
-        assert len(_invalid_input_warnings(caplog)) == 1
-
-    def test_extras_cannot_add_root_or_parent_to_a_root(self, caplog):
+    def test_extras_cannot_add_root_or_parent_to_a_root(self):
         """:220: `root` MUST be omitted on the root device."""
-        with caplog.at_level(logging.WARNING, logger="homie"):
-            device = Device(id="r", description_extras={"root": "x", "parent": "y", "imported-from": "z"})
-        description = device.description()
-        assert "root" not in description and "parent" not in description
-        assert description["imported-from"] == "z"
-        assert len(_invalid_input_warnings(caplog)) == 2
+        with pytest.raises(ValueError, match=r"reason=deviceDescriptionExtrasCoreFieldDropped,id=r,field=parent,root"):
+            Device(id="r", description_extras={"root": "x", "parent": "y", "imported-from": "z"})
 
-    def test_extras_cannot_override_core_fields(self):
-        device = Device(id="r", description_extras={"version": 1, "type": "x", "homie": "4.0"})
-        description = device.description()
-        assert description["homie"] == "5.0"
-        assert description["version"] != 1
-        assert "type" not in description
+    @pytest.mark.parametrize("field", ["homie", "version", "nodes", "name", "type", "children", "extensions"])
+    def test_extras_cannot_set_any_core_field(self, field):
+        with pytest.raises(ValueError, match=rf"reason=deviceDescriptionExtrasCoreFieldDropped,id=r,field={field}\b"):
+            Device(id="r", description_extras={field: "x"})
+
+    def test_a_child_with_core_extras_is_not_attached_and_publishes_nothing(self):
+        root, client = _make_root()
+        client.publish.reset_mock()
+        with pytest.raises(ValueError, match="reason=deviceDescriptionExtrasCoreFieldDropped,id=child"):
+            Device(id="child", parent=root, description_extras={"root": "elsewhere"})
+        assert root.children() == []
+        assert client.publish.call_args_list == []
+
+    def test_extension_extras_are_kept(self):
+        device = Device(id="r", description_extras={"imported-from": "z"})
+        assert device.description()["imported-from"] == "z"
+
+
+# Invalid property $description input (#91): (kwargs, reason). Each raises ValueError.
+_INVALID_PROPERTY_INPUT = [
+    ({"datatype": PropertyDatatype.FLOAT, "retained": None}, "propertyRetainedNull"),  # :343
+    ({}, "propertyDatatypeMissing"),  # :340
+    ({"datatype": "decimal"}, "propertyDatatypeUnknown"),
+    ({"datatype": PropertyDatatype.ENUM}, "propertyFormatMissing"),  # :392
+    ({"datatype": PropertyDatatype.COLOR}, "propertyFormatMissing"),  # :393
+    ({"datatype": PropertyDatatype.ENUM, "format": "a,,b"}, "propertyEnumFormatEmptyValue"),  # :392
+    ({"datatype": PropertyDatatype.ENUM, "format": "a,b,a"}, "propertyEnumFormatDuplicate"),  # :392
+    ({"datatype": PropertyDatatype.COLOR, "format": "rgb,cmyk"}, "propertyColorFormatInvalid"),  # :393
+]
+_INVALID_IDS = [f"{reason}-{kwargs.get('datatype')}" for kwargs, reason in _INVALID_PROPERTY_INPUT]
+
+
+class TestInvalidPropertyInputRaises:
+    """Invalid producer input raises at every entry point, before anything is published (#91)."""
+
+    @pytest.mark.parametrize(("kwargs", "reason"), _INVALID_PROPERTY_INPUT, ids=_INVALID_IDS)
+    def test_constructor(self, kwargs, reason):
+        with pytest.raises(ValueError, match=rf"reason={reason},propertyID=p\b"):
+            Property(id="p", **kwargs)
+
+    @pytest.mark.parametrize(("kwargs", "reason"), _INVALID_PROPERTY_INPUT, ids=_INVALID_IDS)
+    def test_from_dict(self, kwargs, reason):
+        with pytest.raises(ValueError, match=rf"reason={reason},propertyID=p\b"):
+            Property(from_dict={"id": "p", **kwargs})
+
+    @pytest.mark.parametrize(("kwargs", "reason"), _INVALID_PROPERTY_INPUT, ids=_INVALID_IDS)
+    def test_add_property_from_dict_publishes_and_adds_nothing(self, kwargs, reason):
+        root, client = _make_root()
+        node = root.new_node("n")
+        root.add_node(node)
+        client.publish.reset_mock()
+
+        with pytest.raises(ValueError, match=rf"reason={reason},propertyID=p\b"):
+            node.add_property_from_dict({"id": "p", **kwargs})
+
+        assert node.get_property("p") is None
+        assert client.publish.call_args_list == []
+        assert root.state() == DeviceState.READY
+
+    @pytest.mark.parametrize(
+        ("fmt", "reason"),
+        [(None, "propertyFormatMissing"), ("", "propertyFormatMissing"), ("a,a", "propertyEnumFormatDuplicate")],
+    )
+    def test_set_format_raises_and_keeps_the_old_format(self, fmt, reason):
+        prop = Property(id="e", datatype=PropertyDatatype.ENUM, format="a,b")
+        with pytest.raises(ValueError, match=rf"reason={reason},propertyID=e\b"):
+            prop.set_format(fmt)
+        assert prop.format() == "a,b"
+
+    def test_valid_input_still_constructs(self):
+        Property(id="e", datatype=PropertyDatatype.ENUM, format="a,b")
+        Property(id="c", datatype=PropertyDatatype.COLOR, format="rgb,hsv,xyz")
+        Property(id="j", datatype=PropertyDatatype.JSON)
+        Property(id="f", datatype="float", retained=False)
 
 
 class TestNewValuesPrecedeReady:
@@ -893,8 +928,24 @@ class TestAlerts:
         root.publish("$alert", "no id")
         assert root.publish_alert("a/b", "x") is False
         assert root.publish_alert("", "x") is False
-        assert root.publish_alert("battery", "") is False
         assert client.publish.call_args_list == []
+
+    @pytest.mark.parametrize(
+        ("alert_id", "message", "reason"),
+        [
+            ("Battery_Low", "low", "devicePublishAlertIdFormat"),
+            ("battery", "", "devicePublishAlertEmptyMessage"),
+            ("battery", None, "devicePublishAlertEmptyMessage"),
+        ],
+    )
+    def test_invalid_alert_raises_and_records_nothing(self, alert_id, message, reason):
+        """:517 (alert ids follow the ID format); an empty payload deletes the topic."""
+        root, client = _make_root()
+        client.publish.reset_mock()
+        with pytest.raises(ValueError, match=rf"reason={reason},id=root,alertId={alert_id}"):
+            root.publish_alert(alert_id, message)
+        assert client.publish.call_args_list == []
+        assert root.alerts() == {}
 
 
 # ── D. /set on the device ────────────────────────────────────────────────
