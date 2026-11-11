@@ -62,7 +62,7 @@ def _print_device(controller: Controller, device: DiscoveredDevice, depth: int) 
     pad = "  " * depth
     effective = controller.get_effective_state(device.device_id)
     own = device.state
-    # Show the effective state; call out when a non-ready root has suppressed a
+    # Show the effective state; call out when a lost root has overridden a
     # descendant's own state (the whole point of a tree-aware view).
     state = str(effective) if effective == own else f"{effective} (own: {own})"
     dtype = (device.description or {}).get("type", "?")
