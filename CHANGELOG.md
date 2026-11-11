@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- `jsonschema` is imported on the first `$format` validation instead of when `ebus_sdk.homie` loads, so a process that never validates a `json` property's `$format` does not load it ([#113](https://github.com/electrification-bus/python-sdk/issues/113)). Validation, and the one-time warning when `jsonschema` is not installed, are unchanged.
+
 ## [0.27.0] — 2026-10-21
 
 A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.
