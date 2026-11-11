@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import ebus_sdk.homie as homie
@@ -80,6 +83,32 @@ def test_validate_gracefully_skips_when_jsonschema_absent(monkeypatch):
     monkeypatch.setattr(homie, "_jsonschema", None)
     monkeypatch.setattr(homie, "_jsonschema_warned", False)
     assert homie.validate_json_format({"mode": "BOGUS"}, FLEX_SCHEMA_STR) is None
+
+
+def test_validate_skips_and_warns_once_when_jsonschema_import_fails(monkeypatch, caplog):
+    # The real lazy-import path: `import jsonschema` raises ImportError.
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    monkeypatch.setattr(homie, "_jsonschema", homie._JSONSCHEMA_UNLOADED)
+    monkeypatch.setattr(homie, "_jsonschema_warned", False)
+    with caplog.at_level(logging.WARNING, logger="homie"):
+        assert homie.validate_json_format({"mode": "BOGUS"}, FLEX_SCHEMA_STR) is None
+        assert homie.validate_json_format({"mode": "BOGUS"}, FLEX_SCHEMA_STR) is None
+    assert [r.message for r in caplog.records].count(
+        "reason=jsonSchemaValidationUnavailable,"
+        "hint=install ebus-sdk[validation] (jsonschema) to enable $format JSONSchema validation"
+    ) == 1
+
+
+def test_import_does_not_load_jsonschema():
+    # GH #113: jsonschema is imported on first $format validation, not at import.
+    # A fresh interpreter, since this test session has already loaded it.
+    code = (
+        "import sys, ebus_sdk, ebus_sdk.homie\n"
+        "assert 'jsonschema' not in sys.modules\n"
+        "ebus_sdk.homie.validate_json_format({}, {'type': 'object'})\n"
+        "assert 'jsonschema' in sys.modules\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 # --- device-side /set: decode + validate before entity_setter ----------------
