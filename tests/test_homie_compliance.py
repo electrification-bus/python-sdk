@@ -6,10 +6,12 @@ Line numbers in docstrings refer to homieiot/convention@7edc221 convention.md.
 import datetime
 import decimal
 import enum
+from fractions import Fraction
 import inspect
 import json
 import logging
 import socket
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +25,10 @@ from ebus_sdk.homie import (
     Node,
     Property,
     PropertyDatatype,
+    _has_iso_week_53,
+    _exact_number,
+    _numeric_format,
+    _parse_set_payload,
 )
 
 BASE = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}"
@@ -782,6 +788,17 @@ class TestOutboundEncoders:
         for bad in ("garbage", "2026-10-08 12:00", "2026-13-01", "2026-02-30", "2026-10-08T25:00", "\u0662026-10-08"):
             assert _published(PropertyDatatype.DATETIME, bad) is None, bad
 
+    def test_datetime_hour_24_ordinal_366_and_week_53_limits(self):
+        """:132 (ISO 8601): 24 only as 24:00[:00], day 366 in leap years, week 53 in 53-week years."""
+        for good in ("2024-01-01T24:00", "2024-01-01T24:00:00", "2024-01-01T24:00:00.000", "2024-366", "2020-W53"):
+            assert _published(PropertyDatatype.DATETIME, good) == good, good
+        for bad in ("2024-01-01T24:30", "2024-01-01T24:00:01", "2024-01-01T24:00:00.5", "2023-366", "2021-W53"):
+            assert _published(PropertyDatatype.DATETIME, bad) is None, bad
+
+    def test_week_53_years_match_the_calendar(self):
+        for year in range(1, 3000):
+            assert _has_iso_week_53(year) == (datetime.date(year, 12, 28).isocalendar()[1] == 53), year
+
     def test_duration_is_ptxhxmxs(self):
         """:137-144."""
         timedelta = datetime.timedelta
@@ -818,6 +835,14 @@ class TestOutboundEncoders:
         assert _published(PropertyDatatype.JSON, '"text"') is None
         assert _published(PropertyDatatype.JSON, {"a": float("nan")}) is None
         assert _published(PropertyDatatype.JSON, '{"a": NaN}') is None
+
+    def test_json_rejects_overflowing_numbers_and_lone_surrogates(self):
+        """:150: no inf from an out-of-range number, no string that is not Unicode scalar values."""
+        assert _published(PropertyDatatype.JSON, "[1e400]") is None
+        assert _published(PropertyDatatype.JSON, '["\\ud800"]') is None
+        assert _published(PropertyDatatype.JSON, ["\ud800"]) is None
+        assert _published(PropertyDatatype.JSON, {"\udfff": 1}) is None
+        assert _published(PropertyDatatype.JSON, '["\\ud83d\\ude00"]') == '["\\ud83d\\ude00"]'
 
 
 class TestEventProperties:
@@ -952,6 +977,40 @@ class TestInboundValidation:
     def test_the_current_value_is_the_step_base_without_min_or_max(self):
         assert _accepts(PropertyDatatype.INTEGER, "6", format="::4", value=1) == "5"
 
+    def test_an_integer_rounded_past_int64_is_rejected(self):
+        """:87-88: the 64-bit range applies after step rounding too."""
+        integer = PropertyDatatype.INTEGER
+        assert _parse_set_payload(str(2**63 - 1), integer, "0::2", None) == (None, "integerOutOf64Bit")
+        assert _parse_set_payload(str(-(2**63)), integer, ":0:3", None) == (None, "integerOutOf64Bit")
+        assert _parse_set_payload(str(2**63 - 2), integer, "0::2", None) == (str(2**63 - 2), None)
+
+    def test_a_float_rounded_past_the_float_range_is_rejected(self):
+        assert _parse_set_payload("1.7e308", PropertyDatatype.FLOAT, "0::1e308", None) == (None, "floatOutOfRange")
+
+    def test_over_4300_digits_is_a_rejection_not_an_exception(self):
+        """Python's int string conversion limit must not escape as ValueError."""
+        digits = "1" * 5000
+        assert _parse_set_payload(digits, PropertyDatatype.INTEGER, None, None) == (None, "integerGrammar")
+        assert _parse_set_payload("0." + digits, PropertyDatatype.FLOAT, "0:1", None) == (None, "floatGrammar")
+        assert _numeric_format(f"0:{digits}") == (0, None, None)
+        assert _parse_set_payload("1.5", PropertyDatatype.FLOAT, f"0:{digits}:0.5", None) == ("1.5", None)
+        assert _published(PropertyDatatype.INTEGER, digits) is None
+
+    def test_a_huge_exponent_costs_no_huge_power(self):
+        """`1e-100000000` must not compute 10**100000000 on the /set path or in `$format`."""
+        float_ = PropertyDatatype.FLOAT
+        start = time.monotonic()
+        assert _parse_set_payload("1e-100000000", float_, None, None) == ("1e-100000000", None)
+        assert _parse_set_payload("-1e-100000000", float_, "0:", None) == (None, "belowMin")
+        assert _parse_set_payload("0e999999999999", float_, "0:1", None) == ("0e999999999999", None)
+        assert _parse_set_payload("5", float_, "1e-99999999999:1e99999999999", None) == ("5", None)
+        assert _parse_set_payload("5", float_, "1e99999999999:", None) == (None, "belowMin")
+        assert time.monotonic() - start < 1.0
+
+    def test_exact_number_matches_fraction_in_range(self):
+        for text in ("0", "-0", "1.5", "-.25", "5.", "1e308", "-4.9e-324", "0.000123e-5", "12.5E3", "1e-1000"):
+            assert _exact_number(text) == Fraction(text), text
+
     def test_non_ascii_digits_are_rejected(self):
         assert _accepts(PropertyDatatype.INTEGER, "\u0661") == "REJECTED"
         assert _accepts(PropertyDatatype.FLOAT, "\u0663.5") == "REJECTED"
@@ -959,7 +1018,7 @@ class TestInboundValidation:
 
     def test_datetime_must_be_iso_8601(self):
         assert _accepts(PropertyDatatype.DATETIME, "2026-10-08T12:00:00Z") == "2026-10-08T12:00:00Z"
-        for bad in ("banana", "2026-10-08 12:00", ""):
+        for bad in ("banana", "2026-10-08 12:00", "", "2024-01-01T24:30", "2023-366", "2021-W53"):
             assert _accepts(PropertyDatatype.DATETIME, bad) == "REJECTED", bad
 
     def test_boolean_is_case_sensitive(self):
@@ -973,7 +1032,7 @@ class TestInboundValidation:
 
     def test_json_must_be_an_array_or_object(self):
         assert _accepts(PropertyDatatype.JSON, "[1, 2]") == [1, 2]
-        for bad in ("5", '"s"', "null", "{", '{"a": NaN}'):
+        for bad in ("5", '"s"', "null", "{", '{"a": NaN}', "[Infinity]", "[1e400]", '["\\ud800"]', "[" * 100000):
             assert _accepts(PropertyDatatype.JSON, bad) == "REJECTED", bad
 
     def test_empty_string_decoding_is_for_string_only(self):
