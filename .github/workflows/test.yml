@@ -32,5 +32,8 @@ jobs:
       # mosquitto for tests/test_controller_real_broker.py (GH #97), which starts its
       # own broker on a free port and is skipped when the binary is absent.
       - run: sudo apt-get update && sudo apt-get install -y mosquitto
+      # Ubuntu 26.04's AppArmor profile for /usr/sbin/mosquitto only lets it read
+      # config under /etc/mosquitto, so the fixture's config in tmp_path is refused.
+      - run: if [ -f /etc/apparmor.d/mosquitto ]; then sudo apparmor_parser -R /etc/apparmor.d/mosquitto; fi
       - run: pip install -e '.[dev]'
       - run: python -m pytest -q

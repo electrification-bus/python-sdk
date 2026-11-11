@@ -218,23 +218,23 @@ class TestControllerHierarchyNavigation:
 
 
 class TestEffectiveStateTable:
-    """SDK-zt2: HOMIE_EFFECTIVE_STATE_TABLE shape."""
+    """HOMIE_EFFECTIVE_STATE_TABLE shape."""
 
     def test_table_covers_all_states(self):
         for state in DeviceState:
             assert state in HOMIE_EFFECTIVE_STATE_TABLE, f"DeviceState.{state.name} missing from precedence table"
 
-    def test_only_ready_maps_to_none(self):
-        """Per spec: only when root is READY do children's own states stand."""
+    def test_only_lost_overrides(self):
+        """convention.md:262-267: only a lost root overrides a child's own state."""
         for state, override in HOMIE_EFFECTIVE_STATE_TABLE.items():
-            if state == DeviceState.READY:
-                assert override is None
+            if state == DeviceState.LOST:
+                assert override == DeviceState.LOST
             else:
-                assert override == state, f"non-ready root {state} should propagate as itself"
+                assert override is None, f"root {state} should not override a child's own state"
 
 
 class TestControllerEffectiveState:
-    """SDK-zt2: Controller.get_effective_state()."""
+    """Controller.get_effective_state()."""
 
     @staticmethod
     def _discover(ctrl, device_id, state, description=None):
@@ -267,10 +267,11 @@ class TestControllerEffectiveState:
             ("ready", "init", "init"),
             ("ready", "sleeping", "sleeping"),
             ("ready", "lost", "lost"),
-            ("init", "ready", "init"),
-            ("disconnected", "ready", "disconnected"),
-            ("disconnected", "lost", "disconnected"),
-            ("sleeping", "ready", "sleeping"),
+            ("init", "ready", "ready"),
+            ("init", "sleeping", "sleeping"),
+            ("disconnected", "ready", "ready"),
+            ("disconnected", "lost", "lost"),
+            ("sleeping", "ready", "ready"),
             ("lost", "ready", "lost"),
             ("lost", "init", "lost"),
         ],

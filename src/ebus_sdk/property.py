@@ -21,6 +21,17 @@ from threading import Lock, RLock, local
 from typing import List, Callable, Union, Optional, Any, Type
 
 
+class SetRefused(Exception):
+    """Raised by a ``/set`` callback (or an ``entity_setter``) to refuse a value.
+
+    The value was well-formed but the application will not apply it: out of range
+    for the hardware's current mode, interlocked, busy. The Homie layer logs
+    ``reason=propertySetRefused`` at info level instead of a callback exception.
+    ``Property.set_entity()`` re-raises it, so a refusal in an ``entity_setter``
+    reaches the Homie layer through ``GroupedPropertyDict.set_entity()``.
+    """
+
+
 class ChangeEvent(Enum):
     """Events fired by GroupedPropertyDict"""
 
@@ -183,12 +194,15 @@ class Property:
         which is done by the property invoking a registered set_entity_callback function
         Presumably changing the entity state will eventually result in the property's state being set/changed,
         which will then invoke any on_set and/or in_change callbacks
-        Returns the new value
+        Returns the new value. A ``SetRefused`` raised by the entity_setter propagates;
+        any other exception is logged and swallowed.
         """
         if self._entity_setter:
             logging.info(f"reason=setEntity,propertyId={self._id},new_value={new_value}")
             try:
                 self._entity_setter(new_value)
+            except SetRefused:
+                raise
             except Exception as e:
                 logging.warning(f"reason=setEntityException,propertyId={self._id},new_value={new_value},e={e}")
         else:

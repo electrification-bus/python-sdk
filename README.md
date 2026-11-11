@@ -152,6 +152,8 @@ A property with `retained=False` publishes non-retained at QoS 0, as Homie 5 req
 
 A `/set` payload is checked against the property's datatype before its `set_callback` runs, and an invalid one is dropped with a `reason=propertySetRejected` warning: `json` must be an array or object (and match a `$format` JSONschema when one can be checked), `integer` and `float` must follow the payload grammar, `boolean` must be `true` or `false`, an `enum` value must be in its `format`, and a `datetime` must be ISO 8601. A number is rounded to its format's step and then checked against min/max (convention.md:397-413): the callback receives the payload as sent, or its rounded form if rounding changed it (`5` on `0:10:2` arrives as `6`).
 
+A `set_callback` refuses a valid value by raising `ebus_sdk.SetRefused` (from the callback, or from the coroutine an async callback returns); it is logged as `reason=propertySetRefused` at info level, not as a callback exception. Its return value is not a refusal.
+
 A `/set` the broker delivers with the retain flag set is a stale command replayed at subscribe time, since controllers publish `/set` non-retained only; it is ignored with a `reason=propertySetRetainedIgnored` warning. That needs ebus-mqtt-client 0.7.0 or later, whose `subscribe(..., with_retain=True)` delivers the flag. With an older client, or an injected transport whose `subscribe` has no `with_retain` parameter, the check is skipped and a debug line says so.
 
 `supports_target=True` is inert: `$target` is not implemented, so the property logs one warning at construction and never publishes `$target`.
@@ -192,7 +194,7 @@ Device(id='mid-1', type='...metering', parent=bess)
 panel.children()[0].delete()
 ```
 
-Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies, and `root.declare_lost()` publishes the same thing deliberately when the publisher knows it is dying — controllers compute effective state per the Homie 5 precedence table (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
+Children may have children of their own. A single Last Will registered on the root marks the entire tree `lost` if the publisher process dies, and `root.declare_lost()` publishes the same thing deliberately when the publisher knows it is dying — controllers compute effective state per the Homie 5 rule that a lost root makes every descendant lost (see [`HOMIE_EFFECTIVE_STATE_TABLE`](src/ebus_sdk/homie.py)).
 
 `$description` republishes are minimized: structural changes made inside one `state_transition()` collapse to a single consolidated publish at exit (not one per `add_node`), and `publish_description()` is a no-op when the description content is unchanged — so a `state_transition()` that changes nothing structural does not re-emit the (potentially multi-KB) `$description`. A reconnect always republishes regardless, to restore retained state. Note this suppresses the redundant `$description` payload, not the `$state` `init`→`ready` edge of an empty transition. Property *values* are minimized the same way and with the same reconnect carve-out (see [Unchanged values are not republished](#unchanged-values-are-not-republished)). The document's `version` is derived from its content (the top 52 bits of a SHA-256 of the document without `version`), so an unchanged document keeps its version across reconnects and restarts, and any change gets a new one. Homie 5 lets `$description` change only while the device is `init`, `disconnected` or `lost`: a structural change made outside a `state_transition()` on a `ready` or `sleeping` device is published as `init`, the changed values, the new `$description`, then the state the device was in. A change that leaves the document as last published (a property added to a node not yet attached to its device, or an identical re-declaration) publishes only its values.
 
@@ -274,8 +276,8 @@ Controllers can also navigate device hierarchies and compute effective state:
 roots = controller.get_root_devices()
 for root in roots:
     for descendant in controller.get_descendants(root.device_id):
-        # When the root is lost/disconnected/sleeping/init, every descendant
-        # is effectively the same regardless of its own reported $state.
+        # When the root is lost, every descendant is effectively lost
+        # regardless of its own reported $state.
         print(f'{descendant.device_id}: {controller.get_effective_state(descendant.device_id)}')
 ```
 

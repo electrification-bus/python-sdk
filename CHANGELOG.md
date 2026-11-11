@@ -4,9 +4,19 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `SetRefused`, exported from `ebus_sdk`: a `/set` callback (or the coroutine an async one returns) raises it to refuse a well-formed value it will not apply, and the property logs `reason=propertySetRefused,propertyID=...` at info level instead of `propertySetCallbackException`. `ObservableProperty.set_entity()` re-raises it from its `entity_setter` and still logs and swallows any other exception, so a refusal in an `entity_setter` wired by `build_from_declarations` reaches the Homie layer. Return values keep their meaning ([#102](https://github.com/electrification-bus/python-sdk/issues/102)).
+
 ### Changed
 
+- `jsonschema` is imported on the first `$format` validation instead of when `ebus_sdk.homie` loads, so a process that never validates a `json` property's `$format` does not load it ([#113](https://github.com/electrification-bus/python-sdk/issues/113)). Validation, and the one-time warning when `jsonschema` is not installed, are unchanged.
+- `Controller.get_effective_state()` and `HOMIE_EFFECTIVE_STATE_TABLE` follow the convention's rule (convention.md:262-267): a child's effective state is its own `$state` unless its root is `lost`. A root in `init`, `disconnected` or `sleeping` no longer overrides its descendants, so a child of a `disconnected` root that reports `ready` now reads `ready`. ([#110](https://github.com/electrification-bus/python-sdk/issues/110))
 - Invalid ids, topics and domains are warned about, once per object, and still published ([#92](https://github.com/electrification-bus/python-sdk/issues/92), part of [#91](https://github.com/electrification-bus/python-sdk/issues/91)): a device, node or property id that is empty, starts with `$` or has a character outside `a-z`, `0-9` and `-` (convention.md:39, :41); a second node with an existing id in `Device.add_node()` or property in `Node.add_property()` whose `$description` differs from the first, which it still replaces (:294, :326; an identical re-declaration is not warned about); a device id already used on another branch of the same tree (:194; an ancestor or sibling with the id still raises `ValueError`); a root `homie_domain` that is `""` (still published as `ebus`), starts with `$` or contains `/`, `+` or `#` (:157, :161); and a `Controller.broadcast()` subtopic with a segment that is not a valid id (:533). `sanitize_homie_id()` documents that distinct inputs can map to the same id.
+
+### Fixed
+
+- Payload validation applies Homie 5 rules it missed. On `/set`, an integer that step rounding carries past the int64 range is rejected as `integerOutOf64Bit` (`9223372036854775807` with `$format` `0::2` was accepted as `9223372036854775808`), and a float carried past the float range as `floatOutOfRange`. On `/set` and on publish, a datetime accepts hour 24 only as `24:00[:00[.0]]`, ordinal day 366 only in a leap year and ISO week 53 only in a year that has one (`2024-01-01T24:30`, `2023-366` and `2021-W53` were accepted), and a json payload holding a number outside the float range (`[1e400]` decoded to `inf`), a string or key with a lone surrogate (`["\ud800"]`) or nesting too deep to parse is rejected as `jsonInvalid`. A number over Python's 4,300-digit int conversion limit no longer raises `ValueError`: an integer or float `/set` is a grammar rejection (`propertySetRejected`, where it was logged as `propertySetCallbackException`), an integer published with `set_value()` is refused as out of int64, and a numeric `$format` bound is ignored, like any other bound that does not parse. A float `/set` or `$format` bound with a huge exponent (`1e-100000000`) no longer computes the power exactly, which took seconds. ([#110](https://github.com/electrification-bus/python-sdk/issues/110))
 
 ## [0.27.0] — 2026-10-21
 
