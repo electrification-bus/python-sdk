@@ -78,11 +78,10 @@ from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport
 
 # Optional: JSONSchema validation of a `json` property's `$format`. Kept optional
 # (see `ebus-sdk[validation]`) so a constrained build can omit it; absent it,
-# validation is gracefully skipped (see `validate_json_format`).
-try:
-    import jsonschema as _jsonschema
-except ImportError:  # pragma: no cover - exercised via the graceful-skip path
-    _jsonschema = None
+# validation is gracefully skipped (see `validate_json_format`). Imported on first
+# use (GH #113), so a process that never validates a `$format` never loads it.
+_JSONSCHEMA_UNLOADED = object()
+_jsonschema: Any = _JSONSCHEMA_UNLOADED
 
 logger = logging.getLogger("homie")
 
@@ -118,6 +117,19 @@ def _warn_invalid_once(owner: Any, problem: str, message: str) -> None:
 # One-time warning when a `$format` JSONSchema is present but jsonschema is not.
 _jsonschema_warned = False
 
+
+def _load_jsonschema() -> Any:
+    """Return the ``jsonschema`` module, importing it on first call; None if not installed."""
+    global _jsonschema
+    if _jsonschema is _JSONSCHEMA_UNLOADED:
+        try:
+            import jsonschema
+        except ImportError:
+            jsonschema = None
+        _jsonschema = jsonschema
+    return _jsonschema
+
+
 # eBus MQTT topic constants
 EBUS_HOMIE_DOMAIN = "ebus"
 EBUS_HOMIE_VERSION_MAJOR = 5
@@ -146,7 +158,8 @@ def validate_json_format(value: Any, format_schema: Union[str, dict, None]) -> O
     global _jsonschema_warned
     if not format_schema:
         return None
-    if _jsonschema is None:
+    jsonschema = _load_jsonschema()
+    if jsonschema is None:
         if not _jsonschema_warned:
             _jsonschema_warned = True
             logger.warning(
@@ -164,11 +177,11 @@ def validate_json_format(value: Any, format_schema: Union[str, dict, None]) -> O
     if not isinstance(schema, dict):
         return None
     try:
-        _jsonschema.validate(instance=value, schema=schema)
+        jsonschema.validate(instance=value, schema=schema)
         return None
-    except _jsonschema.ValidationError as e:
+    except jsonschema.ValidationError as e:
         return e.message
-    except _jsonschema.SchemaError as e:
+    except jsonschema.SchemaError as e:
         logger.warning(f"reason=jsonSchemaInvalidSchema,error={e}")
         return None
 
