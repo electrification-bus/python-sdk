@@ -1,5 +1,6 @@
 """Tests for ebus_sdk.homie device-role classes: Property, Node, Device, and helpers."""
 
+import asyncio
 import json
 import logging
 import threading
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ebus_sdk import SetRefused
 from ebus_sdk.homie import (
     Property,
     PropertyDatatype,
@@ -859,6 +861,34 @@ class TestHomiePropertySettableCallback:
         topic = "wrong/5/dev1/node1/mode/set"
         prop._settable_callback(topic, b"manual")
         cb.assert_not_called()
+
+    def test_set_refused_logs_info_not_exception(self):
+        """A callback raising SetRefused is a refusal, not a callback failure (#102)."""
+        cb = MagicMock(side_effect=SetRefused("interlocked"))
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(
+            mock_client, id="mode", settable=True, set_callback=cb, datatype=PropertyDatatype.STRING
+        )
+
+        topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev1/node1/mode/set"
+        with patch("ebus_sdk.homie.logger") as mock_logger:
+            prop._settable_callback(topic, b"manual")
+        cb.assert_called_once_with("manual")
+        assert any("reason=propertySetRefused,propertyID=mode" in str(c) for c in mock_logger.info.call_args_list)
+        assert not any("propertySetCallbackException" in str(c) for c in mock_logger.exception.call_args_list)
+
+    def test_other_exception_still_logged_as_callback_exception(self):
+        cb = MagicMock(side_effect=ValueError("boom"))
+        mock_client = _mock_mqtt_client()
+        prop = _make_wired_property(
+            mock_client, id="mode", settable=True, set_callback=cb, datatype=PropertyDatatype.STRING
+        )
+
+        topic = f"{EBUS_HOMIE_DOMAIN}/{EBUS_HOMIE_VERSION_MAJOR}/dev1/node1/mode/set"
+        with patch("ebus_sdk.homie.logger") as mock_logger:
+            prop._settable_callback(topic, b"manual")
+        assert any("propertySetCallbackException" in str(c) for c in mock_logger.exception.call_args_list)
+        assert not any("propertySetRefused" in str(c) for c in mock_logger.info.call_args_list)
 
 
 class TestEmptyStringEncoding:
@@ -2876,6 +2906,30 @@ class TestInboundAsyncLoop:
         with patch("ebus_sdk.homie.logger") as mock_logger:
             prop._log_async_set_result(future, "mode")
         assert any("propertySetAsyncCallbackException" in str(c) for c in mock_logger.error.call_args_list)
+
+    def test_async_set_refused_logs_info(self):
+        """A SetRefused from an awaited /set coroutine is a refusal, as on the sync path (#102)."""
+
+        async def cb(payload):
+            raise SetRefused("busy")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            prop = Property(id="mode", settable=True, set_callback=cb)
+            prop.async_loop = loop
+            logged = threading.Event()
+            with patch("ebus_sdk.homie.logger") as mock_logger:
+                mock_logger.info.side_effect = lambda *a, **k: logged.set()
+                prop._settable_callback("ebus/5/dev/node/mode/set", b"LOAD_UP")
+                assert logged.wait(timeout=5)
+            assert any("reason=propertySetRefused,propertyID=mode" in str(c) for c in mock_logger.info.call_args_list)
+            mock_logger.error.assert_not_called()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
 
 
 class TestDeviceWithoutTransport:

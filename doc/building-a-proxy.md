@@ -220,6 +220,8 @@ For each settable spec that has an `entity_setter`, `build_from_declarations` re
 
 Inbound flow: MQTT `/set` -> Homie property `set_callback` -> `model.set_entity(capability, prop_id, value)` -> your `entity_setter` -> device command. Your `entity_setter` actuates the device and, once the real state changes, writes it back with `model.set_value(...)`, which mirrors onto Homie via the outbound (report) path.
 
+To refuse a command the device cannot apply now (interlocked, busy, out of range for its current mode), raise `ebus_sdk.SetRefused` from the `entity_setter`. `model.set_entity` re-raises it (any other exception it logs and swallows), and the Homie property logs `reason=propertySetRefused,propertyID=...` at info level rather than a callback exception. A `set_callback` you wire yourself, or the coroutine an async one returns, refuses the same way. Return values carry no meaning here: `set_entity` returns the value it was given.
+
 If you build the tree by hand instead of via `build_from_declarations`, wire the same two seams yourself: `model.set_entity_setter(capability, prop_id, fn)` and `homie_property.set_set_callback(partial(model.set_entity, capability, prop_id))`.
 
 ### Settable `json` properties and `$format` validation

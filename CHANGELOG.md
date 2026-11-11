@@ -4,6 +4,10 @@ All notable changes to `ebus-sdk` are recorded here. Format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- `SetRefused`, exported from `ebus_sdk`: a `/set` callback (or the coroutine an async one returns) raises it to refuse a well-formed value it will not apply, and the property logs `reason=propertySetRefused,propertyID=...` at info level instead of `propertySetCallbackException`. `ObservableProperty.set_entity()` re-raises it from its `entity_setter` and still logs and swallows any other exception, so a refusal in an `entity_setter` wired by `build_from_declarations` reaches the Homie layer. Return values keep their meaning ([#102](https://github.com/electrification-bus/python-sdk/issues/102)).
+
 ## [0.27.0] — 2026-10-21
 
 A device built without nodes announces once, in its caller's first transition, instead of publishing `ready` before any value. Breaking for code that relied on a bare `Device(...)` being `ready`.

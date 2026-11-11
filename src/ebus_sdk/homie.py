@@ -74,6 +74,7 @@ from typing import Any, Callable, List, Optional, Type, Union
 from ebus_mqtt_client import MqttClient
 
 from ebus_sdk.transport import MqttControllerTransport, MqttDeviceTransport
+from ebus_sdk.property import SetRefused
 
 # Optional: JSONSchema validation of a `json` property's `$format`. Kept optional
 # (see `ebus-sdk[validation]`) so a constrained build can omit it; absent it,
@@ -1278,7 +1279,15 @@ class Property:
         return self._set_callback
 
     def set_set_callback(self, callback: Callable) -> None:
-        """Set the callback function for handling /set topic messages."""
+        """Set the callback function for handling /set topic messages.
+
+        The callback receives the validated value. To refuse it (well-formed, but not
+        applicable now: interlocked, busy, out of range for the current mode), raise
+        ``SetRefused``, from the callback or from the coroutine it returns; the refusal
+        is logged as ``reason=propertySetRefused`` at info level. Any other exception is
+        logged as a callback exception. The return value is used only to detect a
+        coroutine.
+        """
         self._set_callback = callback
 
     def supports_target(self) -> bool:
@@ -1542,6 +1551,9 @@ class Property:
         (convention.md:399), an enum must be in ``$format``, a boolean must be
         ``true`` or ``false``. The ``0x00`` empty-string decoding applies to string
         properties only.
+
+        A callback refuses a valid value by raising ``SetRefused``, logged as
+        ``reason=propertySetRefused`` at info level.
         """
         logger.debug(f"reason=propertySetCallback,topic={topic}")
         try:
@@ -1608,6 +1620,8 @@ class Property:
                 # coroutine would vanish silently (the inline path is caught below by the
                 # surrounding try/except). Surface it, matching the sync path's logging.
                 future.add_done_callback(partial(self._log_async_set_result, property_id=property_id))
+        except SetRefused as e:
+            logger.info(f"reason=propertySetRefused,propertyID={property_id},e={e}")
         except Exception as e:
             logger.exception(f"reason=propertySetCallbackException,e={e}")
 
@@ -1616,12 +1630,15 @@ class Property:
 
         The scheduling Future is otherwise discarded, and a discarded concurrent.futures
         Future swallows a stored exception silently (unlike an asyncio.Task). Surface it,
-        matching the synchronous path's ``propertySetCallbackException`` logging.
+        matching the synchronous path's ``propertySetCallbackException`` logging, and
+        its ``propertySetRefused`` logging for a ``SetRefused``.
         """
         if future.cancelled():
             return
         exc = future.exception()
-        if exc is not None:
+        if isinstance(exc, SetRefused):
+            logger.info(f"reason=propertySetRefused,propertyID={property_id},e={exc}")
+        elif exc is not None:
             logger.error(f"reason=propertySetAsyncCallbackException,propertyID={property_id},exc={exc!r}")
 
     def set_subscribe(self) -> None:
